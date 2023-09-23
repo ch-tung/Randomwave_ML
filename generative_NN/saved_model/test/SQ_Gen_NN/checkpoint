@@ -1,2 +1,2 @@
-model_checkpoint_path: "test"
-all_model_checkpoint_paths: "test"
+model_checkpoint_path: "test_bg_model_decoder_ext"
+all_model_checkpoint_paths: "test_bg_model_decoder_ext"

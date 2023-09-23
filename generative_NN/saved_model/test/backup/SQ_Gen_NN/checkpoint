@@ -1,0 +1,2 @@
+model_checkpoint_path: "test_fuzzy_bg_model_decoder"
+all_model_checkpoint_paths: "test_fuzzy_bg_model_decoder"
