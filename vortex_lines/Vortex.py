@@ -2,7 +2,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-plt.rcParams["font.family"] = "Arial"
+# plt.rcParams["font.family"] = "Arial"
 # from skimage import measure
 import pyvista as pv
 pv.set_jupyter_backend('trame')
