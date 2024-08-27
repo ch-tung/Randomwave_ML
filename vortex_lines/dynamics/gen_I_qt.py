@@ -128,9 +128,9 @@ t_list = np.linspace(0,1,n_time)*80*np.pi # collect for omega_0*t = 40pi
 
 # %%
 sigma_k = 1e-8
-# kappa_list = [n_fft]
+kappa_list = [64]
 sigma_omega_list = [0.05, 0.1, 0.2]
-sigma_omega_list = [0.1]
+# sigma_omega_list = [0.1]
 
 parameters_list = []
 rho_list = []
@@ -230,7 +230,7 @@ plt.show()
 # %%
 sigma_k_list = [0.05, 0.1, 0.2]
 # sigma_k_list = [0.1]
-kappa_list = [n_fft]
+kappa_list = [64]
 k_bar = scale*2*np.pi
 c = 1.0*0.1
 D = 1/(2*k_bar)*0.1
