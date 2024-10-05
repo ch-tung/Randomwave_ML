@@ -1,0 +1,18 @@
+Model Setup:
+  base_fun: identity
+  device: cuda
+  grid: 20
+  grid_eps: 0.75
+  k: 3
+  model_class: SQ_KAN
+  noise_scale: 2
+  seed: 11451419
+  width:
+  - 4
+  - 9
+  - 1
+  width_aug:
+  - 3
+  - 7
+  - 3
+Training Configuration: {}

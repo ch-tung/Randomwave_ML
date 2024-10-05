@@ -1,0 +1,7 @@
+# Model Setup
+n_grid: 100
+n_grid_scale: 256
+box_size: 2
+grid_ext_template: '../../training_set/alpha/fixed_phase/grid_ext/S_q_{}_ex.mat'
+grid_ext_template_half: '../../training_set/alpha/fixed_phase/grid_ext/S_q_{}.5_ex.mat'
+parameters_zscore: 0
