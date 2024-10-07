@@ -23,22 +23,24 @@ def to_torch_device(array, device=device):
     return torch.from_numpy(array.astype('float32')).float().to(device)
 
 # Parameters for preparing the training data
-n_grid = 100
-x = np.linspace(-1, 1, n_grid + 1)
-y = np.linspace(-1, 1, n_grid + 1)
-z = np.linspace(-1, 1, n_grid + 1)
+# n_grid = 100
+# x = np.linspace(-1, 1, n_grid + 1)
+# y = np.linspace(-1, 1, n_grid + 1)
+# z = np.linspace(-1, 1, n_grid + 1)
 
-r_grid = np.meshgrid(x, y, z)
-box_size = 2
-n_grid_scale = 256
-scale = n_grid_scale / r_grid[0].shape[0]
-dq = 2 * np.pi / box_size
-qq = np.arange(n_grid_scale / 2) * dq
-Q = qq[1:-1] / 20 / np.pi
+# r_grid = np.meshgrid(x, y, z)
+# box_size = 2
+# n_grid_scale = 256
+# scale = n_grid_scale / r_grid[0].shape[0]
+# dq = 2 * np.pi / box_size
+# qq = np.arange(n_grid_scale / 2) * dq
+# Q = qq[1:-1] / 20 / np.pi
 
 # Load training data
 config_file = 'setup_ts.txt'
-x_train, y_train = load_training_data(config_file)
+x_train, y_train, Q_train = load_training_data(config_file)
+x_train_torch = to_torch_device(x_train, device=device)
+y_train_torch = to_torch_device(y_train, device=device)
 
 # Add a column of ones to x to account for the bias term
 x_train_bias = np.hstack([x_train, np.ones((x_train.shape[0], 1))])
@@ -54,20 +56,29 @@ for i in range(y_train.shape[1]):
     A[:, i] = coef[:-1]
     B[i] = coef[-1]
 
+Qx = np.vstack([Q_train,np.ones_like(Q_train)]).T
+Qx_inv = to_torch_device((np.linalg.pinv(Qx)), device=device)
+Qx = to_torch_device(Qx, device=device)
+
 class SQ_KAN(nn.Module):
-    def __init__(self, width, width_aug, grid, k, seed, device, grid_eps, noise_scale, base_fun):
+    def __init__(self, width, width_aug, grid, k, seed, device, grid_eps, noise_scale, base_fun, multiplier):
         super(SQ_KAN, self).__init__()
         self.kan_aug = KAN(width=width_aug, grid=10, k=k, seed=seed, device=device, grid_eps=grid_eps, noise_scale=noise_scale, base_fun=base_fun)
+        self.kan_aug.update_grid_from_samples(x_train_torch)
         self.kan = KAN(width=width, grid=grid, k=k, seed=seed, device=device, noise_scale=noise_scale, base_fun=base_fun)
-        self.Q_torch = to_torch_device((Q - 2) / 4, device=device)
+        self.Q_torch = to_torch_device((Q_train - 2) / 4, device=device)
         self.A = to_torch_device(A, device=device)
         self.B = to_torch_device(B, device=device)
+        self.multiplier = multiplier
         
     def forward(self, x):
         bg = (x @ self.A + self.B)
         bg_expanded = bg.unsqueeze(1).expand(-1, self.Q_torch.size(0), -1)
         # Compute the mean of individual bg
         bg_mean = bg_expanded.mean(dim=-1)
+        # Linear approximation of the background
+        Qab = Qx_inv@bg.T
+        bg_lin = (Qx@Qab).T
         
         x = self.kan_aug(x)
         x_expanded = x.unsqueeze(1).expand(-1, self.Q_torch.size(0), -1)
@@ -76,7 +87,7 @@ class SQ_KAN(nn.Module):
         Q_params_reshaped = Q_params.view(-1, Q_params.size(-1))
         sq_full = self.kan(Q_params_reshaped)
         sq_full_reshaped = sq_full.view(x.size(0), self.Q_torch.size(0))
-        return sq_full_reshaped + bg_mean
+        return sq_full_reshaped*self.multiplier + bg_lin
 
 def build_model(config, device=device):
     model = SQ_KAN(
@@ -88,7 +99,8 @@ def build_model(config, device=device):
         device=device,
         grid_eps=config['grid_eps'],
         noise_scale=config['noise_scale'],
-        base_fun=config['base_fun']
+        base_fun=config['base_fun'],
+        multiplier=config['multiplier']
     )
     return model
 

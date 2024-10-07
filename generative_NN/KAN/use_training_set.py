@@ -12,6 +12,7 @@ def load_training_data(config_file):
     box_size = config['box_size']
     dq = 2 * np.pi / box_size
     qq = np.arange(n_grid_scale / 2) * dq
+    Q_train = qq[1:-1] / 20 / np.pi
 
     S_q_Grid = []
     p_Grid = []
@@ -70,7 +71,7 @@ def load_training_data(config_file):
     y_train = log_S_q_sm_Grid
     x_train = parameters_train
 
-    return x_train, y_train
+    return x_train, y_train, Q_train
 
 # Example usage
 # config_file = 'setup_model.txt'
