@@ -13,7 +13,7 @@ source activate torch
 for P in {0..9}
 do
     # Run the Python script with the current value of P
-    srun -N1 -n1 --exclusive python ./test_rw_SQ_mo_P.py -P ${P} &
+    srun -N1 -n1 --exclusive python ./test_rw_SQ_mo_P.5.py -P ${P} &
 done
 
 # Wait for all background jobs to finish

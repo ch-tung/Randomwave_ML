@@ -1,5 +1,6 @@
 import numpy as np
 from scipy import interpolate, ndimage
+# import pyfftw
 
 def sample_k(k_mean,k_cov):
     return np.random.multivariate_normal(k_mean,k_cov)
@@ -106,10 +107,10 @@ def scatter_grid(rho, alpha, qq, scale=1, box_size=2):
     rho_bi = np.zeros_like(rho_bi_zoom)  # Density = 0 or 1
     rho_bi[rho_bi_zoom > alpha] = 1  # Clipped to alpha
     
-    rho_r = rho_bi
-    N_ones = np.sum(rho_r)  # Number of ones
+    N_ones = np.sum(rho_bi)  # Number of ones
     
-    rho_q = np.fft.fftn(rho_r.astype(np.float32))  # FFT of the grid density
+    rho_q = np.fft.fftn(rho_bi.astype(np.float32))  # FFT of the grid density
+    # rho_q = pyfftw.interfaces.numpy_fft.fftn(rho_bi)  # FFT of the grid density
     S_q_lmn = np.absolute(rho_q) ** 2  # Scattering function in grid points
 
     # Reduce S_q_lmn

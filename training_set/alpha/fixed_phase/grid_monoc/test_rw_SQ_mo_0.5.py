@@ -35,10 +35,10 @@ for k, alpha in zip(kz_grid.flatten(),alpha_grid.flatten()):
 
         # calculate scattering function
         box_size = 2
-        n_grid_scale = 512
+        n_grid_scale = 256
         scale = n_grid_scale/rho.shape[0]
         dq = 2*np.pi/box_size
-        qq = np.arange(n_grid_scale/4)*dq
+        qq = np.arange(n_grid_scale/2)*dq
 
         S_q_i = scatter_grid(rho,alpha,qq,scale=scale)
         S_q_list.append(S_q_i)
