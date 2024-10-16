@@ -3,7 +3,7 @@ from scipy.io import loadmat
 from scipy.ndimage import gaussian_filter1d as gf1d
 import yaml
 
-def load_training_data(config_file):
+def load_training_data(config_file, extend=False):
     with open(config_file, 'r') as file:
         config = yaml.safe_load(file)
     
@@ -17,7 +17,7 @@ def load_training_data(config_file):
     S_q_Grid = []
     p_Grid = []
     for i in range(10):
-        filename = config['grid_ext_template'].format(i)
+        filename = config['grid_ext'].format(i)
         data = loadmat(filename)
         k_grid = data['k_grid']
         S_q_kxy = data['S_q_kxy']
@@ -25,12 +25,29 @@ def load_training_data(config_file):
         p_Grid.append(k_grid)
 
     for i in range(10):
-        filename = config['grid_ext_template_half'].format(i)
+        filename = config['grid_ext_half'].format(i)
         data = loadmat(filename)
         k_grid = data['k_grid']
         S_q_kxy = data['S_q_kxy']
         S_q_Grid.append(S_q_kxy)
         p_Grid.append(k_grid)
+        
+    if extend:
+        for i in range(10):
+            filename = config['grid_ex_monoc'].format(i)
+            data = loadmat(filename)
+            k_grid = data['k_grid']
+            S_q_kxy = data['S_q_kxy']
+            S_q_Grid.append(S_q_kxy)
+            p_Grid.append(k_grid)
+            
+        for i in range(10):
+            filename = config['grid_ex_monoc_half'].format(i)
+            data = loadmat(filename)
+            k_grid = data['k_grid']
+            S_q_kxy = data['S_q_kxy']
+            S_q_Grid.append(S_q_kxy)
+            p_Grid.append(k_grid)
 
     S_q_Grid = np.array(S_q_Grid).reshape(100 * len(p_Grid), 128)[:, 1:-1].astype(np.float32)
     p_Grid = np.array(p_Grid).reshape(100 * len(p_Grid), 3)
@@ -39,6 +56,7 @@ def load_training_data(config_file):
     log_S_q_sm_Grid = np.log(S_q_sm_Grid)
 
     k_z = p_Grid[:, 0].astype(np.float32)
+    logk_z = np.log(k_z).astype(np.float32)
     alpha = p_Grid[:, 1].astype(np.float32)
     kappa = p_Grid[:, 2].astype(np.float32)
     logkappa = np.log(kappa).astype(np.float32)
@@ -52,12 +70,12 @@ def load_training_data(config_file):
 
     parameters_zscore = config['parameters_zscore']
     if parameters_zscore:
-        k_z_mean = np.mean(k_z)
-        k_z_std = np.std(k_z)
-        k_z_z = (k_z - k_z_mean) / k_z_std
+        k_z_mean = np.mean(logk_z)
+        k_z_std = np.std(logk_z)
+        k_z_z = (logk_z - k_z_mean) / k_z_std
 
         kappa_mean = np.mean(logkappa)
-        kappa_std = np.std(kappa)
+        kappa_std = np.std(logkappa)
         kappa_z = (logkappa - kappa_mean) / kappa_std
 
         alpha_mean = np.mean(alpha)
@@ -66,7 +84,7 @@ def load_training_data(config_file):
 
         parameters_train = np.array([k_z_z, kappa_z, alpha_z]).T
     else:
-        parameters_train = np.array([k_z, logkappa, alpha]).T
+        parameters_train = np.array([logk_z, logkappa, alpha]).T
 
     y_train = log_S_q_sm_Grid
     x_train = parameters_train

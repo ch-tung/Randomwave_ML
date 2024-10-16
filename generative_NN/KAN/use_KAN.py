@@ -12,6 +12,15 @@ def set_device(new_device):
     global device
     device = torch.device(new_device)
     print(f"Device set to: {device}")
+    
+def update_device(new_device):
+    global device, x_train_torch, y_train_torch, Qx, Qx_inv
+    set_device(new_device)
+    x_train_torch = x_train_torch.to(device)
+    y_train_torch = y_train_torch.to(device)
+    Qx = Qx.to(device)
+    Qx_inv = Qx_inv.to(device)
+    print("All relevant tensors and models have been moved to the new device.")
 
 def calculate_output_size(input_size, filter_size, padding, stride):
     return int((input_size - filter_size + 2*padding) / stride + 1)
@@ -61,10 +70,10 @@ Qx_inv = to_torch_device((np.linalg.pinv(Qx)), device=device)
 Qx = to_torch_device(Qx, device=device)
 
 class SQ_KAN(nn.Module):
-    def __init__(self, width, width_aug, grid, k, seed, device, grid_eps, noise_scale, base_fun, multiplier):
+    def __init__(self, width, width_aug, grid, grid_aug, k, seed, device, grid_eps, noise_scale, base_fun, multiplier):
         super(SQ_KAN, self).__init__()
-        self.kan_aug = KAN(width=width_aug, grid=10, k=k, seed=seed, device=device, grid_eps=grid_eps, noise_scale=noise_scale, base_fun=base_fun)
-        self.kan_aug.update_grid_from_samples(x_train_torch)
+        self.kan_aug = KAN(width=width_aug, grid=grid_aug, k=k, seed=seed, device=device, grid_eps=grid_eps, noise_scale=noise_scale, base_fun=base_fun)
+        # self.kan_aug.update_grid_from_samples(x_train_torch)
         self.kan = KAN(width=width, grid=grid, k=k, seed=seed, device=device, noise_scale=noise_scale, base_fun=base_fun)
         self.Q_torch = to_torch_device((Q_train - 2) / 4, device=device)
         self.A = to_torch_device(A, device=device)
@@ -73,9 +82,9 @@ class SQ_KAN(nn.Module):
         
     def forward(self, x):
         bg = (x @ self.A + self.B)
-        bg_expanded = bg.unsqueeze(1).expand(-1, self.Q_torch.size(0), -1)
+        # bg_expanded = bg.unsqueeze(1).expand(-1, self.Q_torch.size(0), -1)
         # Compute the mean of individual bg
-        bg_mean = bg_expanded.mean(dim=-1)
+        # bg_mean = bg_expanded.mean(dim=-1)
         # Linear approximation of the background
         Qab = Qx_inv@bg.T
         bg_lin = (Qx@Qab).T
@@ -94,6 +103,7 @@ def build_model(config, device=device):
         width=config['width'],
         width_aug=config['width_aug'],
         grid=config['grid'],
+        grid_aug=config['grid_aug'],
         k=config['k'],
         seed=config['seed'],
         device=device,
@@ -103,6 +113,45 @@ def build_model(config, device=device):
         multiplier=config['multiplier']
     )
     return model
+
+def f_IQ_KAN(model, x, Q):
+    Qx_sample = to_torch_device(np.vstack([Q,np.ones_like(Q)]).T, device=device)
+    
+    # Transform x using kan_aug
+    n_data = x.shape[0]
+    x = x.view(-1, 3)
+    # x[:,0] = np.exp(x[:,0])
+    # x[:,1] = np.exp(x[:,1])
+    x_transformed = model.kan_aug(x)
+    
+    # Transform Q using to_torch_device
+    Q_torch = to_torch_device((Q - 2) / 4, device=device)
+    
+    # Calculate bg
+    bg = (x @ model.A + model.B)
+    # bg_expanded = bg.unsqueeze(1).expand(-1, self.Q_torch.size(0), -1)
+    # Compute the mean of individual bg
+    # bg_mean = bg_expanded.mean(dim=-1)
+    # Linear approximation of the background
+    Qab = Qx_inv@bg.T
+    bg_lin = (Qx_sample@Qab).T
+    
+    # Expand dimensions to match Q_torch
+    x_expanded = x_transformed.unsqueeze(1).expand(-1, Q_torch.size(0), -1)
+    Q_expanded = Q_torch.unsqueeze(0).unsqueeze(-1).expand(x.size(0), -1, x.size(-1))
+    
+    # Combine Q and x
+    Q_params = torch.cat([Q_expanded, x_expanded], dim=-1)
+    Q_params_reshaped = Q_params.view(-1, Q_params.size(-1))
+    
+    # Produce f(Q, x) using kan
+    f_Q_x = model.kan(Q_params_reshaped)
+    f_Q_x_reshaped = f_Q_x.view(x.size(0), Q_torch.size(0))
+    
+    # print(f_Q_x_reshaped.shape)
+    # print(bg_mean)    
+    # Add bg to the final output
+    return f_Q_x_reshaped*model.multiplier + bg_lin
 
 def main():
     with open('setup_model.txt', 'r') as file:
