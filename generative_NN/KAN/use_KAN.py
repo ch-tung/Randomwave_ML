@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import yaml
+import numpy as np
 from kan import *
 from use_training_set import *
 
@@ -8,18 +9,23 @@ from use_training_set import *
 device = torch.device('cpu')
 torch.set_default_dtype(torch.float32)
 
+# Global model variable
+model = None
+
 def set_device(new_device):
     global device
     device = torch.device(new_device)
     print(f"Device set to: {device}")
     
 def update_device(new_device):
-    global device, x_train_torch, y_train_torch, Qx, Qx_inv
+    global device, x_train_torch, y_train_torch, Qx, Qx_inv, model
     set_device(new_device)
     x_train_torch = x_train_torch.to(device)
     y_train_torch = y_train_torch.to(device)
     Qx = Qx.to(device)
     Qx_inv = Qx_inv.to(device)
+    if model is not None:
+        model.to(device)
     print("All relevant tensors and models have been moved to the new device.")
 
 def calculate_output_size(input_size, filter_size, padding, stride):
@@ -65,7 +71,10 @@ for i in range(y_train.shape[1]):
     A[:, i] = coef[:-1]
     B[i] = coef[-1]
 
-Qx = np.vstack([Q_train,np.ones_like(Q_train)]).T
+# the default Qx
+f_Qx=lambda Q: np.vstack([Q,np.ones_like(Q)]).T
+# Qx = np.vstack([Q_train,np.ones_like(Q_train)]).T
+Qx = f_Qx(Q_train)
 Qx_inv = to_torch_device((np.linalg.pinv(Qx)), device=device)
 Qx = to_torch_device(Qx, device=device)
 
@@ -114,8 +123,8 @@ def build_model(config, device=device):
     )
     return model
 
-def f_IQ_KAN(model, x, Q):
-    Qx_sample = to_torch_device(np.vstack([Q,np.ones_like(Q)]).T, device=device)
+def f_IQ_KAN(model, x, Q, f_Qx):
+    Qx_sample = to_torch_device(f_Qx(Q), device=device)
     
     # Transform x using kan_aug
     n_data = x.shape[0]
@@ -153,10 +162,19 @@ def f_IQ_KAN(model, x, Q):
     # Add bg to the final output
     return f_Q_x_reshaped*model.multiplier + bg_lin
 
+def update_Qx(f_Qx, config):
+    global Qx_inv, model, f_IQ_KAN
+    Qx_inv = to_torch_device(np.linalg.pinv(f_Qx(Q_train)), device=device)
+    print("Qx and Qx_inv have been defined and updated.")
+    # Redefine the model since Qx has been updated
+    model = build_model(config['Model Setup'])
+    print("Model has been redefined.")
+
 def main():
     with open('setup_model.txt', 'r') as file:
         config = yaml.safe_load(file)
     
+    global model
     model = build_model(config['Model Setup'])
     print(model)
 
