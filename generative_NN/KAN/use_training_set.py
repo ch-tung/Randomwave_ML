@@ -3,7 +3,7 @@ from scipy.io import loadmat
 from scipy.ndimage import gaussian_filter1d as gf1d
 import yaml
 
-def load_training_data(config_file, extend=False):
+def load_training_data(config_file, extend=False, sm=True):
     with open(config_file, 'r') as file:
         config = yaml.safe_load(file)
     
@@ -86,8 +86,11 @@ def load_training_data(config_file, extend=False):
     else:
         parameters_train = np.array([logk_z, logkappa, alpha]).T
 
-    y_train = log_S_q_sm_Grid
+    y_train = log_S_q_Grid
     x_train = parameters_train
+    
+    if sm:
+        y_train = log_S_q_sm_Grid
 
     return x_train, y_train, Q_train
 
