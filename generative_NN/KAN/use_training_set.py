@@ -54,6 +54,9 @@ def load_training_data(config_file, extend=False, sm=True):
     S_q_sm_Grid = np.exp(np.array([gf1d(f, 1, mode='nearest') for f in np.log(S_q_Grid)])).astype(np.float32)
     log_S_q_Grid = np.log(S_q_Grid)
     log_S_q_sm_Grid = np.log(S_q_sm_Grid)
+    
+    # S_q_sm_Grid = np.exp(np.array([gf1d(f, 0.5, mode='nearest') for f in np.log(S_q_Grid)])).astype(np.float32)
+    # log_S_q_Grid = np.log(S_q_sm_Grid)
 
     k_z = p_Grid[:, 0].astype(np.float32)
     logk_z = np.log(k_z).astype(np.float32)
