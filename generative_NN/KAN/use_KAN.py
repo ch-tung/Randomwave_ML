@@ -125,7 +125,7 @@ def build_model(config, device=device):
     )
     return model
 
-def f_IQ_KAN(model, x, Q, f_Qx):
+def f_IQ_KAN(model, x, Q, f_Qx, device=device):
     Qx_sample = to_torch_device(f_Qx(Q), device=device)
     
     # Transform x using kan_aug
@@ -172,12 +172,13 @@ class SQ_KAN_cos(nn.Module):
         self.kan_aug = KAN(width=width_aug, grid=grid_aug, k=k, seed=seed, device=device, grid_eps=grid_eps, noise_scale=noise_scale, base_fun=base_fun)
         # self.kan_aug.update_grid_from_samples(x_train_torch)
         self.kan = KAN(width=width, grid=grid, k=k, seed=seed, device=device, noise_scale=noise_scale, base_fun=base_fun)
-        self.Q_torch = to_torch_device(Q_train)
-        self.Q_torch_scale = to_torch_device((Q_train-2)*Q_scale)
-        self.A = to_torch_device(A)
-        self.B = to_torch_device(B)
+        self.Q_torch = to_torch_device(Q_train, device=device)
+        self.Q_torch_scale = to_torch_device((Q_train-2)*Q_scale, device=device)
+        self.A = to_torch_device(A, device=device)
+        self.B = to_torch_device(B, device=device)
         self.multiplier = multiplier
         self.Q_scale = Q_scale
+        self.nQ = self.Q_torch.size(0)
         
     def forward(self, x):
         bg = (x@self.A+self.B)
@@ -189,19 +190,19 @@ class SQ_KAN_cos(nn.Module):
         bg_lin = (Qx@Qab).T
         
         x = self.kan_aug(x)
-        x_expanded = x.unsqueeze(1).expand(-1, self.Q_torch.size(0), -1)
+        x_expanded = x.unsqueeze(1).expand(-1, self.nQ, -1)
         Q_expanded = self.Q_torch_scale.unsqueeze(0).unsqueeze(-1).expand(x.size(0), -1, x.size(-1))
         Q_params = torch.cat([Q_expanded, x_expanded], dim=-1)
         Q_params_reshaped = Q_params.view(-1, Q_params.size(-1))
         
         G_full = self.kan(Q_params_reshaped)
-        G_full_reshaped = G_full.view(x.size(0), self.Q_torch_scale.size(0), 2)  # (n_sample, n_Q, 2)
+        G_full_reshaped = G_full.view(x.size(0), self.nQ, 2)  # (n_sample, n_Q, 2)
         
         output_1 = G_full_reshaped[:, :, 0]
         output_2 = G_full_reshaped[:, :, 1]
         
         sq_full = output_1*torch.cos(2*np.pi*self.Q_torch) + output_2
-        sq_full_reshaped = sq_full.view(x.size(0), self.Q_torch.size(0))
+        sq_full_reshaped = sq_full.view(x.size(0), self.nQ)
         
         return sq_full_reshaped*self.multiplier + bg_lin
 
@@ -222,7 +223,7 @@ def build_model_cos(config, device=device):
     )
     return model
 
-def f_IQ_KAN_cos(model, x, Q, f_Qx):
+def f_IQ_KAN_cos(model, x, Q, f_Qx, device=device):
     Qx_sample = to_torch_device(f_Qx(Q), device=device)
     
     # Transform x using kan_aug
@@ -234,7 +235,9 @@ def f_IQ_KAN_cos(model, x, Q, f_Qx):
     
     # Transform Q using to_torch_device
     Q_scale = model.Q_scale
-    Q_torch = to_torch_device((Q - 2)*Q_scale, device=device)
+    Q_torch = to_torch_device(Q, device=device)
+    Q_torch_scale = to_torch_device((Q - 2)*Q_scale, device=device)
+    nQ = Q_torch_scale.size(0)
     
     # Calculate bg
     bg = (x @ model.A + model.B)
@@ -246,21 +249,21 @@ def f_IQ_KAN_cos(model, x, Q, f_Qx):
     bg_lin = (Qx_sample@Qab).T
     
     # Expand dimensions to match Q_torch
-    x_expanded = x_transformed.unsqueeze(1).expand(-1, Q_torch.size(0), -1)
-    Q_expanded = Q_torch.unsqueeze(0).unsqueeze(-1).expand(x.size(0), -1, x.size(-1))
+    x_expanded = x_transformed.unsqueeze(1).expand(-1, nQ, -1)
+    Q_expanded = Q_torch_scale.unsqueeze(0).unsqueeze(-1).expand(x.size(0), -1, x.size(-1))
     
     # Combine Q and x
     Q_params = torch.cat([Q_expanded, x_expanded], dim=-1)
     Q_params_reshaped = Q_params.view(-1, Q_params.size(-1))
     
     G_full = model.kan(Q_params_reshaped)
-    G_full_reshaped = G_full.view(x.size(0), model.Q_torch_scale.size(0), 2)  # (n_sample, n_Q, 2)
+    G_full_reshaped = G_full.view(x.size(0), nQ, 2)  # (n_sample, n_Q, 2)
     
     output_1 = G_full_reshaped[:, :, 0]
     output_2 = G_full_reshaped[:, :, 1]
     
-    sq_full = output_1*torch.cos(2*np.pi*model.Q_torch) + output_2
-    sq_full_reshaped = sq_full.view(x.size(0), model.Q_torch.size(0))
+    sq_full = output_1*torch.cos(2*np.pi*Q_torch) + output_2
+    sq_full_reshaped = sq_full.view(x.size(0), nQ)
     # print(f_Q_x_reshaped.shape)
     # print(bg_mean)    
     # Add bg to the final output
