@@ -1,0 +1,1202 @@
+"""
+Three-field random-wave line network in a periodic cubic box.
+
+Geometry:
+    A single scalar zero set phi_a = 0 is a surface in 3D.
+    A pairwise zero set phi_a = 0 and phi_b = 0 is a line in 3D.
+    Therefore Gamma_12 and Gamma_13 define two random line families.
+
+    Their common triple-zero points,
+
+        phi_1 = phi_2 = phi_3 = 0,
+
+    act as crosslink nodes between the two retained line families. Since only
+    the (1, 2) and (1, 3) line families are retained here, a generic triple-zero
+    node has four local branches.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Literal, Sequence
+
+import numpy as np
+import pyvista as pv
+from scipy.interpolate import splev, splrep
+from scipy.spatial import cKDTree
+
+
+# =============================================================================
+# Editable parameters
+# =============================================================================
+
+GRID_SIZE = 128
+RANDOM_SEED = 20260526
+
+# Number of modes per field. Use one integer for all fields or a 3-tuple.
+NUM_MODES: int | tuple[int, int, int] = (180, 180, 180)
+
+# K-distribution choices:
+#   "single_shell"   : |k| = K0 with isotropic directions
+#   "gaussian_radial": |k| ~ Normal(K0, r_SIGMA_K*K0) with isotropic directions
+#   "uniform_band"   : |k| in [r_K_MIN*K0, r_K_MAX*K0]
+#   "user_list"      : use USER_K_VECTORS below
+K_DISTRIBUTION: Literal[
+    "single_shell", "gaussian_radial", "uniform_band", "user_list"
+] = "single_shell"
+
+# Use one float for all fields or a 3-tuple for (phi_1, phi_2, phi_3).
+K0: float | tuple[float, float, float] = 10.0
+
+# Relative k-distribution controls. Use one float for all fields or a 3-tuple
+# for (phi_1, phi_2, phi_3). The absolute values passed to the sampler are:
+#   sigma_k = r_SIGMA_K*K0
+#   k_min   = r_K_MIN*K0
+#   k_max   = r_K_MAX*K0
+r_SIGMA_K: float | tuple[float, float, float] = 0.15
+r_K_MIN: float | tuple[float, float, float] = 0.7
+r_K_MAX: float | tuple[float, float, float] = 1.3
+
+# Optional correlation control for phi_2 and phi_3. If enabled, two independent
+# base waves Sa and Sb are generated, then:
+#   phi_2 = normalize(Sa + c*Sb)
+#   phi_3 = normalize(Sa - c*Sb)
+# For iid Gaussian base waves, corr(phi_2, phi_3) = (1-c^2)/(1+c^2).
+COUPLE_PHI2_PHI3 = False
+PHI23_COUPLING_C = 1.0
+
+# Used only when K_DISTRIBUTION = "user_list".
+# If SHARED_K_VECTORS is True, provide one list of (kx, ky, kz) vectors.
+# If SHARED_K_VECTORS is False, provide a 3-tuple of such lists, one per field.
+USER_K_VECTORS: Sequence[Sequence[float]] | tuple[
+    Sequence[Sequence[float]], Sequence[Sequence[float]], Sequence[Sequence[float]]
+] = (
+    (8.0, 0.0, 0.0),
+    (0.0, 8.0, 0.0),
+    (0.0, 0.0, 8.0),
+)
+
+# Share the same sampled k-vectors among phi_1, phi_2, phi_3, while keeping
+# amplitudes and phases independent. If False, each field gets its own k-set.
+SHARED_K_VECTORS = True
+
+# Tube-domain thresholds for visualizing pairwise zero lines:
+#   S_12 = {phi_1^2 + phi_2^2 < EPSILON_12^2}
+#   S_13 = {phi_1^2 + phi_3^2 < EPSILON_13^2}
+EPSILON_12 = 0.18
+EPSILON_13 = 0.18
+
+# Context zero surfaces.
+SHOW_PHI1_ZERO_SURFACE = True
+SHOW_PHI2_ZERO_SURFACE = False
+SHOW_PHI3_ZERO_SURFACE = False
+
+# Rendering and output.
+WINDOW_SIZE = (1000, 1000)
+BACKGROUND_COLOR = "white"
+CAMERA_ZOOM = 0.82
+
+S12_TUBE_COLOR = "red"
+S13_TUBE_COLOR = "blue"
+S12_TUBE_OPACITY = 0.95
+S13_TUBE_OPACITY = 0.95
+LINE_DOMAIN_OPACITY = 0.62
+
+PHI1_SURFACE_COLOR = "gray"
+PHI2_SURFACE_COLOR = "tomato"
+PHI3_SURFACE_COLOR = "royalblue"
+PHI1_SURFACE_OPACITY = 0.13
+PHI2_SURFACE_OPACITY = 0.07
+PHI3_SURFACE_OPACITY = 0.07
+ZERO_SURFACE_OPACITY = 0.10
+SHOW_PHI_SURFACE_EDGES = False
+PHI_SURFACE_EDGE_COLOR = "black"
+SHOW_TUBE_EDGES = False
+TUBE_EDGE_COLOR = "black"
+SHOW_CROSSLINK_EDGES = False
+CROSSLINK_EDGE_COLOR = "black"
+SHOW_BOUNDING_BOX = True
+BOUNDING_BOX_COLOR = "black"
+BOUNDING_BOX_LINE_WIDTH = 1.0
+
+# Vortex-line rendering traces phase windings of psi_12=phi1+i*phi2 and
+# psi_13=phi1+i*phi3. This gives line geometry directly, avoiding the bulged
+# tube-boundary isosurfaces from phi_a^2+phi_b^2=epsilon^2.
+USE_VORTEX_TRACING = True
+VORTEX_TUBE_RADIUS = 0.35
+MIN_VORTEX_SEGMENT_LENGTH = 0.0
+SMOOTH_VORTEX_LINES = True
+VORTEX_SMOOTHING_SCALE = 4
+VORTEX_MIN_SMOOTH_POINTS = 5
+# If None, use the same style as Vortex.py: s = n_points + sqrt(2*n_points).
+VORTEX_SPLINE_SMOOTHING: float | None = None
+
+SHOW_CROSSLINK_NODES = True
+CROSSLINK_SEARCH_RADIUS = 1.25
+CROSSLINK_MERGE_RADIUS = 0.75
+CROSSLINK_BALL_RADIUS = 0.85
+CROSSLINK_COLOR = "black"
+CROSSLINK_ADJUST_TO_SMOOTHED_LINES = True
+CROSSLINK_SEGMENT_CANDIDATES = 12
+CROSSLINK_ADJUST_CENTER_WEIGHT = 0.25
+CROSSLINK_ADJUST_CLUSTER_RADIUS = CROSSLINK_MERGE_RADIUS
+
+SAVE_SCREENSHOT = True
+SCREENSHOT_PATH = "random_wave_line_network.png"
+
+SAVE_MESHES = False
+MESH_OUTPUT_DIR = "random_wave_line_meshes"
+S12_MESH_NAME = "S12_red_domain.vtp"
+S13_MESH_NAME = "S13_blue_domain.vtp"
+
+
+# =============================================================================
+# Random-wave construction
+# =============================================================================
+
+
+KDistribution = Literal["single_shell", "gaussian_radial", "uniform_band", "user_list"]
+
+
+@dataclass(frozen=True)
+class FieldKSets:
+    """Container for the wavevector sets used by the three fields."""
+
+    phi1: np.ndarray
+    phi2: np.ndarray
+    phi3: np.ndarray
+
+
+def _mode_counts(num_modes: int | Sequence[int]) -> tuple[int, int, int]:
+    if isinstance(num_modes, int):
+        return (num_modes, num_modes, num_modes)
+    if len(num_modes) != 3:
+        raise ValueError("NUM_MODES must be an integer or a length-3 sequence.")
+    return tuple(int(n) for n in num_modes)
+
+
+def _field_parameter_values(value: float | Sequence[float], name: str) -> tuple[float, float, float]:
+    """Return one parameter value per field from a scalar or length-3 tuple."""
+
+    if isinstance(value, (int, float)):
+        scalar = float(value)
+        return (scalar, scalar, scalar)
+    if len(value) != 3:
+        raise ValueError(f"{name} must be a float or a length-3 sequence.")
+    return tuple(float(item) for item in value)
+
+
+def _isotropic_unit_vectors(count: int, rng: np.random.Generator) -> np.ndarray:
+    directions = rng.normal(size=(count, 3))
+    norms = np.linalg.norm(directions, axis=1)
+    while np.any(norms == 0.0):
+        bad = norms == 0.0
+        directions[bad] = rng.normal(size=(np.count_nonzero(bad), 3))
+        norms = np.linalg.norm(directions, axis=1)
+    return directions / norms[:, None]
+
+
+def sample_k_vectors(
+    count: int,
+    distribution: KDistribution,
+    rng: np.random.Generator,
+    *,
+    k0: float = K0,
+    sigma_k: float | None = None,
+    k_min: float | None = None,
+    k_max: float | None = None,
+    user_vectors: Iterable[Sequence[float]] | None = None,
+) -> np.ndarray:
+    """
+    Sample wavevectors normalized relative to the box size.
+
+    The fields use cos(2*pi*k dot r_tilde + theta), where r_tilde=(x/N,y/N,z/N).
+    Integer-valued k components make the waves exactly periodic on the grid.
+    Isotropic radial choices below allow non-integer components to give continuous
+    directional control; increase/decrease k magnitudes to tune feature scale.
+    """
+
+    if count <= 0:
+        raise ValueError("count must be positive.")
+
+    if distribution == "user_list":
+        if user_vectors is None:
+            raise ValueError("user_vectors must be supplied for 'user_list'.")
+        vectors = np.asarray(list(user_vectors), dtype=float)
+        if vectors.ndim != 2 or vectors.shape[1] != 3:
+            raise ValueError("user_vectors must have shape (M, 3).")
+        if len(vectors) < count:
+            raise ValueError("user_vectors contains fewer vectors than requested.")
+        return vectors[:count].copy()
+
+    directions = _isotropic_unit_vectors(count, rng)
+
+    if distribution == "single_shell":
+        radii = np.full(count, float(k0))
+    elif distribution == "gaussian_radial":
+        if sigma_k is None:
+            sigma_k = float(k0) * 0.15
+        if sigma_k <= 0.0:
+            raise ValueError("sigma_k must be positive for 'gaussian_radial'.")
+        radii = rng.normal(float(k0), float(sigma_k), size=count)
+        while np.any(radii <= 0.0):
+            bad = radii <= 0.0
+            radii[bad] = rng.normal(float(k0), float(sigma_k), size=np.count_nonzero(bad))
+    elif distribution == "uniform_band":
+        if k_min is None:
+            k_min = 0.7 * float(k0)
+        if k_max is None:
+            k_max = 1.3 * float(k0)
+        if k_max <= k_min:
+            raise ValueError("k_max must exceed k_min for 'uniform_band'.")
+        radii = rng.uniform(float(k_min), float(k_max), size=count)
+    else:
+        raise ValueError(f"Unknown k-distribution: {distribution!r}")
+
+    return radii[:, None] * directions
+
+
+def make_field_k_sets(
+    num_modes: int | Sequence[int],
+    distribution: KDistribution,
+    rng: np.random.Generator,
+    *,
+    shared_k_vectors: bool,
+) -> FieldKSets:
+    """Create the k-vector sets for phi_1, phi_2, and phi_3."""
+
+    counts = _mode_counts(num_modes)
+    k0_values = _field_parameter_values(K0, "K0")
+    r_sigma_k_values = _field_parameter_values(r_SIGMA_K, "r_SIGMA_K")
+    r_k_min_values = _field_parameter_values(r_K_MIN, "r_K_MIN")
+    r_k_max_values = _field_parameter_values(r_K_MAX, "r_K_MAX")
+    sigma_k_values = tuple(r_sigma * k0 for r_sigma, k0 in zip(r_sigma_k_values, k0_values))
+    k_min_values = tuple(r_k_min * k0 for r_k_min, k0 in zip(r_k_min_values, k0_values))
+    k_max_values = tuple(r_k_max * k0 for r_k_max, k0 in zip(r_k_max_values, k0_values))
+
+    if distribution == "user_list" and not shared_k_vectors:
+        if len(USER_K_VECTORS) != 3:
+            raise ValueError(
+                "For independent user_list k-sets, USER_K_VECTORS must be a 3-tuple."
+            )
+        return FieldKSets(
+            sample_k_vectors(counts[0], distribution, rng, user_vectors=USER_K_VECTORS[0]),
+            sample_k_vectors(counts[1], distribution, rng, user_vectors=USER_K_VECTORS[1]),
+            sample_k_vectors(counts[2], distribution, rng, user_vectors=USER_K_VECTORS[2]),
+        )
+
+    if shared_k_vectors:
+        base_count = max(counts)
+        if (
+            len(set(k0_values)) > 1
+            or len(set(sigma_k_values)) > 1
+            or len(set(k_min_values)) > 1
+            or len(set(k_max_values)) > 1
+        ):
+            raise ValueError(
+                "SHARED_K_VECTORS=True requires scalar k-distribution parameters. "
+                "Use SHARED_K_VECTORS=False for per-field K0/r_SIGMA_K/r_K_MIN/r_K_MAX tuples."
+            )
+        base_vectors = sample_k_vectors(
+            base_count,
+            distribution,
+            rng,
+            k0=k0_values[0],
+            sigma_k=sigma_k_values[0],
+            k_min=k_min_values[0],
+            k_max=k_max_values[0],
+            user_vectors=USER_K_VECTORS,
+        )
+        return FieldKSets(
+            base_vectors[: counts[0]].copy(),
+            base_vectors[: counts[1]].copy(),
+            base_vectors[: counts[2]].copy(),
+        )
+
+    return FieldKSets(
+        sample_k_vectors(
+            counts[0],
+            distribution,
+            rng,
+            k0=k0_values[0],
+            sigma_k=sigma_k_values[0],
+            k_min=k_min_values[0],
+            k_max=k_max_values[0],
+        ),
+        sample_k_vectors(
+            counts[1],
+            distribution,
+            rng,
+            k0=k0_values[1],
+            sigma_k=sigma_k_values[1],
+            k_min=k_min_values[1],
+            k_max=k_max_values[1],
+        ),
+        sample_k_vectors(
+            counts[2],
+            distribution,
+            rng,
+            k0=k0_values[2],
+            sigma_k=sigma_k_values[2],
+            k_min=k_min_values[2],
+            k_max=k_max_values[2],
+        ),
+    )
+
+
+def build_random_wave_field(
+    grid_size: int,
+    k_vectors: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    amplitude_scale: float = 1.0,
+    dtype: np.dtype = np.float32,
+) -> np.ndarray:
+    """
+    Build one real random-wave field and normalize it to zero mean/unit std.
+
+    The returned array is indexed as field[x, y, z]. This convention matches
+    PyVista point-data insertion when flattened with order="F".
+    """
+
+    n = int(grid_size)
+    coords = np.arange(n, dtype=np.float64) / float(n)
+    x = coords[:, None, None]
+    y = coords[None, :, None]
+    z = coords[None, None, :]
+
+    field = np.zeros((n, n, n), dtype=np.float64)
+    amplitudes = rng.normal(loc=0.0, scale=amplitude_scale, size=len(k_vectors))
+    phases = rng.uniform(0.0, 2.0 * np.pi, size=len(k_vectors))
+
+    for (kx, ky, kz), amplitude, phase0 in zip(k_vectors, amplitudes, phases):
+        phase = 2.0 * np.pi * (kx * x + ky * y + kz * z) + phase0
+        field += amplitude * np.cos(phase)
+
+    return normalize_field(field, dtype=dtype)
+
+
+def normalize_field(field: np.ndarray, *, dtype: np.dtype = np.float32) -> np.ndarray:
+    """Normalize a field to zero mean and unit standard deviation."""
+
+    field = np.asarray(field, dtype=np.float64)
+    field -= np.mean(field)
+    std = np.std(field)
+    if std == 0.0:
+        raise RuntimeError("Field has zero standard deviation.")
+    field /= std
+    return field.astype(dtype, copy=False)
+
+
+def build_correlated_phi2_phi3_fields(
+    grid_size: int,
+    k_vectors_a: np.ndarray,
+    k_vectors_b: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    coupling_c: float = PHI23_COUPLING_C,
+    dtype: np.dtype = np.float32,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build phi_2 and phi_3 from two independent base waves Sa and Sb.
+
+    The construction is:
+        phi_2 = normalize(Sa + c*Sb)
+        phi_3 = normalize(Sa - c*Sb)
+
+    If Sa and Sb are iid Gaussian random fields, the resulting pointwise
+    correlation is (1-c^2)/(1+c^2). Thus c=0 gives complete overlap and c=1
+    gives zero correlation, which is independence in the Gaussian limit.
+    """
+
+    c = float(coupling_c)
+    if c < 0.0:
+        raise ValueError("PHI23_COUPLING_C must be non-negative.")
+
+    sa = build_random_wave_field(grid_size, k_vectors_a, rng, dtype=np.float64)
+    sb = build_random_wave_field(grid_size, k_vectors_b, rng, dtype=np.float64)
+    phi2 = normalize_field(sa + c * sb, dtype=dtype)
+    phi3 = normalize_field(sa - c * sb, dtype=dtype)
+    return phi2, phi3
+
+
+def theoretical_phi23_correlation(coupling_c: float) -> float:
+    """Correlation from phi2=Sa+c*Sb and phi3=Sa-c*Sb for iid base waves."""
+
+    c = float(coupling_c)
+    return (1.0 - c * c) / (1.0 + c * c)
+
+
+def make_line_scalar(phi_a: np.ndarray, phi_b: np.ndarray) -> np.ndarray:
+    """Return phi_a^2 + phi_b^2, whose small values approximate a zero line."""
+
+    return np.square(phi_a, dtype=np.float32) + np.square(phi_b, dtype=np.float32)
+
+
+def _wrapped_phase_difference(delta: np.ndarray) -> np.ndarray:
+    """Wrap phase differences to (-pi, pi]."""
+
+    return (delta + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _plaquette_winding(
+    p00: np.ndarray,
+    p10: np.ndarray,
+    p11: np.ndarray,
+    p01: np.ndarray,
+) -> np.ndarray:
+    """Integer phase winding around oriented plaquettes."""
+
+    total = (
+        _wrapped_phase_difference(p10 - p00)
+        + _wrapped_phase_difference(p11 - p10)
+        + _wrapped_phase_difference(p01 - p11)
+        + _wrapped_phase_difference(p00 - p01)
+    )
+    return np.rint(total / (2.0 * np.pi)).astype(np.int8)
+
+
+def phase_winding_faces(phi_real: np.ndarray, phi_imag: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Detect phase winding on grid plaquettes for psi = phi_real + i*phi_imag.
+
+    Returns:
+        wx: winding on yz faces, indexed as wx[x_face, y_cell, z_cell]
+        wy: winding on xz faces, indexed as wy[x_cell, y_face, z_cell]
+        wz: winding on xy faces, indexed as wz[x_cell, y_cell, z_face]
+
+    The implementation uses non-periodic boundary cells. Periodic wrapping can
+    be added later by replacing the endpoint slices with rolled arrays and
+    connecting segments across opposite box faces.
+    """
+
+    phase = np.angle(phi_real + 1j * phi_imag)
+
+    wx = _plaquette_winding(
+        phase[:, :-1, :-1],
+        phase[:, 1:, :-1],
+        phase[:, 1:, 1:],
+        phase[:, :-1, 1:],
+    )
+    wy = _plaquette_winding(
+        phase[:-1, :, :-1],
+        phase[:-1, :, 1:],
+        phase[1:, :, 1:],
+        phase[1:, :, :-1],
+    )
+    wz = _plaquette_winding(
+        phase[:-1, :-1, :],
+        phase[1:, :-1, :],
+        phase[1:, 1:, :],
+        phase[:-1, 1:, :],
+    )
+    return wx, wy, wz
+
+
+def trace_vortex_segments(
+    phi_real: np.ndarray,
+    phi_imag: np.ndarray,
+    *,
+    min_segment_length: float = MIN_VORTEX_SEGMENT_LENGTH,
+) -> pv.PolyData:
+    """
+    Trace vortex-line segments from phase-winding plaquettes.
+
+    Each cell collects the centers of its pierced faces. Cells with two pierced
+    faces become one segment; cells with more pierced faces connect each pierced
+    face to the local centroid. This is a compact marching-vortex construction
+    for the pairwise zero set Re(psi)=0, Im(psi)=0.
+    """
+
+    wx, wy, wz = phase_winding_faces(phi_real, phi_imag)
+    nx, ny, nz = phi_real.shape
+
+    points: list[tuple[float, float, float]] = []
+    lines: list[int] = []
+
+    def add_segment(a: np.ndarray, b: np.ndarray) -> None:
+        if np.linalg.norm(b - a) < min_segment_length:
+            return
+        start = len(points)
+        points.append(tuple(a))
+        points.append(tuple(b))
+        lines.extend((2, start, start + 1))
+
+    face_count = np.zeros((nx - 1, ny - 1, nz - 1), dtype=np.uint8)
+    face_count += (wx[:-1, :, :] != 0)
+    face_count += (wx[1:, :, :] != 0)
+    face_count += (wy[:, :-1, :] != 0)
+    face_count += (wy[:, 1:, :] != 0)
+    face_count += (wz[:, :, :-1] != 0)
+    face_count += (wz[:, :, 1:] != 0)
+
+    active_cells = np.argwhere(face_count >= 2)
+    for i, j, k in active_cells:
+        face_points: list[np.ndarray] = []
+
+        if wx[i, j, k] != 0:
+            face_points.append(np.array([i, j + 0.5, k + 0.5], dtype=float))
+        if wx[i + 1, j, k] != 0:
+            face_points.append(np.array([i + 1, j + 0.5, k + 0.5], dtype=float))
+        if wy[i, j, k] != 0:
+            face_points.append(np.array([i + 0.5, j, k + 0.5], dtype=float))
+        if wy[i, j + 1, k] != 0:
+            face_points.append(np.array([i + 0.5, j + 1, k + 0.5], dtype=float))
+        if wz[i, j, k] != 0:
+            face_points.append(np.array([i + 0.5, j + 0.5, k], dtype=float))
+        if wz[i, j, k + 1] != 0:
+            face_points.append(np.array([i + 0.5, j + 0.5, k + 1], dtype=float))
+
+        if len(face_points) == 2:
+            add_segment(face_points[0], face_points[1])
+        elif len(face_points) > 2:
+            center = np.mean(face_points, axis=0)
+            for face_point in face_points:
+                add_segment(face_point, center)
+
+    poly = pv.PolyData()
+    if points:
+        poly.points = np.asarray(points)
+        poly.lines = np.asarray(lines, dtype=np.int_)
+    return poly
+
+
+def _polydata_segments_to_paths(poly: pv.PolyData) -> list[np.ndarray]:
+    """Convert a segment-only PolyData graph into ordered point paths."""
+
+    if poly.n_points == 0 or poly.n_lines == 0:
+        return []
+
+    raw_points = np.asarray(poly.points)
+    point_ids: dict[tuple[float, float, float], int] = {}
+    points: list[np.ndarray] = []
+    adjacency: dict[int, set[int]] = {}
+
+    def merged_id(point: np.ndarray) -> int:
+        key = tuple(np.round(point.astype(float), 6))
+        if key not in point_ids:
+            point_ids[key] = len(points)
+            points.append(np.asarray(point, dtype=float))
+            adjacency[point_ids[key]] = set()
+        return point_ids[key]
+
+    lines = np.asarray(poly.lines)
+    cursor = 0
+    edges: set[tuple[int, int]] = set()
+    while cursor < len(lines):
+        n_in_cell = int(lines[cursor])
+        ids = lines[cursor + 1 : cursor + 1 + n_in_cell]
+        cursor += n_in_cell + 1
+        if n_in_cell != 2:
+            continue
+        a = merged_id(raw_points[int(ids[0])])
+        b = merged_id(raw_points[int(ids[1])])
+        if a == b:
+            continue
+        edge = tuple(sorted((a, b)))
+        if edge in edges:
+            continue
+        edges.add(edge)
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+
+    visited_edges: set[tuple[int, int]] = set()
+    paths: list[np.ndarray] = []
+
+    def walk(start: int, nxt: int) -> list[int]:
+        path = [start, nxt]
+        visited_edges.add(tuple(sorted((start, nxt))))
+        prev, cur = start, nxt
+
+        while True:
+            candidates = [
+                node
+                for node in adjacency[cur]
+                if node != prev and tuple(sorted((cur, node))) not in visited_edges
+            ]
+            if len(candidates) != 1 or len(adjacency[cur]) != 2:
+                break
+            nxt_node = candidates[0]
+            visited_edges.add(tuple(sorted((cur, nxt_node))))
+            path.append(nxt_node)
+            prev, cur = cur, nxt_node
+        return path
+
+    branch_or_end_nodes = [node for node, neighbors in adjacency.items() if len(neighbors) != 2]
+    for node in branch_or_end_nodes:
+        for neighbor in adjacency[node]:
+            edge = tuple(sorted((node, neighbor)))
+            if edge not in visited_edges:
+                paths.append(np.array([points[idx] for idx in walk(node, neighbor)]))
+
+    for a, b in edges:
+        edge = tuple(sorted((a, b)))
+        if edge in visited_edges:
+            continue
+        loop = walk(a, b)
+        paths.append(np.array([points[idx] for idx in loop]))
+
+    return [path for path in paths if len(path) >= 2]
+
+
+def _smooth_path(path: np.ndarray) -> np.ndarray:
+    """Spline-smooth one ordered vortex path, following the approach in Vortex.py."""
+
+    if len(path) < VORTEX_MIN_SMOOTH_POINTS:
+        return path
+
+    x = np.arange(len(path), dtype=float)
+    x_fine = np.linspace(0.0, len(path) - 1.0, max(len(path) * VORTEX_SMOOTHING_SCALE, len(path)))
+    smoothing = (
+        len(path) + np.sqrt(2.0 * len(path))
+        if VORTEX_SPLINE_SMOOTHING is None
+        else float(VORTEX_SPLINE_SMOOTHING)
+    )
+    k = min(3, len(path) - 1)
+    splines = [splrep(x, path[:, axis], s=smoothing, k=k) for axis in range(3)]
+    return np.array([splev(x_fine, spline) for spline in splines]).T
+
+
+def smooth_vortex_polydata(poly: pv.PolyData) -> pv.PolyData:
+    """Merge traced vortex segments into ordered paths and spline-smooth them."""
+
+    paths = _polydata_segments_to_paths(poly)
+    if not paths:
+        return poly
+
+    out = pv.PolyData()
+    points: list[np.ndarray] = []
+    lines: list[int] = []
+
+    for path in paths:
+        smooth_path = _smooth_path(path) if SMOOTH_VORTEX_LINES else path
+        if len(smooth_path) < 2:
+            continue
+        start = len(points)
+        points.extend(smooth_path)
+        lines.extend([len(smooth_path), *range(start, start + len(smooth_path))])
+
+    if points:
+        out.points = np.asarray(points)
+        out.lines = np.asarray(lines, dtype=np.int_)
+    return out
+
+
+def _cluster_points(points: np.ndarray, radius: float) -> np.ndarray:
+    """Cluster nearby points and return one centroid per connected cluster."""
+
+    if len(points) == 0:
+        return np.empty((0, 3), dtype=float)
+
+    tree = cKDTree(points)
+    pairs = tree.query_pairs(r=radius)
+    parent = np.arange(len(points))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri = find(i)
+        rj = find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i, j in pairs:
+        union(i, j)
+
+    roots = np.array([find(i) for i in range(len(points))])
+    centers = []
+    for root in np.unique(roots):
+        centers.append(np.mean(points[roots == root], axis=0))
+    return np.asarray(centers)
+
+
+def find_crosslink_nodes(
+    s12_lines: pv.PolyData,
+    s13_lines: pv.PolyData,
+    *,
+    search_radius: float = CROSSLINK_SEARCH_RADIUS,
+    merge_radius: float | None = None,
+) -> np.ndarray:
+    """
+    Estimate triple-zero crosslink nodes from close contacts of two line families.
+
+    The retained line families are Gamma_12=(phi1=phi2=0) and
+    Gamma_13=(phi1=phi3=0). Their intersections are triple zeros. On a grid, the
+    two independently traced line sets rarely share exactly identical vertices,
+    so this function finds close vertex pairs and clusters their midpoints.
+    Candidate midpoint clusters farther apart than merge_radius remain separate.
+    """
+
+    if merge_radius is None:
+        merge_radius = CROSSLINK_MERGE_RADIUS
+
+    if s12_lines.n_points == 0 or s13_lines.n_points == 0:
+        return np.empty((0, 3), dtype=float)
+
+    p12 = np.asarray(s12_lines.points)
+    p13 = np.asarray(s13_lines.points)
+    tree13 = cKDTree(p13)
+    neighbors = tree13.query_ball_point(p12, r=search_radius)
+
+    midpoints = []
+    for i, ids in enumerate(neighbors):
+        for j in ids:
+            midpoints.append(0.5 * (p12[i] + p13[j]))
+
+    if not midpoints:
+        return np.empty((0, 3), dtype=float)
+
+    return _cluster_points(np.asarray(midpoints), radius=float(merge_radius))
+
+
+def _polydata_line_segments(poly: pv.PolyData) -> tuple[np.ndarray, np.ndarray]:
+    """Return start/end arrays for every consecutive segment in a line PolyData."""
+
+    if poly.n_points == 0 or poly.n_lines == 0:
+        empty = np.empty((0, 3), dtype=float)
+        return empty, empty
+
+    points = np.asarray(poly.points)
+    lines = np.asarray(poly.lines)
+    starts = []
+    ends = []
+    cursor = 0
+    while cursor < len(lines):
+        n_in_cell = int(lines[cursor])
+        ids = lines[cursor + 1 : cursor + 1 + n_in_cell].astype(int)
+        cursor += n_in_cell + 1
+        if n_in_cell < 2:
+            continue
+        for a_id, b_id in zip(ids[:-1], ids[1:]):
+            starts.append(points[a_id])
+            ends.append(points[b_id])
+
+    if not starts:
+        empty = np.empty((0, 3), dtype=float)
+        return empty, empty
+    return np.asarray(starts, dtype=float), np.asarray(ends, dtype=float)
+
+
+def _closest_points_between_segments(
+    p1: np.ndarray,
+    q1: np.ndarray,
+    p2: np.ndarray,
+    q2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Closest points on two 3D line segments."""
+
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = float(np.dot(d1, d1))
+    e = float(np.dot(d2, d2))
+    f = float(np.dot(d2, r))
+    eps = 1e-12
+
+    if a <= eps and e <= eps:
+        c1 = p1
+        c2 = p2
+        return c1, c2, float(np.linalg.norm(c1 - c2))
+
+    if a <= eps:
+        s = 0.0
+        t = np.clip(f / e, 0.0, 1.0)
+    else:
+        c = float(np.dot(d1, r))
+        if e <= eps:
+            t = 0.0
+            s = np.clip(-c / a, 0.0, 1.0)
+        else:
+            b = float(np.dot(d1, d2))
+            denom = a * e - b * b
+            if denom != 0.0:
+                s = np.clip((b * f - c * e) / denom, 0.0, 1.0)
+            else:
+                s = 0.0
+
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = np.clip(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = np.clip((b - c) / a, 0.0, 1.0)
+
+    c1 = p1 + s * d1
+    c2 = p2 + t * d2
+    return c1, c2, float(np.linalg.norm(c1 - c2))
+
+
+def adjust_crosslink_nodes_to_smoothed_lines(
+    raw_centers: np.ndarray,
+    s12_lines: pv.PolyData,
+    s13_lines: pv.PolyData,
+    *,
+    candidate_count: int = CROSSLINK_SEGMENT_CANDIDATES,
+    center_weight: float = CROSSLINK_ADJUST_CENTER_WEIGHT,
+    cluster_radius: float | None = None,
+) -> np.ndarray:
+    """
+    Move raw crosslink estimates onto the intersection of the smoothed lines.
+
+    For each raw node, nearby smoothed segments from both retained line families
+    are considered together. The adjusted node is the midpoint between the
+    closest points on the best pair of smoothed segments.
+    """
+
+    if len(raw_centers) == 0:
+        return raw_centers
+
+    if cluster_radius is None:
+        cluster_radius = CROSSLINK_MERGE_RADIUS
+
+    s12_starts, s12_ends = _polydata_line_segments(s12_lines)
+    s13_starts, s13_ends = _polydata_line_segments(s13_lines)
+    if len(s12_starts) == 0 or len(s13_starts) == 0:
+        return raw_centers
+
+    s12_midpoints = 0.5 * (s12_starts + s12_ends)
+    s13_midpoints = 0.5 * (s13_starts + s13_ends)
+    tree12 = cKDTree(s12_midpoints)
+    tree13 = cKDTree(s13_midpoints)
+    k12 = min(int(candidate_count), len(s12_midpoints))
+    k13 = min(int(candidate_count), len(s13_midpoints))
+
+    adjusted = []
+    for center in raw_centers:
+        ids12 = np.atleast_1d(tree12.query(center, k=k12)[1]).astype(int)
+        ids13 = np.atleast_1d(tree13.query(center, k=k13)[1]).astype(int)
+
+        best_score = np.inf
+        best_point = center
+        for id12 in ids12:
+            for id13 in ids13:
+                c12, c13, segment_distance = _closest_points_between_segments(
+                    s12_starts[id12],
+                    s12_ends[id12],
+                    s13_starts[id13],
+                    s13_ends[id13],
+                )
+                midpoint = 0.5 * (c12 + c13)
+                score = segment_distance + center_weight * float(np.linalg.norm(midpoint - center))
+                if score < best_score:
+                    best_score = score
+                    best_point = midpoint
+        adjusted.append(best_point)
+
+    return _cluster_points(np.asarray(adjusted), radius=float(cluster_radius))
+
+
+def make_crosslink_node_mesh(
+    centers: np.ndarray,
+    *,
+    radius: float | None = None,
+) -> pv.PolyData:
+    """Create a merged sphere mesh for crosslink nodes."""
+
+    if radius is None:
+        radius = CROSSLINK_BALL_RADIUS
+
+    merged = pv.PolyData()
+    for center in centers:
+        sphere = pv.Sphere(radius=radius, center=tuple(center), theta_resolution=20, phi_resolution=20)
+        merged = merged.merge(sphere)
+    return merged
+
+
+# =============================================================================
+# PyVista visualization
+# =============================================================================
+
+
+def make_image_data(grid_size: int) -> pv.ImageData:
+    """Create a point-centered ImageData grid with coordinates 0..N-1."""
+
+    grid = pv.ImageData()
+    grid.dimensions = (grid_size, grid_size, grid_size)
+    grid.origin = (0.0, 0.0, 0.0)
+    grid.spacing = (1.0, 1.0, 1.0)
+    return grid
+
+
+def add_scalar_field(grid: pv.ImageData, name: str, values: np.ndarray) -> None:
+    """Attach field[x,y,z] to PyVista point data with correct VTK ordering."""
+
+    grid.point_data[name] = np.asarray(values).ravel(order="F")
+
+
+def add_isosurface_to_plotter(
+    plotter: pv.Plotter,
+    grid: pv.ImageData,
+    scalar_name: str,
+    *,
+    value: float = 0.0,
+    color: str = "lightgray",
+    opacity: float = ZERO_SURFACE_OPACITY,
+    smooth_shading: bool = True,
+    show_edges: bool = SHOW_PHI_SURFACE_EDGES,
+    edge_color: str = PHI_SURFACE_EDGE_COLOR,
+) -> pv.PolyData:
+    """Extract and render an isosurface for a scalar field."""
+
+    surface = grid.contour(isosurfaces=[value], scalars=scalar_name)
+    plotter.add_mesh(
+        surface,
+        color=color,
+        opacity=opacity,
+        smooth_shading=smooth_shading,
+        show_edges=show_edges,
+        edge_color=edge_color,
+        specular=0.12,
+        name=f"{scalar_name}_isosurface",
+    )
+    return surface
+
+
+def extract_line_domain(
+    grid: pv.ImageData,
+    scalar_name: str,
+    epsilon: float,
+) -> pv.PolyData:
+    """Extract the epsilon tube boundary as scalar_name = epsilon^2."""
+
+    return grid.contour(isosurfaces=[float(epsilon) ** 2], scalars=scalar_name)
+
+
+def add_line_domain_to_plotter(
+    plotter: pv.Plotter,
+    mesh: pv.PolyData,
+    *,
+    color: str,
+    opacity: float = LINE_DOMAIN_OPACITY,
+    name: str,
+    show_edges: bool = SHOW_TUBE_EDGES,
+    edge_color: str = TUBE_EDGE_COLOR,
+) -> None:
+    plotter.add_mesh(
+        mesh,
+        color=color,
+        opacity=opacity,
+        smooth_shading=True,
+        show_edges=show_edges,
+        edge_color=edge_color,
+        specular=0.25,
+        name=name,
+    )
+
+
+def save_mesh(mesh: pv.PolyData, output_dir: str | Path, file_name: str) -> Path:
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    out_path = path / file_name
+    mesh.save(out_path)
+    return out_path
+
+
+def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    k_sets = make_field_k_sets(
+        NUM_MODES,
+        K_DISTRIBUTION,
+        rng,
+        shared_k_vectors=SHARED_K_VECTORS,
+    )
+
+    print("Building phi_1...")
+    phi1 = build_random_wave_field(GRID_SIZE, k_sets.phi1, rng)
+    if COUPLE_PHI2_PHI3:
+        print(
+            "Building coupled phi_2/phi_3 "
+            f"(c={PHI23_COUPLING_C}, theoretical corr={theoretical_phi23_correlation(PHI23_COUPLING_C):.3f})..."
+        )
+        phi2, phi3 = build_correlated_phi2_phi3_fields(
+            GRID_SIZE,
+            k_sets.phi2,
+            k_sets.phi3,
+            rng,
+            coupling_c=PHI23_COUPLING_C,
+        )
+    else:
+        print("Building phi_2...")
+        phi2 = build_random_wave_field(GRID_SIZE, k_sets.phi2, rng)
+        print("Building phi_3...")
+        phi3 = build_random_wave_field(GRID_SIZE, k_sets.phi3, rng)
+
+    s12 = make_line_scalar(phi1, phi2)
+    s13 = make_line_scalar(phi1, phi3)
+
+    grid = make_image_data(GRID_SIZE)
+    add_scalar_field(grid, "phi1", phi1)
+    add_scalar_field(grid, "phi2", phi2)
+    add_scalar_field(grid, "phi3", phi3)
+    add_scalar_field(grid, "S12_scalar", s12)
+    add_scalar_field(grid, "S13_scalar", s13)
+
+    print("Extracting S_12 and S_13 tube-domain meshes...")
+    if USE_VORTEX_TRACING:
+        s12_raw_mesh = trace_vortex_segments(phi1, phi2)
+        s13_raw_mesh = trace_vortex_segments(phi1, phi3)
+        raw_crosslink_centers = find_crosslink_nodes(s12_raw_mesh, s13_raw_mesh)
+        s12_mesh = smooth_vortex_polydata(s12_raw_mesh)
+        s13_mesh = smooth_vortex_polydata(s13_raw_mesh)
+        if CROSSLINK_ADJUST_TO_SMOOTHED_LINES:
+            crosslink_centers = adjust_crosslink_nodes_to_smoothed_lines(
+                raw_crosslink_centers,
+                s12_mesh,
+                s13_mesh,
+            )
+        else:
+            crosslink_centers = raw_crosslink_centers
+    else:
+        s12_mesh = extract_line_domain(grid, "S12_scalar", EPSILON_12)
+        s13_mesh = extract_line_domain(grid, "S13_scalar", EPSILON_13)
+        raw_crosslink_centers = np.empty((0, 3), dtype=float)
+        crosslink_centers = np.empty((0, 3), dtype=float)
+
+    plotter = pv.Plotter(window_size=WINDOW_SIZE)
+    plotter.set_background(BACKGROUND_COLOR)
+
+    if USE_VORTEX_TRACING:
+        s12_display = s12_mesh.tube(radius=VORTEX_TUBE_RADIUS) if s12_mesh.n_points else s12_mesh
+        s13_display = s13_mesh.tube(radius=VORTEX_TUBE_RADIUS) if s13_mesh.n_points else s13_mesh
+        add_line_domain_to_plotter(
+            plotter,
+            s12_display,
+            color=S12_TUBE_COLOR,
+            opacity=S12_TUBE_OPACITY,
+            name="S12",
+            show_edges=SHOW_TUBE_EDGES,
+            edge_color=TUBE_EDGE_COLOR,
+        )
+        add_line_domain_to_plotter(
+            plotter,
+            s13_display,
+            color=S13_TUBE_COLOR,
+            opacity=S13_TUBE_OPACITY,
+            name="S13",
+            show_edges=SHOW_TUBE_EDGES,
+            edge_color=TUBE_EDGE_COLOR,
+        )
+    else:
+        add_line_domain_to_plotter(
+            plotter,
+            s12_mesh,
+            color=S12_TUBE_COLOR,
+            opacity=LINE_DOMAIN_OPACITY,
+            name="S12",
+            show_edges=SHOW_TUBE_EDGES,
+            edge_color=TUBE_EDGE_COLOR,
+        )
+        add_line_domain_to_plotter(
+            plotter,
+            s13_mesh,
+            color=S13_TUBE_COLOR,
+            opacity=LINE_DOMAIN_OPACITY,
+            name="S13",
+            show_edges=SHOW_TUBE_EDGES,
+            edge_color=TUBE_EDGE_COLOR,
+        )
+
+    if SHOW_PHI1_ZERO_SURFACE:
+        add_isosurface_to_plotter(
+            plotter,
+            grid,
+            "phi1",
+            color=PHI1_SURFACE_COLOR,
+            opacity=PHI1_SURFACE_OPACITY,
+            show_edges=SHOW_PHI_SURFACE_EDGES,
+            edge_color=PHI_SURFACE_EDGE_COLOR,
+        )
+    if SHOW_PHI2_ZERO_SURFACE:
+        add_isosurface_to_plotter(
+            plotter,
+            grid,
+            "phi2",
+            color=PHI2_SURFACE_COLOR,
+            opacity=PHI2_SURFACE_OPACITY,
+            show_edges=SHOW_PHI_SURFACE_EDGES,
+            edge_color=PHI_SURFACE_EDGE_COLOR,
+        )
+    if SHOW_PHI3_ZERO_SURFACE:
+        add_isosurface_to_plotter(
+            plotter,
+            grid,
+            "phi3",
+            color=PHI3_SURFACE_COLOR,
+            opacity=PHI3_SURFACE_OPACITY,
+            show_edges=SHOW_PHI_SURFACE_EDGES,
+            edge_color=PHI_SURFACE_EDGE_COLOR,
+        )
+
+    if SHOW_CROSSLINK_NODES and len(crosslink_centers) > 0:
+        crosslink_mesh = make_crosslink_node_mesh(
+            crosslink_centers,
+            radius=CROSSLINK_BALL_RADIUS,
+        )
+        plotter.add_mesh(
+            crosslink_mesh,
+            color=CROSSLINK_COLOR,
+            opacity=1.0,
+            smooth_shading=True,
+            show_edges=SHOW_CROSSLINK_EDGES,
+            edge_color=CROSSLINK_EDGE_COLOR,
+            specular=0.35,
+            name="crosslink_nodes",
+        )
+
+    if SHOW_BOUNDING_BOX:
+        plotter.add_bounding_box(color=BOUNDING_BOX_COLOR, line_width=BOUNDING_BOX_LINE_WIDTH)
+    plotter.add_axes(line_width=2, labels_off=False)
+    plotter.camera_position = "iso"
+    plotter.reset_camera()
+    plotter.camera.zoom(CAMERA_ZOOM)
+    plotter.camera.reset_clipping_range()
+
+    meshes = {
+        "S12": s12_mesh,
+        "S13": s13_mesh,
+        "crosslink_centers": crosslink_centers,
+        "raw_crosslink_centers": raw_crosslink_centers,
+    }
+    return plotter, meshes
+
+
+def main() -> None:
+    plotter, meshes = build_scene()
+
+    if SAVE_MESHES:
+        s12_path = save_mesh(meshes["S12"], MESH_OUTPUT_DIR, S12_MESH_NAME)
+        s13_path = save_mesh(meshes["S13"], MESH_OUTPUT_DIR, S13_MESH_NAME)
+        print(f"Saved S_12 mesh: {s12_path}")
+        print(f"Saved S_13 mesh: {s13_path}")
+
+    if SAVE_SCREENSHOT:
+        plotter.show(screenshot=SCREENSHOT_PATH)
+        print(f"Saved screenshot: {SCREENSHOT_PATH}")
+    else:
+        plotter.show()
+
+    print(
+        "\nMorphology tuning note:\n"
+        "  Larger k values produce finer line-network features; smaller k values\n"
+        "  produce coarser features. A single shell gives a narrow wavelength,\n"
+        "  Gaussian radial sampling broadens the length-scale distribution, and a\n"
+        "  uniform band limits features to a controlled k interval. More modes make\n"
+        "  the random waves closer to Gaussian and usually smooth out directional\n"
+        "  artifacts. Increasing epsilon thickens the displayed tube domains around\n"
+        "  Gamma_12 and Gamma_13. Shared k-sets correlate morphology across fields,\n"
+        "  while independent k-sets decorrelate them. Additional correlation between\n"
+        "  phi_2 and phi_3 can be introduced by partially sharing amplitudes/phases\n"
+        "  or by mixing fields, which changes how often the two retained line\n"
+        "  families approach the same triple-zero crosslink nodes."
+    )
+
+
+if __name__ == "__main__":
+    main()
