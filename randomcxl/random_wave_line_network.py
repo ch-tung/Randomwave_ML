@@ -137,6 +137,11 @@ CROSSLINK_SEARCH_RADIUS = 1.25
 CROSSLINK_MERGE_RADIUS = 0.75
 CROSSLINK_BALL_RADIUS = 0.85
 CROSSLINK_COLOR = "black"
+ORDER_CROSSLINK_BALLS = False
+CROSSLINK_TRACE_LINES = True
+CROSSLINK_ORDER_LINK_RADIUS = 2.0
+CROSSLINK_ORDER_SPACING = 1.5
+CROSSLINK_ORDER_MIN_NODES = 3
 CROSSLINK_ADJUST_TO_SMOOTHED_LINES = True
 CROSSLINK_SEGMENT_CANDIDATES = 12
 CROSSLINK_ADJUST_CENTER_WEIGHT = 0.25
@@ -735,23 +740,43 @@ def find_crosslink_nodes(
     if merge_radius is None:
         merge_radius = CROSSLINK_MERGE_RADIUS
 
+    candidate_midpoints = find_crosslink_candidate_midpoints(
+        s12_lines,
+        s13_lines,
+        search_radius=search_radius,
+    )
+    if len(candidate_midpoints) == 0:
+        return np.empty((0, 3), dtype=float)
+
+    return _cluster_points(candidate_midpoints, radius=float(merge_radius))
+
+
+def find_crosslink_candidate_midpoints(
+    s12_lines: pv.PolyData,
+    s13_lines: pv.PolyData,
+    *,
+    search_radius: float = CROSSLINK_SEARCH_RADIUS,
+) -> np.ndarray:
+    """
+    Return dense close-contact midpoint candidates before crosslink merging.
+
+    This is useful when phi_2 and phi_3 are strongly coupled. Then Gamma_12 and
+    Gamma_13 can overlap for extended distances, and clustering all candidates
+    immediately would collapse many visible contact sites into one node.
+    """
+
     if s12_lines.n_points == 0 or s13_lines.n_points == 0:
         return np.empty((0, 3), dtype=float)
 
     p12 = np.asarray(s12_lines.points)
     p13 = np.asarray(s13_lines.points)
     tree13 = cKDTree(p13)
-    neighbors = tree13.query_ball_point(p12, r=search_radius)
-
-    midpoints = []
-    for i, ids in enumerate(neighbors):
-        for j in ids:
-            midpoints.append(0.5 * (p12[i] + p13[j]))
-
-    if not midpoints:
+    distances, ids = tree13.query(p12, k=1, distance_upper_bound=float(search_radius))
+    valid = np.isfinite(distances) & (ids < len(p13))
+    if not np.any(valid):
         return np.empty((0, 3), dtype=float)
 
-    return _cluster_points(np.asarray(midpoints), radius=float(merge_radius))
+    return 0.5 * (p12[valid] + p13[ids[valid]])
 
 
 def _polydata_line_segments(poly: pv.PolyData) -> tuple[np.ndarray, np.ndarray]:
@@ -852,9 +877,6 @@ def adjust_crosslink_nodes_to_smoothed_lines(
     if len(raw_centers) == 0:
         return raw_centers
 
-    if cluster_radius is None:
-        cluster_radius = CROSSLINK_MERGE_RADIUS
-
     s12_starts, s12_ends = _polydata_line_segments(s12_lines)
     s13_starts, s13_ends = _polydata_line_segments(s13_lines)
     if len(s12_starts) == 0 or len(s13_starts) == 0:
@@ -889,7 +911,10 @@ def adjust_crosslink_nodes_to_smoothed_lines(
                     best_point = midpoint
         adjusted.append(best_point)
 
-    return _cluster_points(np.asarray(adjusted), radius=float(cluster_radius))
+    adjusted_points = np.asarray(adjusted)
+    if cluster_radius is None or cluster_radius <= 0:
+        return adjusted_points
+    return _cluster_points(adjusted_points, radius=float(cluster_radius))
 
 
 def make_crosslink_node_mesh(
@@ -907,6 +932,260 @@ def make_crosslink_node_mesh(
         sphere = pv.Sphere(radius=radius, center=tuple(center), theta_resolution=20, phi_resolution=20)
         merged = merged.merge(sphere)
     return merged
+
+
+def _minimum_spanning_adjacency(
+    centers: np.ndarray,
+    pairs: list[tuple[int, int]],
+) -> dict[int, list[tuple[int, float]]]:
+    """Build a sparse nearest-neighbor tree from candidate close pairs."""
+
+    parent = np.arange(len(centers))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    adjacency: dict[int, list[tuple[int, float]]] = {i: [] for i in range(len(centers))}
+    weighted_pairs = [
+        (float(np.linalg.norm(centers[i] - centers[j])), int(i), int(j))
+        for i, j in pairs
+    ]
+    for distance, i, j in sorted(weighted_pairs):
+        ri = find(i)
+        rj = find(j)
+        if ri == rj:
+            continue
+        parent[rj] = ri
+        adjacency[i].append((j, distance))
+        adjacency[j].append((i, distance))
+    return adjacency
+
+
+def _tree_farthest_path(
+    adjacency: dict[int, list[tuple[int, float]]],
+    component: list[int],
+) -> list[int]:
+    """Return the weighted-diameter path through one tree component."""
+
+    def farthest_from(start: int) -> tuple[int, dict[int, int | None]]:
+        distances = {start: 0.0}
+        parents: dict[int, int | None] = {start: None}
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for neighbor, weight in adjacency[node]:
+                if neighbor in distances:
+                    continue
+                distances[neighbor] = distances[node] + weight
+                parents[neighbor] = node
+                stack.append(neighbor)
+        farthest = max(distances, key=distances.get)
+        return farthest, parents
+
+    a, _ = farthest_from(component[0])
+    b, parents = farthest_from(a)
+    path = [b]
+    while path[-1] != a:
+        parent = parents[path[-1]]
+        if parent is None:
+            break
+        path.append(parent)
+    path.reverse()
+    return path
+
+
+def _resample_polyline(points: np.ndarray, spacing: float) -> np.ndarray:
+    """Place evenly spaced points along an ordered polyline."""
+
+    if len(points) < 2 or spacing <= 0.0:
+        return points
+
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    total_length = float(cumulative[-1])
+    if total_length == 0.0:
+        return points[:1]
+
+    sample_distances = list(np.arange(0.0, total_length, float(spacing)))
+    if not np.isclose(sample_distances[-1], total_length):
+        sample_distances.append(total_length)
+
+    samples = []
+    for distance in sample_distances:
+        idx = int(np.searchsorted(cumulative, distance, side="right") - 1)
+        idx = min(idx, len(points) - 2)
+        span = cumulative[idx + 1] - cumulative[idx]
+        fraction = 0.0 if span == 0.0 else (distance - cumulative[idx]) / span
+        samples.append(points[idx] + fraction * (points[idx + 1] - points[idx]))
+    return np.asarray(samples)
+
+
+def order_crosslink_centers_with_spacing(
+    centers: np.ndarray,
+    *,
+    link_radius: float = CROSSLINK_ORDER_LINK_RADIUS,
+    spacing: float = CROSSLINK_ORDER_SPACING,
+    min_nodes: int = CROSSLINK_ORDER_MIN_NODES,
+) -> np.ndarray:
+    """
+    Redistribute close crosslink centers as evenly spaced balls along local paths.
+
+    Nearby centers are grouped with link_radius. Components with at least
+    min_nodes are ordered along their nearest-neighbor tree diameter and
+    redistributed using the requested spacing.
+    """
+
+    if len(centers) < max(2, int(min_nodes)):
+        return centers
+
+    centers = np.asarray(centers, dtype=float)
+    tree = cKDTree(centers)
+    pairs = [(int(i), int(j)) for i, j in tree.query_pairs(r=float(link_radius))]
+    if not pairs:
+        return centers
+
+    adjacency = _minimum_spanning_adjacency(centers, pairs)
+    visited: set[int] = set()
+    ordered_centers = []
+
+    for start in range(len(centers)):
+        if start in visited:
+            continue
+        stack = [start]
+        component = []
+        visited.add(start)
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for neighbor, _ in adjacency[node]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+
+        if len(component) < int(min_nodes):
+            ordered_centers.extend(centers[component])
+            continue
+
+        path_ids = _tree_farthest_path(adjacency, component)
+        path_points = centers[path_ids]
+        ordered_centers.extend(_resample_polyline(path_points, float(spacing)))
+
+    return np.asarray(ordered_centers, dtype=float)
+
+
+def trace_crosslink_lines(
+    candidate_centers: np.ndarray,
+    *,
+    link_radius: float = CROSSLINK_ORDER_LINK_RADIUS,
+    min_nodes: int = CROSSLINK_ORDER_MIN_NODES,
+) -> pv.PolyData:
+    """
+    Trace dense crosslink contacts into line-like overlap paths.
+
+    This follows the same idea as vortex-line rendering: local vertices are
+    connected into ordered paths, optionally smoothed, and represented as a
+    PyVista line mesh. Ball sites can then be sampled from this mesh.
+    """
+
+    out = pv.PolyData()
+    if len(candidate_centers) < max(2, int(min_nodes)):
+        return out
+
+    centers = np.asarray(candidate_centers, dtype=float)
+    tree = cKDTree(centers)
+    pairs = [(int(i), int(j)) for i, j in tree.query_pairs(r=float(link_radius))]
+    if not pairs:
+        return out
+
+    adjacency = _minimum_spanning_adjacency(centers, pairs)
+    visited: set[int] = set()
+    points: list[np.ndarray] = []
+    lines: list[int] = []
+
+    for start in range(len(centers)):
+        if start in visited:
+            continue
+        stack = [start]
+        component = []
+        visited.add(start)
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for neighbor, _ in adjacency[node]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+
+        if len(component) < int(min_nodes):
+            continue
+
+        path_ids = _tree_farthest_path(adjacency, component)
+        path_points = centers[path_ids]
+        if SMOOTH_VORTEX_LINES:
+            path_points = _smooth_path(path_points)
+        if len(path_points) < 2:
+            continue
+
+        path_start = len(points)
+        points.extend(path_points)
+        lines.extend([len(path_points), *range(path_start, path_start + len(path_points))])
+
+    if points:
+        out.points = np.asarray(points, dtype=float)
+        out.lines = np.asarray(lines, dtype=np.int_)
+    return out
+
+
+def sample_crosslink_line_sites(
+    crosslink_lines: pv.PolyData,
+    *,
+    spacing: float = CROSSLINK_ORDER_SPACING,
+) -> np.ndarray:
+    """Sample evenly spaced ball centers from traced crosslink line paths."""
+
+    if crosslink_lines.n_points == 0 or crosslink_lines.n_lines == 0:
+        return np.empty((0, 3), dtype=float)
+
+    points = np.asarray(crosslink_lines.points)
+    lines = np.asarray(crosslink_lines.lines)
+    samples = []
+    cursor = 0
+    while cursor < len(lines):
+        n_in_cell = int(lines[cursor])
+        ids = lines[cursor + 1 : cursor + 1 + n_in_cell].astype(int)
+        cursor += n_in_cell + 1
+        if n_in_cell < 2:
+            continue
+        samples.extend(_resample_polyline(points[ids], float(spacing)))
+
+    if not samples:
+        return np.empty((0, 3), dtype=float)
+    return np.asarray(samples, dtype=float)
+
+
+def enforce_crosslink_site_spacing(
+    centers: np.ndarray,
+    *,
+    min_spacing: float = CROSSLINK_ORDER_SPACING,
+) -> np.ndarray:
+    """Greedily remove displayed crosslink balls closer than min_spacing."""
+
+    if len(centers) < 2 or min_spacing <= 0:
+        return centers
+
+    centers = np.asarray(centers, dtype=float)
+    kept: list[np.ndarray] = []
+    for center in centers:
+        if not kept:
+            kept.append(center)
+            continue
+        distances = np.linalg.norm(np.asarray(kept) - center, axis=1)
+        if np.all(distances >= float(min_spacing)):
+            kept.append(center)
+    return np.asarray(kept, dtype=float)
 
 
 # =============================================================================
@@ -1042,7 +1321,21 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
     if USE_VORTEX_TRACING:
         s12_raw_mesh = trace_vortex_segments(phi1, phi2)
         s13_raw_mesh = trace_vortex_segments(phi1, phi3)
-        raw_crosslink_centers = find_crosslink_nodes(s12_raw_mesh, s13_raw_mesh)
+        crosslink_candidate_centers = find_crosslink_candidate_midpoints(
+            s12_raw_mesh,
+            s13_raw_mesh,
+            search_radius=CROSSLINK_SEARCH_RADIUS,
+        )
+        raw_crosslink_centers = (
+            _cluster_points(crosslink_candidate_centers, radius=float(CROSSLINK_MERGE_RADIUS))
+            if len(crosslink_candidate_centers)
+            else np.empty((0, 3), dtype=float)
+        )
+        crosslink_line_mesh = trace_crosslink_lines(
+            crosslink_candidate_centers,
+            link_radius=CROSSLINK_ORDER_LINK_RADIUS,
+            min_nodes=CROSSLINK_ORDER_MIN_NODES,
+        )
         s12_mesh = smooth_vortex_polydata(s12_raw_mesh)
         s13_mesh = smooth_vortex_polydata(s13_raw_mesh)
         if CROSSLINK_ADJUST_TO_SMOOTHED_LINES:
@@ -1050,14 +1343,48 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
                 raw_crosslink_centers,
                 s12_mesh,
                 s13_mesh,
+                cluster_radius=CROSSLINK_ADJUST_CLUSTER_RADIUS,
             )
         else:
             crosslink_centers = raw_crosslink_centers
     else:
         s12_mesh = extract_line_domain(grid, "S12_scalar", EPSILON_12)
         s13_mesh = extract_line_domain(grid, "S13_scalar", EPSILON_13)
+        crosslink_candidate_centers = np.empty((0, 3), dtype=float)
         raw_crosslink_centers = np.empty((0, 3), dtype=float)
         crosslink_centers = np.empty((0, 3), dtype=float)
+        crosslink_line_mesh = pv.PolyData()
+
+    if ORDER_CROSSLINK_BALLS:
+        if USE_VORTEX_TRACING and CROSSLINK_TRACE_LINES:
+            display_crosslink_centers = sample_crosslink_line_sites(
+                crosslink_line_mesh,
+                spacing=CROSSLINK_ORDER_SPACING,
+            )
+            if CROSSLINK_ADJUST_TO_SMOOTHED_LINES:
+                display_crosslink_centers = adjust_crosslink_nodes_to_smoothed_lines(
+                    display_crosslink_centers,
+                    s12_mesh,
+                    s13_mesh,
+                    cluster_radius=None,
+                )
+            display_crosslink_centers = enforce_crosslink_site_spacing(
+                display_crosslink_centers,
+                min_spacing=CROSSLINK_ORDER_SPACING,
+            )
+        else:
+            display_crosslink_centers = order_crosslink_centers_with_spacing(
+                crosslink_centers,
+                link_radius=CROSSLINK_ORDER_LINK_RADIUS,
+                spacing=CROSSLINK_ORDER_SPACING,
+                min_nodes=CROSSLINK_ORDER_MIN_NODES,
+            )
+            display_crosslink_centers = enforce_crosslink_site_spacing(
+                display_crosslink_centers,
+                min_spacing=CROSSLINK_ORDER_SPACING,
+            )
+    else:
+        display_crosslink_centers = crosslink_centers
 
     plotter = pv.Plotter(window_size=WINDOW_SIZE)
     plotter.set_background(BACKGROUND_COLOR)
@@ -1134,9 +1461,9 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
             edge_color=PHI_SURFACE_EDGE_COLOR,
         )
 
-    if SHOW_CROSSLINK_NODES and len(crosslink_centers) > 0:
+    if SHOW_CROSSLINK_NODES and len(display_crosslink_centers) > 0:
         crosslink_mesh = make_crosslink_node_mesh(
-            crosslink_centers,
+            display_crosslink_centers,
             radius=CROSSLINK_BALL_RADIUS,
         )
         plotter.add_mesh(
@@ -1162,6 +1489,9 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
         "S12": s12_mesh,
         "S13": s13_mesh,
         "crosslink_centers": crosslink_centers,
+        "display_crosslink_centers": display_crosslink_centers,
+        "crosslink_candidate_centers": crosslink_candidate_centers,
+        "crosslink_lines": crosslink_line_mesh,
         "raw_crosslink_centers": raw_crosslink_centers,
     }
     return plotter, meshes

@@ -1,6 +1,6 @@
 Coupling sweep generated from interactive_random_wave_line_network.ipynb settings
 
-Coupling values: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.7, 0.8, 0.9, 1.0
+Coupling values: 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
 
 Important interpretation:
   phi2 = normalize(Sa + c*Sb)
@@ -14,13 +14,13 @@ Base settings after notebook cell execution:
   WINDOW_SIZE = (1200, 1200)
   CAMERA_ZOOM = 0.82
   K_DISTRIBUTION = gaussian_radial
-  K0 = (1, 1, 1)
+  K0 = (2, 2, 2)
   r_SIGMA_K = (0.02, 0.02, 0.02)
   r_K_MIN = (0.98, 0.98, 0.98)
   r_K_MAX = (1.02, 1.02, 1.02)
   SHARED_K_VECTORS = False
   COUPLE_PHI2_PHI3 = True
-  PHI23_COUPLING_C = 0.2
+  PHI23_COUPLING_C = 0.1
   USE_VORTEX_TRACING = True
   VORTEX_TUBE_RADIUS = 1
   SMOOTH_VORTEX_LINES = True
@@ -54,14 +54,14 @@ Base settings after notebook cell execution:
   BOUNDING_BOX_LINE_WIDTH = 1.0
 
 Sweep results:
-  c=0.10: expected_corr=0.980198, S12_lines=7, S13_lines=7, raw_crosslinks=24, adjusted_crosslinks=24, file=coupling_c_0p10.png
-  c=0.20: expected_corr=0.923077, S12_lines=6, S13_lines=7, raw_crosslinks=15, adjusted_crosslinks=14, file=coupling_c_0p20.png
-  c=0.30: expected_corr=0.834862, S12_lines=6, S13_lines=7, raw_crosslinks=9, adjusted_crosslinks=9, file=coupling_c_0p30.png
-  c=0.40: expected_corr=0.724138, S12_lines=7, S13_lines=7, raw_crosslinks=10, adjusted_crosslinks=10, file=coupling_c_0p40.png
-  c=0.50: expected_corr=0.6, S12_lines=7, S13_lines=7, raw_crosslinks=7, adjusted_crosslinks=7, file=coupling_c_0p50.png
-  c=0.60: expected_corr=0.470588, S12_lines=6, S13_lines=7, raw_crosslinks=6, adjusted_crosslinks=6, file=coupling_c_0p60.png
-  c=0.70: expected_corr=0.342282, S12_lines=6, S13_lines=8, raw_crosslinks=5, adjusted_crosslinks=5, file=coupling_c_0p70.png
-  c=0.70: expected_corr=0.342282, S12_lines=6, S13_lines=8, raw_crosslinks=5, adjusted_crosslinks=5, file=coupling_c_0p70.png
-  c=0.80: expected_corr=0.219512, S12_lines=6, S13_lines=9, raw_crosslinks=5, adjusted_crosslinks=5, file=coupling_c_0p80.png
-  c=0.90: expected_corr=0.104972, S12_lines=5, S13_lines=8, raw_crosslinks=5, adjusted_crosslinks=5, file=coupling_c_0p90.png
-  c=1.00: expected_corr=0, S12_lines=5, S13_lines=8, raw_crosslinks=5, adjusted_crosslinks=5, file=coupling_c_1p00.png
+  c=0.00: expected_corr=1, S12_lines=24, S13_lines=24, raw_crosslinks=520, adjusted_crosslinks=502, file=coupling_c_0p00.png
+  c=0.10: expected_corr=0.980198, S12_lines=24, S13_lines=25, raw_crosslinks=555, adjusted_crosslinks=486, file=coupling_c_0p10.png
+  c=0.20: expected_corr=0.923077, S12_lines=22, S13_lines=24, raw_crosslinks=310, adjusted_crosslinks=245, file=coupling_c_0p20.png
+  c=0.30: expected_corr=0.834862, S12_lines=22, S13_lines=24, raw_crosslinks=216, adjusted_crosslinks=151, file=coupling_c_0p30.png
+  c=0.40: expected_corr=0.724138, S12_lines=23, S13_lines=27, raw_crosslinks=179, adjusted_crosslinks=116, file=coupling_c_0p40.png
+  c=0.50: expected_corr=0.6, S12_lines=23, S13_lines=27, raw_crosslinks=162, adjusted_crosslinks=106, file=coupling_c_0p50.png
+  c=0.60: expected_corr=0.470588, S12_lines=22, S13_lines=26, raw_crosslinks=137, adjusted_crosslinks=83, file=coupling_c_0p60.png
+  c=0.70: expected_corr=0.342282, S12_lines=24, S13_lines=26, raw_crosslinks=135, adjusted_crosslinks=78, file=coupling_c_0p70.png
+  c=0.80: expected_corr=0.219512, S12_lines=23, S13_lines=25, raw_crosslinks=127, adjusted_crosslinks=70, file=coupling_c_0p80.png
+  c=0.90: expected_corr=0.104972, S12_lines=24, S13_lines=26, raw_crosslinks=121, adjusted_crosslinks=69, file=coupling_c_0p90.png
+  c=1.00: expected_corr=0, S12_lines=21, S13_lines=26, raw_crosslinks=115, adjusted_crosslinks=69, file=coupling_c_1p00.png
