@@ -11,6 +11,15 @@ The third pair, `Gamma_23`, is not rendered. Crosslink nodes are estimated where
 the retained `(1,2)` and `(1,3)` vortex-line traces meet, corresponding to
 triple-zero points `phi_1 = phi_2 = phi_3 = 0`.
 
+![Crosslink mechanism schematic](schematic_cxl.png)
+
+In the retained network, the red `Gamma_12` and green `Gamma_13` line families
+share the `phi_1 = 0` surface. Where `phi_2` and `phi_3` vanish at the same
+location on that surface, a triple-zero point acts as a crosslink between the
+two line families. Since `Gamma_23` is omitted, each generic retained crosslink
+has the local topology of two crossing line families rather than a third
+rendered branch.
+
 ## Files
 
 - `random_wave_line_network.py`: reusable script with field generation,
@@ -20,7 +29,10 @@ triple-zero points `phi_1 = phi_2 = phi_3 = 0`.
   sampling, tracing, crosslink, and render settings.
 - `figure_coupling/`: coupling sweep figures and the settings used to generate
   them.
-- `schematic_crosslink.png`: schematic crosslink visualization.
+- `schematic.ipynb`: notebook used to generate the schematic figures.
+- `schematic_cxl.png`: schematic explaining the retained crosslink mechanism.
+- `schematic_nocxl.png`: companion schematic without the crosslink highlight.
+- `schematic_crosslink.png`: combined schematic crosslink visualization.
 
 ## Main Controls
 
