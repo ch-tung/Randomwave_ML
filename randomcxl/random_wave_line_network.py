@@ -96,16 +96,28 @@ SHOW_PHI3_ZERO_SURFACE = False
 WINDOW_SIZE = (1000, 1000)
 BACKGROUND_COLOR = "white"
 CAMERA_ZOOM = 0.82
+CAMERA_AZIMUTH_DEGREES = 30.0
+CAMERA_POLAR_DEGREES = 60.0
+USE_CUSTOM_LIGHTING = True
+HEADLIGHT_INTENSITY = 0.55
+TOP_LIGHT_INTENSITY = 0.75
+AMBIENT_LIGHT_INTENSITY = 0.18
 
-S12_TUBE_COLOR = "red"
-S13_TUBE_COLOR = "blue"
+SLACK_AUBERGINE = "#4A154B"
+SLACK_BLUE = "#64C3EB"
+SLACK_GREEN = "#5BB381"
+SLACK_YELLOW = "#E3B34C"
+SLACK_RED = "#CE375C"
+
+S12_TUBE_COLOR = SLACK_RED
+S13_TUBE_COLOR = SLACK_GREEN
 S12_TUBE_OPACITY = 0.95
 S13_TUBE_OPACITY = 0.95
 LINE_DOMAIN_OPACITY = 0.62
 
 PHI1_SURFACE_COLOR = "gray"
-PHI2_SURFACE_COLOR = "tomato"
-PHI3_SURFACE_COLOR = "royalblue"
+PHI2_SURFACE_COLOR = SLACK_RED
+PHI3_SURFACE_COLOR = SLACK_GREEN
 PHI1_SURFACE_OPACITY = 0.13
 PHI2_SURFACE_OPACITY = 0.07
 PHI3_SURFACE_OPACITY = 0.07
@@ -117,6 +129,7 @@ TUBE_EDGE_COLOR = "black"
 SHOW_CROSSLINK_EDGES = False
 CROSSLINK_EDGE_COLOR = "black"
 SHOW_BOUNDING_BOX = True
+BOX_SIZE_L: float | None = None
 BOUNDING_BOX_COLOR = "black"
 BOUNDING_BOX_LINE_WIDTH = 1.0
 
@@ -136,7 +149,9 @@ SHOW_CROSSLINK_NODES = True
 CROSSLINK_SEARCH_RADIUS = 1.25
 CROSSLINK_MERGE_RADIUS = 0.75
 CROSSLINK_BALL_RADIUS = 0.85
-CROSSLINK_COLOR = "black"
+CROSSLINK_COLOR = SLACK_YELLOW
+CROSSLINK_RENDER_CONSECUTIVE_AS_TUBES = False
+CROSSLINK_TUBE_CONNECT_RADIUS: float | None = None
 ORDER_CROSSLINK_BALLS = False
 CROSSLINK_TRACE_LINES = True
 CROSSLINK_ORDER_LINK_RADIUS = 2.0
@@ -934,6 +949,82 @@ def make_crosslink_node_mesh(
     return merged
 
 
+def make_capped_crosslink_tube_mesh(
+    centers: np.ndarray,
+    *,
+    radius: float | None = None,
+    connect_radius: float | None = None,
+) -> tuple[pv.PolyData, pv.PolyData]:
+    """
+    Render consecutive crosslink centers as tubes with spherical end caps.
+
+    Returned meshes are (tube_mesh, cap_mesh). Components with only one center
+    are returned as a single sphere in cap_mesh.
+    """
+
+    if radius is None:
+        radius = CROSSLINK_BALL_RADIUS
+    if connect_radius is None:
+        connect_radius = 1.25 * float(CROSSLINK_ORDER_SPACING)
+
+    tube_mesh = pv.PolyData()
+    cap_centers = []
+    centers = np.asarray(centers, dtype=float)
+    if len(centers) == 0:
+        return tube_mesh, make_crosslink_node_mesh(np.empty((0, 3)), radius=radius)
+    if len(centers) == 1:
+        return tube_mesh, make_crosslink_node_mesh(centers, radius=radius)
+
+    tree = cKDTree(centers)
+    pairs = [(int(i), int(j)) for i, j in tree.query_pairs(r=float(connect_radius))]
+    if not pairs:
+        return tube_mesh, make_crosslink_node_mesh(centers, radius=radius)
+
+    adjacency = _minimum_spanning_adjacency(centers, pairs)
+    visited: set[int] = set()
+    points: list[np.ndarray] = []
+    lines: list[int] = []
+
+    for start in range(len(centers)):
+        if start in visited:
+            continue
+        stack = [start]
+        component = []
+        visited.add(start)
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for neighbor, _ in adjacency[node]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+
+        if len(component) == 1:
+            cap_centers.append(centers[component[0]])
+            continue
+
+        path_ids = _tree_farthest_path(adjacency, component)
+        path_points = centers[path_ids]
+        if len(path_points) < 2:
+            cap_centers.extend(centers[component])
+            continue
+
+        path_start = len(points)
+        points.extend(path_points)
+        lines.extend([len(path_points), *range(path_start, path_start + len(path_points))])
+        cap_centers.append(path_points[0])
+        cap_centers.append(path_points[-1])
+
+    if points:
+        line_mesh = pv.PolyData()
+        line_mesh.points = np.asarray(points, dtype=float)
+        line_mesh.lines = np.asarray(lines, dtype=np.int_)
+        tube_mesh = line_mesh.tube(radius=float(radius), capping=True)
+
+    cap_mesh = make_crosslink_node_mesh(np.asarray(cap_centers), radius=radius)
+    return tube_mesh, cap_mesh
+
+
 def _minimum_spanning_adjacency(
     centers: np.ndarray,
     pairs: list[tuple[int, int]],
@@ -1088,6 +1179,14 @@ def trace_crosslink_lines(
     This follows the same idea as vortex-line rendering: local vertices are
     connected into ordered paths, optionally smoothed, and represented as a
     PyVista line mesh. Ball sites can then be sampled from this mesh.
+
+    Note for future improvement: this point-cloud path reconstruction keeps a
+    graph-diameter path in each connected component. That is stable for partial
+    crosslinks, but when phi_2 and phi_3 are identical or nearly identical, the
+    overlap may contain loops/branches and some portions can be underrepresented.
+    A future version should preserve original vortex-line connectivity while
+    still evaluating sampled/display ball centers robustly for non-identical
+    phi_2 and phi_3.
     """
 
     out = pv.PolyData()
@@ -1164,6 +1263,249 @@ def sample_crosslink_line_sites(
     if not samples:
         return np.empty((0, 3), dtype=float)
     return np.asarray(samples, dtype=float)
+
+
+def sample_crosslink_line_site_mesh(
+    crosslink_lines: pv.PolyData,
+    *,
+    spacing: float = CROSSLINK_ORDER_SPACING,
+) -> pv.PolyData:
+    """Sample displayed crosslink sites while preserving their line order."""
+
+    out = pv.PolyData()
+    if crosslink_lines.n_points == 0 or crosslink_lines.n_lines == 0:
+        return out
+
+    points = np.asarray(crosslink_lines.points)
+    raw_lines = np.asarray(crosslink_lines.lines)
+    sampled_points: list[np.ndarray] = []
+    sampled_lines: list[int] = []
+    cursor = 0
+    while cursor < len(raw_lines):
+        n_in_cell = int(raw_lines[cursor])
+        ids = raw_lines[cursor + 1 : cursor + 1 + n_in_cell].astype(int)
+        cursor += n_in_cell + 1
+        if n_in_cell < 2:
+            continue
+
+        path_samples = _resample_polyline(points[ids], float(spacing))
+        if len(path_samples) == 0:
+            continue
+
+        start = len(sampled_points)
+        sampled_points.extend(path_samples)
+        if len(path_samples) >= 2:
+            sampled_lines.extend([len(path_samples), *range(start, start + len(path_samples))])
+
+    if sampled_points:
+        out.points = np.asarray(sampled_points, dtype=float)
+        if sampled_lines:
+            out.lines = np.asarray(sampled_lines, dtype=np.int_)
+    return out
+
+
+def adjust_crosslink_site_mesh_to_smoothed_lines(
+    site_mesh: pv.PolyData,
+    s12_lines: pv.PolyData,
+    s13_lines: pv.PolyData,
+) -> pv.PolyData:
+    """Adjust sampled site positions while keeping their existing path order."""
+
+    if site_mesh.n_points == 0:
+        return site_mesh
+
+    adjusted_points = adjust_crosslink_nodes_to_smoothed_lines(
+        np.asarray(site_mesh.points),
+        s12_lines,
+        s13_lines,
+        cluster_radius=None,
+    )
+    out = pv.PolyData()
+    out.points = adjusted_points
+    if site_mesh.n_lines:
+        out.lines = np.asarray(site_mesh.lines, dtype=np.int_)
+    return out
+
+
+def break_crosslink_site_mesh_by_spacing(
+    site_mesh: pv.PolyData,
+    *,
+    max_segment_length: float | None = None,
+) -> pv.PolyData:
+    """Break display-site paths where consecutive centers are too far apart."""
+
+    if site_mesh.n_points == 0 or site_mesh.n_lines == 0:
+        return site_mesh
+    if max_segment_length is None:
+        max_segment_length = CROSSLINK_TUBE_CONNECT_RADIUS
+    if max_segment_length is None:
+        max_segment_length = 1.25 * float(CROSSLINK_ORDER_SPACING)
+
+    points = np.asarray(site_mesh.points)
+    raw_lines = np.asarray(site_mesh.lines)
+    out_points: list[np.ndarray] = []
+    out_lines: list[int] = []
+    cursor = 0
+    while cursor < len(raw_lines):
+        n_in_cell = int(raw_lines[cursor])
+        ids = raw_lines[cursor + 1 : cursor + 1 + n_in_cell].astype(int)
+        cursor += n_in_cell + 1
+        if n_in_cell == 0:
+            continue
+
+        run: list[int] = [int(ids[0])]
+        for point_id in ids[1:]:
+            previous_id = run[-1]
+            distance = float(np.linalg.norm(points[int(point_id)] - points[previous_id]))
+            if distance <= float(max_segment_length):
+                run.append(int(point_id))
+            else:
+                if len(run) >= 2:
+                    start = len(out_points)
+                    out_points.extend(points[run])
+                    out_lines.extend([len(run), *range(start, start + len(run))])
+                elif len(run) == 1:
+                    out_points.append(points[run[0]])
+                run = [int(point_id)]
+
+        if len(run) >= 2:
+            start = len(out_points)
+            out_points.extend(points[run])
+            out_lines.extend([len(run), *range(start, start + len(run))])
+        elif len(run) == 1:
+            out_points.append(points[run[0]])
+
+    out = pv.PolyData()
+    if out_points:
+        out.points = np.asarray(out_points, dtype=float)
+        if out_lines:
+            out.lines = np.asarray(out_lines, dtype=np.int_)
+    return out
+
+
+def bridge_crosslink_site_mesh_endpoints(
+    site_mesh: pv.PolyData,
+    *,
+    connect_radius: float | None = None,
+) -> pv.PolyData:
+    """Join separate sampled-site paths when their endpoints are close enough."""
+
+    if site_mesh.n_points == 0:
+        return site_mesh
+    if connect_radius is None:
+        connect_radius = CROSSLINK_TUBE_CONNECT_RADIUS
+    if connect_radius is None:
+        connect_radius = 1.25 * float(CROSSLINK_ORDER_SPACING)
+    connect_radius = float(connect_radius)
+    if connect_radius <= 0:
+        return site_mesh
+
+    points = np.asarray(site_mesh.points)
+    paths: list[np.ndarray] = []
+    used_ids: set[int] = set()
+
+    if site_mesh.n_lines:
+        raw_lines = np.asarray(site_mesh.lines)
+        cursor = 0
+        while cursor < len(raw_lines):
+            n_in_cell = int(raw_lines[cursor])
+            ids = raw_lines[cursor + 1 : cursor + 1 + n_in_cell].astype(int)
+            cursor += n_in_cell + 1
+            if n_in_cell == 0:
+                continue
+            used_ids.update(int(i) for i in ids)
+            paths.append(points[ids].copy())
+
+    for point_id in range(site_mesh.n_points):
+        if point_id not in used_ids:
+            paths.append(points[[point_id]].copy())
+
+    if len(paths) < 2:
+        return site_mesh
+
+    while True:
+        best: tuple[float, int, int, str] | None = None
+        for i in range(len(paths)):
+            for j in range(i + 1, len(paths)):
+                endpoints = (
+                    (paths[i][0], paths[j][0], "ss"),
+                    (paths[i][0], paths[j][-1], "se"),
+                    (paths[i][-1], paths[j][0], "es"),
+                    (paths[i][-1], paths[j][-1], "ee"),
+                )
+                for a, b, mode in endpoints:
+                    distance = float(np.linalg.norm(a - b))
+                    if distance <= connect_radius and (best is None or distance < best[0]):
+                        best = (distance, i, j, mode)
+
+        if best is None:
+            break
+
+        _, i, j, mode = best
+        path_i = paths[i]
+        path_j = paths[j]
+        if mode == "ss":
+            merged = np.vstack((path_i[::-1], path_j))
+        elif mode == "se":
+            merged = np.vstack((path_j, path_i))
+        elif mode == "es":
+            merged = np.vstack((path_i, path_j))
+        else:
+            merged = np.vstack((path_i, path_j[::-1]))
+
+        paths[i] = merged
+        del paths[j]
+
+    out_points: list[np.ndarray] = []
+    out_lines: list[int] = []
+    for path in paths:
+        if len(path) == 0:
+            continue
+        start = len(out_points)
+        out_points.extend(path)
+        if len(path) >= 2:
+            out_lines.extend([len(path), *range(start, start + len(path))])
+
+    out = pv.PolyData()
+    if out_points:
+        out.points = np.asarray(out_points, dtype=float)
+        if out_lines:
+            out.lines = np.asarray(out_lines, dtype=np.int_)
+    return out
+
+
+def _line_endpoint_centers(line_mesh: pv.PolyData) -> np.ndarray:
+    """Return endpoint centers for every line cell plus isolated points."""
+
+    if line_mesh.n_points == 0:
+        return np.empty((0, 3), dtype=float)
+
+    points = np.asarray(line_mesh.points)
+    if line_mesh.n_lines == 0:
+        return points.copy()
+
+    raw_lines = np.asarray(line_mesh.lines)
+    endpoint_ids: list[int] = []
+    used_ids: set[int] = set()
+    cursor = 0
+    while cursor < len(raw_lines):
+        n_in_cell = int(raw_lines[cursor])
+        ids = raw_lines[cursor + 1 : cursor + 1 + n_in_cell].astype(int)
+        cursor += n_in_cell + 1
+        if n_in_cell == 0:
+            continue
+        used_ids.update(int(i) for i in ids)
+        endpoint_ids.append(int(ids[0]))
+        if n_in_cell > 1:
+            endpoint_ids.append(int(ids[-1]))
+
+    for point_id in range(line_mesh.n_points):
+        if point_id not in used_ids:
+            endpoint_ids.append(point_id)
+
+    if not endpoint_ids:
+        return np.empty((0, 3), dtype=float)
+    return points[np.asarray(endpoint_ids, dtype=int)]
 
 
 def enforce_crosslink_site_spacing(
@@ -1269,6 +1611,96 @@ def add_line_domain_to_plotter(
     )
 
 
+def add_camera_and_top_lights(plotter: pv.Plotter, grid_size: int) -> None:
+    """Add a headlight from the camera and a top light over the box."""
+
+    if not USE_CUSTOM_LIGHTING:
+        return
+
+    plotter.remove_all_lights()
+
+    camera_position = np.asarray(plotter.camera.position, dtype=float)
+    camera_focal_point = np.asarray(plotter.camera.focal_point, dtype=float)
+    view_direction = camera_focal_point - camera_position
+    norm = np.linalg.norm(view_direction)
+    if norm == 0.0:
+        view_direction = np.array([-1.0, -1.0, -1.0])
+    else:
+        view_direction /= norm
+
+    headlight = pv.Light(
+        position=tuple(camera_position),
+        focal_point=tuple(camera_focal_point),
+        color="white",
+        light_type="scene light",
+        intensity=float(HEADLIGHT_INTENSITY),
+    )
+    plotter.add_light(headlight)
+
+    center = np.array([0.5 * (grid_size - 1)] * 3, dtype=float)
+    top_position = center + np.array([0.0, 0.0, 2.4 * grid_size])
+    top_focal_point = center + 0.15 * grid_size * view_direction
+    top_light = pv.Light(
+        position=tuple(top_position),
+        focal_point=tuple(top_focal_point),
+        color="white",
+        light_type="scene light",
+        intensity=float(TOP_LIGHT_INTENSITY),
+    )
+    plotter.add_light(top_light)
+
+    if AMBIENT_LIGHT_INTENSITY > 0:
+        ambient = pv.Light(
+            color="white",
+            light_type="headlight",
+            intensity=float(AMBIENT_LIGHT_INTENSITY),
+        )
+        plotter.add_light(ambient)
+
+
+def set_camera_from_angles(plotter: pv.Plotter, grid_size: int) -> None:
+    """Set camera by azimuth from +x and polar angle down from +z."""
+
+    center = np.array([0.5 * (grid_size - 1)] * 3, dtype=float)
+    azimuth = np.deg2rad(float(CAMERA_AZIMUTH_DEGREES))
+    polar = np.deg2rad(float(CAMERA_POLAR_DEGREES))
+    direction = np.array(
+        [
+            np.sin(polar) * np.cos(azimuth),
+            np.sin(polar) * np.sin(azimuth),
+            np.cos(polar),
+        ],
+        dtype=float,
+    )
+    distance = 1.7 * np.sqrt(3.0) * max(1.0, float(grid_size - 1))
+    position = center + distance * direction
+    view_up = (0.0, 0.0, 1.0)
+    if abs(float(np.dot(direction, view_up))) > 0.98:
+        view_up = (0.0, 1.0, 0.0)
+
+    plotter.camera.position = tuple(position)
+    plotter.camera.focal_point = tuple(center)
+    plotter.camera.up = view_up
+
+
+def add_fixed_box_outline(plotter: pv.Plotter, *, box_size_l: float | None = None) -> pv.PolyData:
+    """Add a fixed box outline from (0,0,0) to (L,L,L), independent of contents."""
+
+    if box_size_l is None:
+        box_size_l = BOX_SIZE_L
+    if box_size_l is None:
+        box_size_l = float(GRID_SIZE - 1)
+    l_value = float(box_size_l)
+    box = pv.Box(bounds=(0.0, l_value, 0.0, l_value, 0.0, l_value)).outline()
+    plotter.add_mesh(
+        box,
+        color=BOUNDING_BOX_COLOR,
+        line_width=BOUNDING_BOX_LINE_WIDTH,
+        name="fixed_box_outline",
+    )
+    return box
+
+
 def save_mesh(mesh: pv.PolyData, output_dir: str | Path, file_name: str) -> Path:
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
@@ -1355,22 +1787,31 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
         crosslink_centers = np.empty((0, 3), dtype=float)
         crosslink_line_mesh = pv.PolyData()
 
+    display_crosslink_site_mesh = pv.PolyData()
     if ORDER_CROSSLINK_BALLS:
         if USE_VORTEX_TRACING and CROSSLINK_TRACE_LINES:
-            display_crosslink_centers = sample_crosslink_line_sites(
+            display_crosslink_site_mesh = sample_crosslink_line_site_mesh(
                 crosslink_line_mesh,
                 spacing=CROSSLINK_ORDER_SPACING,
             )
             if CROSSLINK_ADJUST_TO_SMOOTHED_LINES:
-                display_crosslink_centers = adjust_crosslink_nodes_to_smoothed_lines(
-                    display_crosslink_centers,
+                display_crosslink_site_mesh = adjust_crosslink_site_mesh_to_smoothed_lines(
+                    display_crosslink_site_mesh,
                     s12_mesh,
                     s13_mesh,
-                    cluster_radius=None,
                 )
-            display_crosslink_centers = enforce_crosslink_site_spacing(
-                display_crosslink_centers,
-                min_spacing=CROSSLINK_ORDER_SPACING,
+            display_crosslink_site_mesh = break_crosslink_site_mesh_by_spacing(
+                display_crosslink_site_mesh,
+                max_segment_length=CROSSLINK_TUBE_CONNECT_RADIUS,
+            )
+            display_crosslink_site_mesh = bridge_crosslink_site_mesh_endpoints(
+                display_crosslink_site_mesh,
+                connect_radius=CROSSLINK_TUBE_CONNECT_RADIUS,
+            )
+            display_crosslink_centers = (
+                np.asarray(display_crosslink_site_mesh.points)
+                if display_crosslink_site_mesh.n_points
+                else np.empty((0, 3), dtype=float)
             )
         else:
             display_crosslink_centers = order_crosslink_centers_with_spacing(
@@ -1462,34 +1903,75 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
         )
 
     if SHOW_CROSSLINK_NODES and len(display_crosslink_centers) > 0:
-        crosslink_mesh = make_crosslink_node_mesh(
-            display_crosslink_centers,
-            radius=CROSSLINK_BALL_RADIUS,
-        )
-        plotter.add_mesh(
-            crosslink_mesh,
-            color=CROSSLINK_COLOR,
-            opacity=1.0,
-            smooth_shading=True,
-            show_edges=SHOW_CROSSLINK_EDGES,
-            edge_color=CROSSLINK_EDGE_COLOR,
-            specular=0.35,
-            name="crosslink_nodes",
-        )
+        if CROSSLINK_RENDER_CONSECUTIVE_AS_TUBES:
+            if USE_VORTEX_TRACING and CROSSLINK_TRACE_LINES and display_crosslink_site_mesh.n_lines:
+                crosslink_tubes = display_crosslink_site_mesh.tube(
+                    radius=float(CROSSLINK_BALL_RADIUS),
+                    capping=True,
+                )
+                crosslink_caps = make_crosslink_node_mesh(
+                    _line_endpoint_centers(display_crosslink_site_mesh),
+                    radius=CROSSLINK_BALL_RADIUS,
+                )
+            else:
+                crosslink_tubes, crosslink_caps = make_capped_crosslink_tube_mesh(
+                    display_crosslink_centers,
+                    radius=CROSSLINK_BALL_RADIUS,
+                    connect_radius=CROSSLINK_TUBE_CONNECT_RADIUS,
+                )
+            if crosslink_tubes.n_points:
+                plotter.add_mesh(
+                    crosslink_tubes,
+                    color=CROSSLINK_COLOR,
+                    opacity=1.0,
+                    smooth_shading=True,
+                    show_edges=SHOW_CROSSLINK_EDGES,
+                    edge_color=CROSSLINK_EDGE_COLOR,
+                    specular=0.35,
+                    name="crosslink_tubes",
+                )
+            if crosslink_caps.n_points:
+                plotter.add_mesh(
+                    crosslink_caps,
+                    color=CROSSLINK_COLOR,
+                    opacity=1.0,
+                    smooth_shading=True,
+                    show_edges=SHOW_CROSSLINK_EDGES,
+                    edge_color=CROSSLINK_EDGE_COLOR,
+                    specular=0.35,
+                    name="crosslink_caps",
+                )
+        else:
+            crosslink_mesh = make_crosslink_node_mesh(
+                display_crosslink_centers,
+                radius=CROSSLINK_BALL_RADIUS,
+            )
+            plotter.add_mesh(
+                crosslink_mesh,
+                color=CROSSLINK_COLOR,
+                opacity=1.0,
+                smooth_shading=True,
+                show_edges=SHOW_CROSSLINK_EDGES,
+                edge_color=CROSSLINK_EDGE_COLOR,
+                specular=0.35,
+                name="crosslink_nodes",
+            )
 
     if SHOW_BOUNDING_BOX:
-        plotter.add_bounding_box(color=BOUNDING_BOX_COLOR, line_width=BOUNDING_BOX_LINE_WIDTH)
+        add_fixed_box_outline(plotter)
     plotter.add_axes(line_width=2, labels_off=False)
-    plotter.camera_position = "iso"
     plotter.reset_camera()
+    set_camera_from_angles(plotter, GRID_SIZE)
     plotter.camera.zoom(CAMERA_ZOOM)
     plotter.camera.reset_clipping_range()
+    add_camera_and_top_lights(plotter, GRID_SIZE)
 
     meshes = {
         "S12": s12_mesh,
         "S13": s13_mesh,
         "crosslink_centers": crosslink_centers,
         "display_crosslink_centers": display_crosslink_centers,
+        "display_crosslink_site_mesh": display_crosslink_site_mesh,
         "crosslink_candidate_centers": crosslink_candidate_centers,
         "crosslink_lines": crosslink_line_mesh,
         "raw_crosslink_centers": raw_crosslink_centers,

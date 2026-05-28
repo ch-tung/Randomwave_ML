@@ -1,6 +1,7 @@
 Coupling sweep generated from interactive_random_wave_line_network.ipynb settings
 
-Coupling values: 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
+Rendered coupling values: 1.00, 0.96, 0.92, 0.88, 0.84, 0.80, 0.76, 0.72, 0.68, 0.64, 0.60, 0.56, 0.52, 0.48, 0.44, 0.40, 0.36, 0.32, 0.28, 0.24, 0.20, 0.16, 0.12, 0.08, 0.04, 0.00
+GIF frame order: 1.00, 0.96, 0.92, 0.88, 0.84, 0.80, 0.76, 0.72, 0.68, 0.64, 0.60, 0.56, 0.52, 0.48, 0.44, 0.40, 0.36, 0.32, 0.28, 0.24, 0.20, 0.16, 0.12, 0.08, 0.04, 0.00, 0.04, 0.08, 0.12, 0.16, 0.20, 0.24, 0.28, 0.32, 0.36, 0.40, 0.44, 0.48, 0.52, 0.56, 0.60, 0.64, 0.68, 0.72, 0.76, 0.80, 0.84, 0.88, 0.92, 0.96
 
 Important interpretation:
   phi2 = normalize(Sa + c*Sb)
@@ -13,6 +14,12 @@ Base settings after notebook cell execution:
   NUM_MODES = (64, 64, 64)
   WINDOW_SIZE = (1200, 1200)
   CAMERA_ZOOM = 0.82
+  CAMERA_AZIMUTH_DEGREES = 30.0
+  CAMERA_POLAR_DEGREES = 60.0
+  USE_CUSTOM_LIGHTING = True
+  HEADLIGHT_INTENSITY = 0.55
+  TOP_LIGHT_INTENSITY = 0.55
+  AMBIENT_LIGHT_INTENSITY = 0.28
   K_DISTRIBUTION = gaussian_radial
   K0 = (2, 2, 2)
   r_SIGMA_K = (0.02, 0.02, 0.02)
@@ -20,7 +27,7 @@ Base settings after notebook cell execution:
   r_K_MAX = (1.02, 1.02, 1.02)
   SHARED_K_VECTORS = False
   COUPLE_PHI2_PHI3 = True
-  PHI23_COUPLING_C = 0.1
+  PHI23_COUPLING_C = 1
   USE_VORTEX_TRACING = True
   VORTEX_TUBE_RADIUS = 1
   SMOOTH_VORTEX_LINES = True
@@ -28,40 +35,67 @@ Base settings after notebook cell execution:
   VORTEX_SPLINE_SMOOTHING = None
   SHOW_CROSSLINK_NODES = True
   CROSSLINK_SEARCH_RADIUS = 1.25
-  CROSSLINK_MERGE_RADIUS = 0.75
+  CROSSLINK_MERGE_RADIUS = 1.0
+  ORDER_CROSSLINK_BALLS = True
+  CROSSLINK_TRACE_LINES = True
+  CROSSLINK_ORDER_LINK_RADIUS = 2.0
+  CROSSLINK_ORDER_SPACING = 2.0
+  CROSSLINK_ORDER_MIN_NODES = 2.0
   CROSSLINK_ADJUST_TO_SMOOTHED_LINES = True
   CROSSLINK_SEGMENT_CANDIDATES = 12
   CROSSLINK_ADJUST_CENTER_WEIGHT = 0.25
-  CROSSLINK_ADJUST_CLUSTER_RADIUS = 0.75
+  CROSSLINK_ADJUST_CLUSTER_RADIUS = 1.0
   CROSSLINK_BALL_RADIUS = 2
-  CROSSLINK_COLOR = green
+  CROSSLINK_COLOR = #E3B34C
+  CROSSLINK_RENDER_CONSECUTIVE_AS_TUBES = True
+  CROSSLINK_TUBE_CONNECT_RADIUS = 6.0
+  SHOW_CROSSLINK_EDGES = False
+  CROSSLINK_EDGE_COLOR = black
   SHOW_PHI1_ZERO_SURFACE = True
-  SHOW_PHI2_ZERO_SURFACE = True
-  SHOW_PHI3_ZERO_SURFACE = True
+  SHOW_PHI2_ZERO_SURFACE = False
+  SHOW_PHI3_ZERO_SURFACE = False
   PHI1_SURFACE_OPACITY = 0.1
   PHI2_SURFACE_OPACITY = 0.1
   PHI3_SURFACE_OPACITY = 0.1
   SHOW_PHI_SURFACE_EDGES = False
   PHI_SURFACE_EDGE_COLOR = [0, 0, 0, 0.5]
-  S12_TUBE_COLOR = red
-  S13_TUBE_COLOR = blue
-  S12_TUBE_OPACITY = 0.95
-  S13_TUBE_OPACITY = 0.95
+  S12_TUBE_COLOR = #CE375C
+  S13_TUBE_COLOR = #5BB381
+  S12_TUBE_OPACITY = 1.0
+  S13_TUBE_OPACITY = 1.0
   SHOW_TUBE_EDGES = False
   TUBE_EDGE_COLOR = black
   SHOW_BOUNDING_BOX = True
+  BOX_SIZE_L = None
   BOUNDING_BOX_COLOR = black
   BOUNDING_BOX_LINE_WIDTH = 1.0
 
 Sweep results:
-  c=0.00: expected_corr=1, S12_lines=24, S13_lines=24, raw_crosslinks=520, adjusted_crosslinks=502, file=coupling_c_0p00.png
-  c=0.10: expected_corr=0.980198, S12_lines=24, S13_lines=25, raw_crosslinks=555, adjusted_crosslinks=486, file=coupling_c_0p10.png
-  c=0.20: expected_corr=0.923077, S12_lines=22, S13_lines=24, raw_crosslinks=310, adjusted_crosslinks=245, file=coupling_c_0p20.png
-  c=0.30: expected_corr=0.834862, S12_lines=22, S13_lines=24, raw_crosslinks=216, adjusted_crosslinks=151, file=coupling_c_0p30.png
-  c=0.40: expected_corr=0.724138, S12_lines=23, S13_lines=27, raw_crosslinks=179, adjusted_crosslinks=116, file=coupling_c_0p40.png
-  c=0.50: expected_corr=0.6, S12_lines=23, S13_lines=27, raw_crosslinks=162, adjusted_crosslinks=106, file=coupling_c_0p50.png
-  c=0.60: expected_corr=0.470588, S12_lines=22, S13_lines=26, raw_crosslinks=137, adjusted_crosslinks=83, file=coupling_c_0p60.png
-  c=0.70: expected_corr=0.342282, S12_lines=24, S13_lines=26, raw_crosslinks=135, adjusted_crosslinks=78, file=coupling_c_0p70.png
-  c=0.80: expected_corr=0.219512, S12_lines=23, S13_lines=25, raw_crosslinks=127, adjusted_crosslinks=70, file=coupling_c_0p80.png
-  c=0.90: expected_corr=0.104972, S12_lines=24, S13_lines=26, raw_crosslinks=121, adjusted_crosslinks=69, file=coupling_c_0p90.png
-  c=1.00: expected_corr=0, S12_lines=21, S13_lines=26, raw_crosslinks=115, adjusted_crosslinks=69, file=coupling_c_1p00.png
+  c=1.00: expected_corr=0, S12_lines=21, S13_lines=26, candidate_crosslinks=513, crosslink_trace_lines=42, raw_crosslinks=56, adjusted_crosslinks=51, displayed_crosslinks=126, file=coupling_c_1p00.png
+  c=0.96: expected_corr=0.0407993, S12_lines=22, S13_lines=26, candidate_crosslinks=513, crosslink_trace_lines=42, raw_crosslinks=59, adjusted_crosslinks=54, displayed_crosslinks=131, file=coupling_c_0p96.png
+  c=0.92: expected_corr=0.0831889, S12_lines=22, S13_lines=26, candidate_crosslinks=519, crosslink_trace_lines=42, raw_crosslinks=60, adjusted_crosslinks=51, displayed_crosslinks=129, file=coupling_c_0p92.png
+  c=0.88: expected_corr=0.127142, S12_lines=24, S13_lines=26, candidate_crosslinks=532, crosslink_trace_lines=42, raw_crosslinks=63, adjusted_crosslinks=52, displayed_crosslinks=134, file=coupling_c_0p88.png
+  c=0.84: expected_corr=0.172608, S12_lines=23, S13_lines=26, candidate_crosslinks=544, crosslink_trace_lines=42, raw_crosslinks=60, adjusted_crosslinks=52, displayed_crosslinks=137, file=coupling_c_0p84.png
+  c=0.80: expected_corr=0.219512, S12_lines=23, S13_lines=25, candidate_crosslinks=560, crosslink_trace_lines=42, raw_crosslinks=64, adjusted_crosslinks=54, displayed_crosslinks=139, file=coupling_c_0p80.png
+  c=0.76: expected_corr=0.267748, S12_lines=24, S13_lines=25, candidate_crosslinks=576, crosslink_trace_lines=43, raw_crosslinks=62, adjusted_crosslinks=51, displayed_crosslinks=141, file=coupling_c_0p76.png
+  c=0.72: expected_corr=0.317176, S12_lines=24, S13_lines=26, candidate_crosslinks=602, crosslink_trace_lines=46, raw_crosslinks=67, adjusted_crosslinks=53, displayed_crosslinks=151, file=coupling_c_0p72.png
+  c=0.68: expected_corr=0.367615, S12_lines=24, S13_lines=26, candidate_crosslinks=617, crosslink_trace_lines=45, raw_crosslinks=63, adjusted_crosslinks=56, displayed_crosslinks=155, file=coupling_c_0p68.png
+  c=0.64: expected_corr=0.418842, S12_lines=23, S13_lines=26, candidate_crosslinks=640, crosslink_trace_lines=44, raw_crosslinks=63, adjusted_crosslinks=58, displayed_crosslinks=154, file=coupling_c_0p64.png
+  c=0.60: expected_corr=0.470588, S12_lines=22, S13_lines=26, candidate_crosslinks=657, crosslink_trace_lines=45, raw_crosslinks=69, adjusted_crosslinks=59, displayed_crosslinks=160, file=coupling_c_0p60.png
+  c=0.56: expected_corr=0.522533, S12_lines=23, S13_lines=26, candidate_crosslinks=687, crosslink_trace_lines=44, raw_crosslinks=69, adjusted_crosslinks=59, displayed_crosslinks=161, file=coupling_c_0p56.png
+  c=0.52: expected_corr=0.574307, S12_lines=24, S13_lines=26, candidate_crosslinks=723, crosslink_trace_lines=43, raw_crosslinks=69, adjusted_crosslinks=62, displayed_crosslinks=168, file=coupling_c_0p52.png
+  c=0.48: expected_corr=0.625488, S12_lines=22, S13_lines=27, candidate_crosslinks=755, crosslink_trace_lines=42, raw_crosslinks=75, adjusted_crosslinks=67, displayed_crosslinks=166, file=coupling_c_0p48.png
+  c=0.44: expected_corr=0.675603, S12_lines=22, S13_lines=27, candidate_crosslinks=799, crosslink_trace_lines=42, raw_crosslinks=74, adjusted_crosslinks=68, displayed_crosslinks=178, file=coupling_c_0p44.png
+  c=0.40: expected_corr=0.724138, S12_lines=23, S13_lines=27, candidate_crosslinks=855, crosslink_trace_lines=41, raw_crosslinks=79, adjusted_crosslinks=69, displayed_crosslinks=184, file=coupling_c_0p40.png
+  c=0.36: expected_corr=0.770538, S12_lines=24, S13_lines=27, candidate_crosslinks=915, crosslink_trace_lines=40, raw_crosslinks=90, adjusted_crosslinks=79, displayed_crosslinks=200, file=coupling_c_0p36.png
+  c=0.32: expected_corr=0.814224, S12_lines=24, S13_lines=26, candidate_crosslinks=1016, crosslink_trace_lines=40, raw_crosslinks=90, adjusted_crosslinks=81, displayed_crosslinks=217, file=coupling_c_0p32.png
+  c=0.28: expected_corr=0.854599, S12_lines=22, S13_lines=24, candidate_crosslinks=1129, crosslink_trace_lines=42, raw_crosslinks=100, adjusted_crosslinks=87, displayed_crosslinks=239, file=coupling_c_0p28.png
+  c=0.24: expected_corr=0.891074, S12_lines=22, S13_lines=24, candidate_crosslinks=1265, crosslink_trace_lines=45, raw_crosslinks=110, adjusted_crosslinks=102, displayed_crosslinks=261, file=coupling_c_0p24.png
+  c=0.20: expected_corr=0.923077, S12_lines=22, S13_lines=24, candidate_crosslinks=1518, crosslink_trace_lines=49, raw_crosslinks=130, adjusted_crosslinks=120, displayed_crosslinks=310, file=coupling_c_0p20.png
+  c=0.16: expected_corr=0.950078, S12_lines=22, S13_lines=23, candidate_crosslinks=1881, crosslink_trace_lines=55, raw_crosslinks=150, adjusted_crosslinks=142, displayed_crosslinks=379, file=coupling_c_0p16.png
+  c=0.12: expected_corr=0.971609, S12_lines=24, S13_lines=24, candidate_crosslinks=2360, crosslink_trace_lines=71, raw_crosslinks=192, adjusted_crosslinks=186, displayed_crosslinks=484, file=coupling_c_0p12.png
+  c=0.08: expected_corr=0.987281, S12_lines=23, S13_lines=25, candidate_crosslinks=3316, crosslink_trace_lines=69, raw_crosslinks=258, adjusted_crosslinks=255, displayed_crosslinks=638, file=coupling_c_0p08.png
+  c=0.04: expected_corr=0.996805, S12_lines=23, S13_lines=25, candidate_crosslinks=4398, crosslink_trace_lines=50, raw_crosslinks=251, adjusted_crosslinks=251, displayed_crosslinks=788, file=coupling_c_0p04.png
+  c=0.00: expected_corr=1, S12_lines=24, S13_lines=24, candidate_crosslinks=5070, crosslink_trace_lines=24, raw_crosslinks=24, adjusted_crosslinks=24, displayed_crosslinks=856, file=coupling_c_0p00.png
+
+GIF: coupling_scan.gif

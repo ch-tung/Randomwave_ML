@@ -1,0 +1,136 @@
+@'
+import json
+from pathlib import Path
+
+from PIL import Image
+import pyvista as pv
+
+import random_wave_line_network as r
+
+import numpy as np
+
+NOTEBOOK = Path('interactive_random_wave_line_network.ipynb')
+OUTPUT_DIR = Path('figure_coupling')
+COUPLING_VALUES = np.linspace(1.0, 0.0, 26)
+GIF_COUPLING_VALUES = list(COUPLING_VALUES) + list(COUPLING_VALUES[-2:0:-1])
+
+
+def coupling_frame_path(c):
+    safe_c = f'{float(c):.2f}'.replace('.', 'p')
+    return OUTPUT_DIR / f'coupling_c_{safe_c}.png'
+
+nb = json.loads(NOTEBOOK.read_text(encoding='utf-8'))
+settings_source = None
+for cell in nb['cells']:
+    source = ''.join(cell.get('source', []))
+    if '# Sampling settings' in source and '# Line tracing settings' in source and '# Render settings' in source:
+        settings_source = source
+        break
+
+if settings_source is None:
+    raise RuntimeError('Could not find the notebook settings cell.')
+
+exec(settings_source, {'r': r})
+
+OUTPUT_DIR.mkdir(exist_ok=True)
+for old_png in OUTPUT_DIR.glob('coupling_c_*.png'):
+    old_png.unlink()
+gif_path = OUTPUT_DIR / 'coupling_scan.gif'
+if gif_path.exists():
+    gif_path.unlink()
+
+pv.OFF_SCREEN = True
+
+settings_lines = []
+settings_lines.append('Coupling sweep generated from interactive_random_wave_line_network.ipynb settings')
+settings_lines.append('')
+settings_lines.append('Rendered coupling values: ' + ', '.join(f'{v:.2f}' for v in COUPLING_VALUES))
+settings_lines.append('GIF frame order: ' + ', '.join(f'{v:.2f}' for v in GIF_COUPLING_VALUES))
+settings_lines.append('')
+settings_lines.append('Important interpretation:')
+settings_lines.append('  phi2 = normalize(Sa + c*Sb)')
+settings_lines.append('  phi3 = normalize(Sa - c*Sb)')
+settings_lines.append('  expected corr(phi2, phi3) = (1-c^2)/(1+c^2)')
+settings_lines.append('')
+settings_lines.append('Base settings after notebook cell execution:')
+
+for name in [
+    'GRID_SIZE', 'RANDOM_SEED', 'NUM_MODES', 'WINDOW_SIZE', 'CAMERA_ZOOM',
+    'CAMERA_AZIMUTH_DEGREES', 'CAMERA_POLAR_DEGREES',
+    'USE_CUSTOM_LIGHTING', 'HEADLIGHT_INTENSITY', 'TOP_LIGHT_INTENSITY',
+    'AMBIENT_LIGHT_INTENSITY',
+    'K_DISTRIBUTION', 'K0', 'r_SIGMA_K', 'r_K_MIN', 'r_K_MAX', 'SHARED_K_VECTORS',
+    'COUPLE_PHI2_PHI3', 'PHI23_COUPLING_C',
+    'USE_VORTEX_TRACING', 'VORTEX_TUBE_RADIUS', 'SMOOTH_VORTEX_LINES',
+    'VORTEX_SMOOTHING_SCALE', 'VORTEX_SPLINE_SMOOTHING', 'SHOW_CROSSLINK_NODES',
+    'CROSSLINK_SEARCH_RADIUS', 'CROSSLINK_MERGE_RADIUS',
+    'ORDER_CROSSLINK_BALLS', 'CROSSLINK_TRACE_LINES',
+    'CROSSLINK_ORDER_LINK_RADIUS', 'CROSSLINK_ORDER_SPACING', 'CROSSLINK_ORDER_MIN_NODES',
+    'CROSSLINK_ADJUST_TO_SMOOTHED_LINES', 'CROSSLINK_SEGMENT_CANDIDATES',
+    'CROSSLINK_ADJUST_CENTER_WEIGHT', 'CROSSLINK_ADJUST_CLUSTER_RADIUS',
+    'CROSSLINK_BALL_RADIUS', 'CROSSLINK_COLOR',
+    'CROSSLINK_RENDER_CONSECUTIVE_AS_TUBES', 'CROSSLINK_TUBE_CONNECT_RADIUS',
+    'SHOW_CROSSLINK_EDGES', 'CROSSLINK_EDGE_COLOR',
+    'SHOW_PHI1_ZERO_SURFACE', 'SHOW_PHI2_ZERO_SURFACE', 'SHOW_PHI3_ZERO_SURFACE',
+    'PHI1_SURFACE_OPACITY', 'PHI2_SURFACE_OPACITY', 'PHI3_SURFACE_OPACITY',
+    'SHOW_PHI_SURFACE_EDGES', 'PHI_SURFACE_EDGE_COLOR',
+    'S12_TUBE_COLOR', 'S13_TUBE_COLOR', 'S12_TUBE_OPACITY', 'S13_TUBE_OPACITY',
+    'SHOW_TUBE_EDGES', 'TUBE_EDGE_COLOR',
+    'SHOW_BOUNDING_BOX', 'BOX_SIZE_L', 'BOUNDING_BOX_COLOR', 'BOUNDING_BOX_LINE_WIDTH',
+]:
+    settings_lines.append(f'  {name} = {getattr(r, name)}')
+
+settings_lines.append('')
+settings_lines.append('Sweep results:')
+
+for c in COUPLING_VALUES:
+    r.COUPLE_PHI2_PHI3 = True
+    r.PHI23_COUPLING_C = c
+    screenshot_path = coupling_frame_path(c)
+
+    print(f'Rendering c={c:.2f} -> {screenshot_path}')
+    plotter, meshes = r.build_scene()
+    plotter.off_screen = True
+    plotter.screenshot(str(screenshot_path))
+    plotter.close()
+
+    raw_count = len(meshes['raw_crosslink_centers'])
+    adjusted_count = len(meshes['crosslink_centers'])
+    candidate_count = len(meshes['crosslink_candidate_centers'])
+    displayed_count = len(meshes['display_crosslink_centers'])
+    corr = r.theoretical_phi23_correlation(c)
+    settings_lines.append(
+        f'  c={c:.2f}: expected_corr={corr:.6g}, '
+        f'S12_lines={meshes["S12"].n_lines}, S13_lines={meshes["S13"].n_lines}, '
+        f'candidate_crosslinks={candidate_count}, '
+        f'crosslink_trace_lines={meshes["crosslink_lines"].n_lines}, '
+        f'raw_crosslinks={raw_count}, adjusted_crosslinks={adjusted_count}, '
+        f'displayed_crosslinks={displayed_count}, '
+        f'file={screenshot_path.name}'
+    )
+
+frame_paths = [
+    coupling_frame_path(c)
+    for c in GIF_COUPLING_VALUES
+]
+if frame_paths:
+    frames = [
+        Image.open(path).convert('P', palette=Image.Palette.ADAPTIVE, colors=128)
+        for path in frame_paths
+    ]
+    frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=100,
+        loop=0,
+        optimize=False,
+    )
+    settings_lines.append('')
+    settings_lines.append(f'GIF: {gif_path.name}')
+    print(f'Wrote {gif_path}')
+
+settings_path = OUTPUT_DIR / 'settings.txt'
+settings_path.write_text('\n'.join(settings_lines) + '\n', encoding='utf-8')
+print(f'Wrote {settings_path}')
+'@ | C:\Users\ccu\AppData\Local\miniconda\envs\pyvista\python.exe -B -
