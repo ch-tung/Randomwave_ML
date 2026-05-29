@@ -34,6 +34,14 @@ from scipy.spatial import cKDTree
 GRID_SIZE = 128
 RANDOM_SEED = 20260526
 
+# Block-wise field assembly for larger domains. GRID_SIZE is the point count
+# for one block. NUM_BLOCK=2 makes a 2 by 2 by 2 block expansion with stitched
+# side length (GRID_SIZE - 1)*NUM_BLOCK + 1. BLOCK_OVERLAP is evaluated around
+# each block before cropping back to the owned core; the final vortex and
+# crosslink detection still run only after the stitched field is recombined.
+NUM_BLOCK = 1
+BLOCK_OVERLAP = 0
+
 # Number of modes per field. Use one integer for all fields or a 3-tuple.
 NUM_MODES: int | tuple[int, int, int] = (180, 180, 180)
 
@@ -137,6 +145,8 @@ BOUNDING_BOX_LINE_WIDTH = 1.0
 # psi_13=phi1+i*phi3. This gives line geometry directly, avoiding the bulged
 # tube-boundary isosurfaces from phi_a^2+phi_b^2=epsilon^2.
 USE_VORTEX_TRACING = True
+VORTEX_FACE_PREFILTER = True
+VORTEX_FACE_ZERO_TOL = 0.0
 VORTEX_TUBE_RADIUS = 0.35
 MIN_VORTEX_SEGMENT_LENGTH = 0.0
 SMOOTH_VORTEX_LINES = True
@@ -163,7 +173,7 @@ CROSSLINK_ADJUST_CENTER_WEIGHT = 0.25
 CROSSLINK_ADJUST_CLUSTER_RADIUS = CROSSLINK_MERGE_RADIUS
 
 SAVE_SCREENSHOT = True
-SCREENSHOT_PATH = "random_wave_line_network.png"
+SCREENSHOT_PATH = "rw_line_network.png"
 
 SAVE_MESHES = False
 MESH_OUTPUT_DIR = "random_wave_line_meshes"
@@ -186,6 +196,15 @@ class FieldKSets:
     phi1: np.ndarray
     phi2: np.ndarray
     phi3: np.ndarray
+
+
+@dataclass(frozen=True)
+class WaveCoefficients:
+    """Fixed coefficients for one random-wave realization."""
+
+    k_vectors: np.ndarray
+    amplitudes: np.ndarray
+    phases: np.ndarray
 
 
 def _mode_counts(num_modes: int | Sequence[int]) -> tuple[int, int, int]:
@@ -365,6 +384,209 @@ def make_field_k_sets(
     )
 
 
+def expanded_grid_size(
+    block_grid_size: int | None = None,
+    num_block: int | None = None,
+) -> int:
+    """Return the stitched point count for a NUM_BLOCK by NUM_BLOCK by NUM_BLOCK domain."""
+
+    if block_grid_size is None:
+        block_grid_size = GRID_SIZE
+    if num_block is None:
+        num_block = NUM_BLOCK
+    n = int(block_grid_size)
+    blocks = int(num_block)
+    if n < 2:
+        raise ValueError("GRID_SIZE must be at least 2.")
+    if blocks < 1:
+        raise ValueError("NUM_BLOCK must be at least 1.")
+    return (n - 1) * blocks + 1
+
+
+def _validate_block_overlap(block_grid_size: int, block_overlap: int) -> int:
+    overlap = int(block_overlap)
+    if overlap < 0:
+        raise ValueError("BLOCK_OVERLAP must be non-negative.")
+    if overlap >= int(block_grid_size):
+        raise ValueError("BLOCK_OVERLAP must be smaller than GRID_SIZE.")
+    return overlap
+
+
+def make_wave_coefficients(
+    k_vectors: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    amplitude_scale: float = 1.0,
+) -> WaveCoefficients:
+    """Sample amplitudes and phases once so every block uses one coherent wave."""
+
+    vectors = np.asarray(k_vectors, dtype=np.float64)
+    amplitudes = rng.normal(loc=0.0, scale=amplitude_scale, size=len(vectors))
+    phases = rng.uniform(0.0, 2.0 * np.pi, size=len(vectors))
+    return WaveCoefficients(vectors, amplitudes, phases)
+
+
+def coefficient_field_std(coefficients: WaveCoefficients) -> float:
+    """
+    Estimate field standard deviation from the mode coefficients.
+
+    For phases that decorrelate over the sampled domain, each term
+    A_n*cos(...) contributes A_n^2/2 to the variance. This avoids changing the
+    normalization just because NUM_BLOCK changes the sampled volume.
+    """
+
+    variance = 0.5 * float(np.sum(np.square(coefficients.amplitudes), dtype=np.float64))
+    if variance <= 0.0:
+        raise RuntimeError("Random-wave coefficients have zero variance.")
+    return float(np.sqrt(variance))
+
+
+def _evaluate_random_wave_on_indices(
+    x_indices: np.ndarray,
+    y_indices: np.ndarray,
+    z_indices: np.ndarray,
+    coefficients: WaveCoefficients,
+    *,
+    coordinate_grid_size: int,
+) -> np.ndarray:
+    """
+    Evaluate one unnormalized field on global integer grid indices.
+
+    The returned array is indexed as field[x, y, z]. This convention matches
+    PyVista point-data insertion when flattened with order="F".
+
+    Coordinates are divided by coordinate_grid_size rather than by the stitched
+    domain size. Therefore kL stays tied to one block of side length 1, and
+    NUM_BLOCK expands the physical box instead of dilating the wavelength.
+    """
+
+    coordinate_scale = float(coordinate_grid_size)
+    x = np.asarray(x_indices, dtype=np.float64)[:, None, None] / coordinate_scale
+    y = np.asarray(y_indices, dtype=np.float64)[None, :, None] / coordinate_scale
+    z = np.asarray(z_indices, dtype=np.float64)[None, None, :] / coordinate_scale
+
+    field = np.zeros((len(x_indices), len(y_indices), len(z_indices)), dtype=np.float64)
+    for (kx, ky, kz), amplitude, phase0 in zip(
+        coefficients.k_vectors,
+        coefficients.amplitudes,
+        coefficients.phases,
+    ):
+        phase = 2.0 * np.pi * (kx * x + ky * y + kz * z) + phase0
+        field += amplitude * np.cos(phase)
+    return field
+
+
+def normalize_field_inplace(field: np.ndarray) -> np.ndarray:
+    """Normalize a floating array in place to zero mean and unit standard deviation."""
+
+    mean = float(np.mean(field, dtype=np.float64))
+    std = float(np.std(field, dtype=np.float64))
+    if std == 0.0:
+        raise RuntimeError("Field has zero standard deviation.")
+    field -= mean
+    field /= std
+    return field
+
+
+def normalize_field_from_coefficients_inplace(
+    field: np.ndarray,
+    coefficients: WaveCoefficients,
+) -> np.ndarray:
+    """Normalize by the coefficient-based variance estimate, without sample fitting."""
+
+    field /= coefficient_field_std(coefficients)
+    return field
+
+
+def build_random_wave_field_from_coefficients(
+    grid_size: int,
+    coefficients: WaveCoefficients,
+    *,
+    dtype: np.dtype = np.float32,
+) -> np.ndarray:
+    """Build one full-grid random-wave field from fixed coefficients."""
+
+    n = int(grid_size)
+    indices = np.arange(n, dtype=np.int64)
+    field = _evaluate_random_wave_on_indices(
+        indices,
+        indices,
+        indices,
+        coefficients,
+        coordinate_grid_size=n,
+    )
+    normalize_field_from_coefficients_inplace(field, coefficients)
+    return field.astype(dtype, copy=False)
+
+
+def build_random_wave_field_blockwise(
+    block_grid_size: int,
+    num_block: int,
+    block_overlap: int,
+    coefficients: WaveCoefficients,
+    *,
+    dtype: np.dtype = np.float32,
+) -> np.ndarray:
+    """
+    Build a larger field one overlapped block at a time, then normalize globally.
+
+    The final stitched grid has side length (block_grid_size - 1)*num_block + 1.
+    Adjacent blocks share boundary planes, so the field remains continuous at
+    joins. Overlap is evaluated and cropped away; it is useful for future local
+    per-block measurements, while this script still traces defects after the
+    recombined field is assembled.
+    """
+
+    n = int(block_grid_size)
+    blocks = int(num_block)
+    overlap = _validate_block_overlap(n, block_overlap)
+    total_n = expanded_grid_size(n, blocks)
+    stride = n - 1
+    field = np.empty((total_n, total_n, total_n), dtype=np.float32)
+
+    for bx in range(blocks):
+        x0 = bx * stride
+        x1 = x0 + n
+        ex0 = max(0, x0 - overlap)
+        ex1 = min(total_n, x1 + overlap)
+        x_eval = np.arange(ex0, ex1, dtype=np.int64)
+        cx0 = x0 - ex0
+        cx1 = cx0 + n
+
+        for by in range(blocks):
+            y0 = by * stride
+            y1 = y0 + n
+            ey0 = max(0, y0 - overlap)
+            ey1 = min(total_n, y1 + overlap)
+            y_eval = np.arange(ey0, ey1, dtype=np.int64)
+            cy0 = y0 - ey0
+            cy1 = cy0 + n
+
+            for bz in range(blocks):
+                z0 = bz * stride
+                z1 = z0 + n
+                ez0 = max(0, z0 - overlap)
+                ez1 = min(total_n, z1 + overlap)
+                z_eval = np.arange(ez0, ez1, dtype=np.int64)
+                cz0 = z0 - ez0
+                cz1 = cz0 + n
+
+                block = _evaluate_random_wave_on_indices(
+                    x_eval,
+                    y_eval,
+                    z_eval,
+                    coefficients,
+                    coordinate_grid_size=n,
+                )
+                field[x0:x1, y0:y1, z0:z1] = block[cx0:cx1, cy0:cy1, cz0:cz1].astype(
+                    np.float32,
+                    copy=False,
+                )
+
+    normalize_field_from_coefficients_inplace(field, coefficients)
+    return field.astype(dtype, copy=False)
+
+
 def build_random_wave_field(
     grid_size: int,
     k_vectors: np.ndarray,
@@ -372,29 +594,29 @@ def build_random_wave_field(
     *,
     amplitude_scale: float = 1.0,
     dtype: np.dtype = np.float32,
+    num_block: int | None = None,
+    block_overlap: int | None = None,
 ) -> np.ndarray:
-    """
-    Build one real random-wave field and normalize it to zero mean/unit std.
+    """Build one real random-wave field with coefficient-based normalization."""
 
-    The returned array is indexed as field[x, y, z]. This convention matches
-    PyVista point-data insertion when flattened with order="F".
-    """
-
-    n = int(grid_size)
-    coords = np.arange(n, dtype=np.float64) / float(n)
-    x = coords[:, None, None]
-    y = coords[None, :, None]
-    z = coords[None, None, :]
-
-    field = np.zeros((n, n, n), dtype=np.float64)
-    amplitudes = rng.normal(loc=0.0, scale=amplitude_scale, size=len(k_vectors))
-    phases = rng.uniform(0.0, 2.0 * np.pi, size=len(k_vectors))
-
-    for (kx, ky, kz), amplitude, phase0 in zip(k_vectors, amplitudes, phases):
-        phase = 2.0 * np.pi * (kx * x + ky * y + kz * z) + phase0
-        field += amplitude * np.cos(phase)
-
-    return normalize_field(field, dtype=dtype)
+    if num_block is None:
+        num_block = NUM_BLOCK
+    if block_overlap is None:
+        block_overlap = BLOCK_OVERLAP
+    coefficients = make_wave_coefficients(k_vectors, rng, amplitude_scale=amplitude_scale)
+    if int(num_block) == 1:
+        return build_random_wave_field_from_coefficients(
+            grid_size,
+            coefficients,
+            dtype=dtype,
+        )
+    return build_random_wave_field_blockwise(
+        grid_size,
+        num_block,
+        block_overlap,
+        coefficients,
+        dtype=dtype,
+    )
 
 
 def normalize_field(field: np.ndarray, *, dtype: np.dtype = np.float32) -> np.ndarray:
@@ -419,11 +641,11 @@ def build_correlated_phi2_phi3_fields(
     dtype: np.dtype = np.float32,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build phi_2 and phi_3 from two independent base waves Sa and Sb.
+    Build phi_2 and phi_3 from two independent coefficient-normalized base waves.
 
     The construction is:
-        phi_2 = normalize(Sa + c*Sb)
-        phi_3 = normalize(Sa - c*Sb)
+        phi_2 = (Sa + c*Sb)/sqrt(1 + c^2)
+        phi_3 = (Sa - c*Sb)/sqrt(1 + c^2)
 
     If Sa and Sb are iid Gaussian random fields, the resulting pointwise
     correlation is (1-c^2)/(1+c^2). Thus c=0 gives complete overlap and c=1
@@ -436,8 +658,9 @@ def build_correlated_phi2_phi3_fields(
 
     sa = build_random_wave_field(grid_size, k_vectors_a, rng, dtype=np.float64)
     sb = build_random_wave_field(grid_size, k_vectors_b, rng, dtype=np.float64)
-    phi2 = normalize_field(sa + c * sb, dtype=dtype)
-    phi3 = normalize_field(sa - c * sb, dtype=dtype)
+    expected_std = np.sqrt(1.0 + c * c)
+    phi2 = ((sa + c * sb) / expected_std).astype(dtype, copy=False)
+    phi3 = ((sa - c * sb) / expected_std).astype(dtype, copy=False)
     return phi2, phi3
 
 
@@ -477,6 +700,55 @@ def _plaquette_winding(
     return np.rint(total / (2.0 * np.pi)).astype(np.int8)
 
 
+def _face_zero_candidate(
+    f00: np.ndarray,
+    f10: np.ndarray,
+    f11: np.ndarray,
+    f01: np.ndarray,
+    *,
+    zero_tol: float,
+) -> np.ndarray:
+    """
+    Return faces where one scalar can plausibly vanish.
+
+    With zero_tol=0 this is the usual bracket test min <= 0 <= max. A small
+    positive tolerance keeps near-tangent contacts in the candidate set, trading
+    a little speed for robustness.
+    """
+
+    f_min = np.minimum(np.minimum(f00, f10), np.minimum(f11, f01))
+    f_max = np.maximum(np.maximum(f00, f10), np.maximum(f11, f01))
+    tol = float(zero_tol)
+    return (f_min <= tol) & (f_max >= -tol)
+
+
+def _prefiltered_plaquette_winding(
+    phase_corners: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    real_corners: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    imag_corners: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    *,
+    zero_tol: float,
+) -> np.ndarray:
+    """Compute winding only on faces where both scalar fields can vanish."""
+
+    candidate = _face_zero_candidate(*real_corners, zero_tol=zero_tol) & _face_zero_candidate(
+        *imag_corners,
+        zero_tol=zero_tol,
+    )
+    winding = np.zeros(candidate.shape, dtype=np.int8)
+    if not np.any(candidate):
+        return winding
+
+    p00, p10, p11, p01 = phase_corners
+    winding[candidate] = _plaquette_winding(
+        p00[candidate],
+        p10[candidate],
+        p11[candidate],
+        p01[candidate],
+    )
+    return winding
+
+
 def phase_winding_faces(phi_real: np.ndarray, phi_imag: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Detect phase winding on grid plaquettes for psi = phi_real + i*phi_imag.
@@ -492,6 +764,72 @@ def phase_winding_faces(phi_real: np.ndarray, phi_imag: np.ndarray) -> tuple[np.
     """
 
     phase = np.angle(phi_real + 1j * phi_imag)
+
+    if VORTEX_FACE_PREFILTER:
+        wx = _prefiltered_plaquette_winding(
+            (
+                phase[:, :-1, :-1],
+                phase[:, 1:, :-1],
+                phase[:, 1:, 1:],
+                phase[:, :-1, 1:],
+            ),
+            (
+                phi_real[:, :-1, :-1],
+                phi_real[:, 1:, :-1],
+                phi_real[:, 1:, 1:],
+                phi_real[:, :-1, 1:],
+            ),
+            (
+                phi_imag[:, :-1, :-1],
+                phi_imag[:, 1:, :-1],
+                phi_imag[:, 1:, 1:],
+                phi_imag[:, :-1, 1:],
+            ),
+            zero_tol=VORTEX_FACE_ZERO_TOL,
+        )
+        wy = _prefiltered_plaquette_winding(
+            (
+                phase[:-1, :, :-1],
+                phase[:-1, :, 1:],
+                phase[1:, :, 1:],
+                phase[1:, :, :-1],
+            ),
+            (
+                phi_real[:-1, :, :-1],
+                phi_real[:-1, :, 1:],
+                phi_real[1:, :, 1:],
+                phi_real[1:, :, :-1],
+            ),
+            (
+                phi_imag[:-1, :, :-1],
+                phi_imag[:-1, :, 1:],
+                phi_imag[1:, :, 1:],
+                phi_imag[1:, :, :-1],
+            ),
+            zero_tol=VORTEX_FACE_ZERO_TOL,
+        )
+        wz = _prefiltered_plaquette_winding(
+            (
+                phase[:-1, :-1, :],
+                phase[1:, :-1, :],
+                phase[1:, 1:, :],
+                phase[:-1, 1:, :],
+            ),
+            (
+                phi_real[:-1, :-1, :],
+                phi_real[1:, :-1, :],
+                phi_real[1:, 1:, :],
+                phi_real[:-1, 1:, :],
+            ),
+            (
+                phi_imag[:-1, :-1, :],
+                phi_imag[1:, :-1, :],
+                phi_imag[1:, 1:, :],
+                phi_imag[:-1, 1:, :],
+            ),
+            zero_tol=VORTEX_FACE_ZERO_TOL,
+        )
+        return wx, wy, wz
 
     wx = _plaquette_winding(
         phase[:, :-1, :-1],
@@ -941,12 +1279,18 @@ def make_crosslink_node_mesh(
 
     if radius is None:
         radius = CROSSLINK_BALL_RADIUS
+    centers = np.asarray(centers, dtype=float)
+    if len(centers) == 0:
+        return pv.PolyData()
 
-    merged = pv.PolyData()
-    for center in centers:
-        sphere = pv.Sphere(radius=radius, center=tuple(center), theta_resolution=20, phi_resolution=20)
-        merged = merged.merge(sphere)
-    return merged
+    cloud = pv.PolyData(centers)
+    sphere = pv.Sphere(
+        radius=float(radius),
+        center=(0.0, 0.0, 0.0),
+        theta_resolution=20,
+        phi_resolution=20,
+    )
+    return cloud.glyph(geom=sphere, scale=False, orient=False)
 
 
 def make_capped_crosslink_tube_mesh(
@@ -1424,31 +1768,51 @@ def bridge_crosslink_site_mesh_endpoints(
         return site_mesh
 
     while True:
-        best: tuple[float, int, int, str] | None = None
-        for i in range(len(paths)):
-            for j in range(i + 1, len(paths)):
-                endpoints = (
-                    (paths[i][0], paths[j][0], "ss"),
-                    (paths[i][0], paths[j][-1], "se"),
-                    (paths[i][-1], paths[j][0], "es"),
-                    (paths[i][-1], paths[j][-1], "ee"),
-                )
-                for a, b, mode in endpoints:
-                    distance = float(np.linalg.norm(a - b))
-                    if distance <= connect_radius and (best is None or distance < best[0]):
-                        best = (distance, i, j, mode)
+        endpoint_points: list[np.ndarray] = []
+        endpoint_path_ids: list[int] = []
+        endpoint_sides: list[int] = []
+        for path_id, path in enumerate(paths):
+            endpoint_points.append(path[0])
+            endpoint_path_ids.append(path_id)
+            endpoint_sides.append(0)
+            endpoint_points.append(path[-1])
+            endpoint_path_ids.append(path_id)
+            endpoint_sides.append(1)
 
-        if best is None:
+        if len(endpoint_points) < 4:
             break
 
-        _, i, j, mode = best
+        endpoint_array = np.asarray(endpoint_points, dtype=float)
+        pairs = cKDTree(endpoint_array).query_pairs(connect_radius, output_type="ndarray")
+        if len(pairs) == 0:
+            break
+
+        path_ids = np.asarray(endpoint_path_ids, dtype=int)
+        sides = np.asarray(endpoint_sides, dtype=int)
+        valid = path_ids[pairs[:, 0]] != path_ids[pairs[:, 1]]
+        if not np.any(valid):
+            break
+
+        pairs = pairs[valid]
+        distances = np.linalg.norm(endpoint_array[pairs[:, 0]] - endpoint_array[pairs[:, 1]], axis=1)
+        best_pair = pairs[int(np.argmin(distances))]
+        i = int(path_ids[best_pair[0]])
+        j = int(path_ids[best_pair[1]])
+        side_i = int(sides[best_pair[0]])
+        side_j = int(sides[best_pair[1]])
+
+        if i == j:
+            break
+        if i > j:
+            i, j = j, i
+            side_i, side_j = side_j, side_i
         path_i = paths[i]
         path_j = paths[j]
-        if mode == "ss":
+        if side_i == 0 and side_j == 0:
             merged = np.vstack((path_i[::-1], path_j))
-        elif mode == "se":
+        elif side_i == 0 and side_j == 1:
             merged = np.vstack((path_j, path_i))
-        elif mode == "es":
+        elif side_i == 1 and side_j == 0:
             merged = np.vstack((path_i, path_j))
         else:
             merged = np.vstack((path_i, path_j[::-1]))
@@ -1689,7 +2053,7 @@ def add_fixed_box_outline(plotter: pv.Plotter, *, box_size_l: float | None = Non
     if box_size_l is None:
         box_size_l = BOX_SIZE_L
     if box_size_l is None:
-        box_size_l = float(GRID_SIZE - 1)
+        box_size_l = float(expanded_grid_size(GRID_SIZE, NUM_BLOCK) - 1)
     l_value = float(box_size_l)
     box = pv.Box(bounds=(0.0, l_value, 0.0, l_value, 0.0, l_value)).outline()
     plotter.add_mesh(
@@ -1711,6 +2075,7 @@ def save_mesh(mesh: pv.PolyData, output_dir: str | Path, file_name: str) -> Path
 
 def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
     rng = np.random.default_rng(RANDOM_SEED)
+    active_grid_size = expanded_grid_size(GRID_SIZE, NUM_BLOCK)
 
     k_sets = make_field_k_sets(
         NUM_MODES,
@@ -1719,8 +2084,21 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
         shared_k_vectors=SHARED_K_VECTORS,
     )
 
+    if int(NUM_BLOCK) > 1:
+        print(
+            "Using block-wise field assembly: "
+            f"GRID_SIZE={GRID_SIZE}, NUM_BLOCK={NUM_BLOCK}, BLOCK_OVERLAP={BLOCK_OVERLAP}, "
+            f"stitched side={active_grid_size}"
+        )
+
     print("Building phi_1...")
-    phi1 = build_random_wave_field(GRID_SIZE, k_sets.phi1, rng)
+    phi1 = build_random_wave_field(
+        GRID_SIZE,
+        k_sets.phi1,
+        rng,
+        num_block=NUM_BLOCK,
+        block_overlap=BLOCK_OVERLAP,
+    )
     if COUPLE_PHI2_PHI3:
         print(
             "Building coupled phi_2/phi_3 "
@@ -1735,14 +2113,27 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
         )
     else:
         print("Building phi_2...")
-        phi2 = build_random_wave_field(GRID_SIZE, k_sets.phi2, rng)
+        phi2 = build_random_wave_field(
+            GRID_SIZE,
+            k_sets.phi2,
+            rng,
+            num_block=NUM_BLOCK,
+            block_overlap=BLOCK_OVERLAP,
+        )
         print("Building phi_3...")
-        phi3 = build_random_wave_field(GRID_SIZE, k_sets.phi3, rng)
+        phi3 = build_random_wave_field(
+            GRID_SIZE,
+            k_sets.phi3,
+            rng,
+            num_block=NUM_BLOCK,
+            block_overlap=BLOCK_OVERLAP,
+        )
 
     s12 = make_line_scalar(phi1, phi2)
     s13 = make_line_scalar(phi1, phi3)
+    active_grid_size = int(phi1.shape[0])
 
-    grid = make_image_data(GRID_SIZE)
+    grid = make_image_data(active_grid_size)
     add_scalar_field(grid, "phi1", phi1)
     add_scalar_field(grid, "phi2", phi2)
     add_scalar_field(grid, "phi3", phi3)
@@ -1961,10 +2352,10 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
         add_fixed_box_outline(plotter)
     plotter.add_axes(line_width=2, labels_off=False)
     plotter.reset_camera()
-    set_camera_from_angles(plotter, GRID_SIZE)
+    set_camera_from_angles(plotter, active_grid_size)
     plotter.camera.zoom(CAMERA_ZOOM)
     plotter.camera.reset_clipping_range()
-    add_camera_and_top_lights(plotter, GRID_SIZE)
+    add_camera_and_top_lights(plotter, active_grid_size)
 
     meshes = {
         "S12": s12_mesh,

@@ -5,11 +5,11 @@ from pathlib import Path
 from PIL import Image
 import pyvista as pv
 
-import random_wave_line_network as r
+import rw_line_network as r
 
 import numpy as np
 
-NOTEBOOK = Path('interactive_random_wave_line_network.ipynb')
+NOTEBOOK = Path('interactive_rw_line_network.ipynb')
 OUTPUT_DIR = Path('figure_coupling')
 COUPLING_VALUES = np.linspace(1.0, 0.0, 26)
 GIF_COUPLING_VALUES = list(COUPLING_VALUES) + list(COUPLING_VALUES[-2:0:-1])
@@ -42,7 +42,7 @@ if gif_path.exists():
 pv.OFF_SCREEN = True
 
 settings_lines = []
-settings_lines.append('Coupling sweep generated from interactive_random_wave_line_network.ipynb settings')
+settings_lines.append('Coupling sweep generated from interactive_rw_line_network.ipynb settings')
 settings_lines.append('')
 settings_lines.append('Rendered coupling values: ' + ', '.join(f'{v:.2f}' for v in COUPLING_VALUES))
 settings_lines.append('GIF frame order: ' + ', '.join(f'{v:.2f}' for v in GIF_COUPLING_VALUES))
@@ -55,13 +55,14 @@ settings_lines.append('')
 settings_lines.append('Base settings after notebook cell execution:')
 
 for name in [
-    'GRID_SIZE', 'RANDOM_SEED', 'NUM_MODES', 'WINDOW_SIZE', 'CAMERA_ZOOM',
+    'GRID_SIZE', 'NUM_BLOCK', 'BLOCK_OVERLAP', 'RANDOM_SEED', 'NUM_MODES', 'WINDOW_SIZE', 'CAMERA_ZOOM',
     'CAMERA_AZIMUTH_DEGREES', 'CAMERA_POLAR_DEGREES',
     'USE_CUSTOM_LIGHTING', 'HEADLIGHT_INTENSITY', 'TOP_LIGHT_INTENSITY',
     'AMBIENT_LIGHT_INTENSITY',
     'K_DISTRIBUTION', 'K0', 'r_SIGMA_K', 'r_K_MIN', 'r_K_MAX', 'SHARED_K_VECTORS',
     'COUPLE_PHI2_PHI3', 'PHI23_COUPLING_C',
-    'USE_VORTEX_TRACING', 'VORTEX_TUBE_RADIUS', 'SMOOTH_VORTEX_LINES',
+    'USE_VORTEX_TRACING', 'VORTEX_FACE_PREFILTER', 'VORTEX_FACE_ZERO_TOL',
+    'VORTEX_TUBE_RADIUS', 'SMOOTH_VORTEX_LINES',
     'VORTEX_SMOOTHING_SCALE', 'VORTEX_SPLINE_SMOOTHING', 'SHOW_CROSSLINK_NODES',
     'CROSSLINK_SEARCH_RADIUS', 'CROSSLINK_MERGE_RADIUS',
     'ORDER_CROSSLINK_BALLS', 'CROSSLINK_TRACE_LINES',
@@ -79,6 +80,7 @@ for name in [
     'SHOW_BOUNDING_BOX', 'BOX_SIZE_L', 'BOUNDING_BOX_COLOR', 'BOUNDING_BOX_LINE_WIDTH',
 ]:
     settings_lines.append(f'  {name} = {getattr(r, name)}')
+settings_lines.append(f'  STITCHED_GRID_SIZE = {r.expanded_grid_size(r.GRID_SIZE, r.NUM_BLOCK)}')
 
 settings_lines.append('')
 settings_lines.append('Sweep results:')

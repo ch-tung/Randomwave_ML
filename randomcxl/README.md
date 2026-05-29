@@ -22,10 +22,10 @@ rendered branch.
 
 ## Files
 
-- `random_wave_line_network.py`: reusable script with field generation,
+- `rw_line_network.py`: reusable script with field generation,
   k-vector sampling, vortex-line tracing, smoothing, crosslink detection, and
   PyVista rendering.
-- `interactive_random_wave_line_network.ipynb`: notebook interface for tuning
+- `interactive_rw_line_network.ipynb`: notebook interface for tuning
   sampling, tracing, crosslink, and render settings.
 - `figure_coupling/`: coupling sweep figures and the settings used to generate
   them.
@@ -40,12 +40,17 @@ The notebook organizes settings into three groups.
 
 ### Sampling settings
 
-The fields are sampled on a cubic grid with normalized box coordinates
-`r_tilde = (x/N, y/N, z/N)`, so the box side is effectively `L = 1`.
+The fields are sampled on a cubic grid with normalized block coordinates
+`r_tilde = (x/N, y/N, z/N)`, so one block side is effectively `L = 1`.
 
 Important controls:
 
-- `GRID_SIZE`: number of grid points along each direction.
+- `GRID_SIZE`: number of grid points along each direction in one sampled block.
+- `NUM_BLOCK`: number of blocks per direction. `NUM_BLOCK = 1` uses the
+  original single-box method; `NUM_BLOCK = 2` stitches a `2 by 2 by 2`
+  expansion.
+- `BLOCK_OVERLAP`: number of extra grid points evaluated around each block
+  before cropping back to the block core.
 - `RANDOM_SEED`: reproducible random seed.
 - `NUM_MODES`: number of random-wave modes for `(phi_1, phi_2, phi_3)`.
 - `K_DISTRIBUTION`: one of `single_shell`, `gaussian_radial`, `uniform_band`,
@@ -55,14 +60,21 @@ Important controls:
   by each field's `K0`.
 - `SHARED_K_VECTORS`: whether fields share sampled k-vectors.
 
+For block-wise assembly, the recombined grid has side length
+`(GRID_SIZE - 1)*NUM_BLOCK + 1`. The same random-wave coefficients are reused in
+every block. Field normalization is estimated from the mode amplitudes
+(`sum(A_n^2)/2`) rather than fitted from the sampled grid, so changing
+`NUM_BLOCK` does not silently rescale the fields. Vortex and crosslink detection
+are then performed on the recombined grid.
+
 ### Coupling phi_2 and phi_3
 
 The script can tune the expected overlap of the two retained line families by
 constructing `phi_2` and `phi_3` from two independent base random waves:
 
 ```python
-phi_2 = normalize(Sa + c*Sb)
-phi_3 = normalize(Sa - c*Sb)
+phi_2 = (Sa + c*Sb) / sqrt(1 + c**2)
+phi_3 = (Sa - c*Sb) / sqrt(1 + c**2)
 ```
 
 Enable with:
@@ -98,6 +110,10 @@ crosslink centers can be adjusted to the closest pair of smoothed segments.
 Useful controls:
 
 - `SMOOTH_VORTEX_LINES`: enable spline smoothing of traced lines.
+- `VORTEX_FACE_PREFILTER`: compute phase winding only on faces where both
+  scalar fields can plausibly cross zero.
+- `VORTEX_FACE_ZERO_TOL`: relaxed zero-bracketing tolerance for the prefilter;
+  larger values are safer for near-tangent cases but admit more faces.
 - `VORTEX_SMOOTHING_SCALE`: interpolation density along smoothed lines.
 - `VORTEX_TUBE_RADIUS`: rendered tube radius, in grid-coordinate units.
 - `CROSSLINK_SEARCH_RADIUS`: distance used to find raw contacts between the
@@ -121,10 +137,10 @@ Use the `pyvista` conda environment:
 ```powershell
 conda activate pyvista
 cd C:\Users\ccu\Documents\codex_projects\project_randomcxl
-python random_wave_line_network.py
+python rw_line_network.py
 ```
 
-For interactive exploration, open `interactive_random_wave_line_network.ipynb`
+For interactive exploration, open `interactive_rw_line_network.ipynb`
 with the same environment selected as the notebook kernel.
 
 ## Coupling Sweep
