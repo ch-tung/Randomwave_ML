@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
@@ -40,6 +41,11 @@ SCATTERING_SEED = 20260529
 SCATTERING_BATCH_SIZE = 32768
 SCATTERING_FLATTEN_Q_DIRECTIONS = False
 SCATTERING_AMPLITUDE_METHOD = "points"  # "points" or "line_segments"
+SCATTERING_WINDOW = "none"  # "none", "tukey_box", "hann_box", or "gaussian"
+SCATTERING_WINDOW_TAPER = 0.15
+SUBTRACT_WINDOWED_MEAN = True
+WINDOW_MEAN_METHOD = "numeric_1d"  # "numeric_1d" or "grid_fft" (reserved)
+WINDOW_NORMALIZATION = "windowed_measure"
 SUBTRACT_EXPLICIT_BOX_MEAN = False
 ANALYTIC_MEAN_BUFFER_BLOCKS = 0
 ANALYTIC_MEAN_BUFFER_MODE = "none"  # "none", "incoherent", or "coherent"
@@ -161,6 +167,185 @@ def active_box_size_l() -> float:
     return float(r.expanded_grid_size(r.GRID_SIZE, r.NUM_BLOCK) - 1)
 
 
+def active_box_center() -> np.ndarray:
+    """Return the center of the active cubic observation box."""
+
+    half_l = 0.5 * active_box_size_l()
+    return np.array([half_l, half_l, half_l], dtype=float)
+
+
+def scattering_window_type(window_type: str | None = None) -> str:
+    """Resolve and validate the scattering window type."""
+
+    if window_type is None:
+        window_type = SCATTERING_WINDOW
+    window_type = str(window_type).lower()
+    if window_type not in {"none", "tukey_box", "hann_box", "gaussian"}:
+        raise ValueError("SCATTERING_WINDOW must be 'none', 'tukey_box', 'hann_box', or 'gaussian'.")
+    return window_type
+
+
+def _window_1d_from_u(u: np.ndarray, window_type: str, taper_fraction: float) -> np.ndarray:
+    """Evaluate a symmetric 1D window as a function of u=abs(x-center)/(L/2)."""
+
+    u = np.asarray(u, dtype=float)
+    window_type = scattering_window_type(window_type)
+    if window_type == "none":
+        return np.ones_like(u)
+
+    inside = u < 1.0
+    values = np.zeros_like(u)
+    if window_type == "tukey_box":
+        taper = float(np.clip(taper_fraction, 1.0e-6, 1.0))
+        plateau_edge = max(0.0, 1.0 - taper)
+        values[(u <= plateau_edge) & inside] = 1.0
+        taper_region = (u > plateau_edge) & inside
+        if np.any(taper_region):
+            t = (u[taper_region] - plateau_edge) / max(1.0 - plateau_edge, 1.0e-12)
+            values[taper_region] = 0.5 * (1.0 + np.cos(np.pi * t))
+        return values
+
+    if window_type == "hann_box":
+        values[inside] = 0.5 * (1.0 + np.cos(np.pi * u[inside]))
+        return values
+
+    edge_value = float(np.clip(taper_fraction, 1.0e-4, 0.95))
+    sigma_u = 1.0 / np.sqrt(2.0 * np.log(1.0 / edge_value))
+    values[inside] = np.exp(-0.5 * (u[inside] / sigma_u) ** 2)
+    return values
+
+
+def window_function(
+    points: np.ndarray,
+    box_center: Sequence[float] | None = None,
+    box_size: float | Sequence[float] | None = None,
+    window_type: str | None = None,
+    taper_fraction: float | None = None,
+) -> np.ndarray:
+    """Evaluate the smooth observation window at point coordinates."""
+
+    points = np.asarray(points, dtype=float)
+    if points.ndim == 1:
+        points = points[None, :]
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3).")
+    window_type = scattering_window_type(window_type)
+    if taper_fraction is None:
+        taper_fraction = SCATTERING_WINDOW_TAPER
+    if box_size is None:
+        box_size = active_box_size_l()
+    box_size = np.asarray(box_size, dtype=float)
+    if box_size.ndim == 0:
+        box_size = np.full(3, float(box_size))
+    if box_center is None:
+        box_center = 0.5 * box_size
+    box_center = np.asarray(box_center, dtype=float)
+
+    if window_type == "none":
+        return np.ones(len(points), dtype=float)
+
+    half_size = 0.5 * box_size
+    u = np.abs(points - box_center[None, :]) / half_size[None, :]
+    one_d = _window_1d_from_u(u, window_type, float(taper_fraction))
+    return np.prod(one_d, axis=1)
+
+
+@lru_cache(maxsize=64)
+def window_volume_1d(
+    box_size: float,
+    window_type: str,
+    taper_fraction: float,
+    samples: int = 4096,
+) -> float:
+    """Numerically integrate the 1D window over one box side."""
+
+    window_type = scattering_window_type(window_type)
+    if window_type == "none":
+        return float(box_size)
+    x = np.linspace(0.0, float(box_size), int(samples))
+    center = 0.5 * float(box_size)
+    u = np.abs(x - center) / center
+    w = _window_1d_from_u(u, window_type, float(taper_fraction))
+    return float(np.trapz(w, x))
+
+
+def window_volume(
+    box_size: float | None = None,
+    window_type: str | None = None,
+    taper_fraction: float | None = None,
+) -> float:
+    """Return integral W(r) dr over the active observation box."""
+
+    if box_size is None:
+        box_size = active_box_size_l()
+    if taper_fraction is None:
+        taper_fraction = SCATTERING_WINDOW_TAPER
+    window_type = scattering_window_type(window_type)
+    v1 = window_volume_1d(float(box_size), window_type, float(taper_fraction))
+    return v1**3
+
+
+@lru_cache(maxsize=200000)
+def window_hat_1d_numeric(
+    q_value_rounded: float,
+    box_size: float,
+    window_type: str,
+    taper_fraction: float,
+    samples: int = 4096,
+) -> complex:
+    """Numerically compute int w(x) exp(i q x) dx for one coordinate."""
+
+    q_value = float(q_value_rounded)
+    window_type = scattering_window_type(window_type)
+    if window_type == "none":
+        center = 0.5 * float(box_size)
+        return complex(float(box_size) * np.exp(1j * q_value * center) * np.sinc(q_value * float(box_size) / (2.0 * np.pi)))
+    x = np.linspace(0.0, float(box_size), int(samples))
+    center = 0.5 * float(box_size)
+    u = np.abs(x - center) / center
+    w = _window_1d_from_u(u, window_type, float(taper_fraction))
+    return complex(np.trapz(w * np.exp(1j * q_value * x), x))
+
+
+def window_hat(
+    q_vectors: np.ndarray,
+    *,
+    box_size: float | None = None,
+    window_type: str | None = None,
+    taper_fraction: float | None = None,
+    method: str | None = None,
+) -> np.ndarray:
+    """Return W_hat(q)=int W(r) exp(i q.r) dr using separable 1D quadrature."""
+
+    if method is None:
+        method = WINDOW_MEAN_METHOD
+    method = str(method).lower()
+    if method != "numeric_1d":
+        raise NotImplementedError("Only WINDOW_MEAN_METHOD='numeric_1d' is currently implemented.")
+    if box_size is None:
+        box_size = active_box_size_l()
+    if taper_fraction is None:
+        taper_fraction = SCATTERING_WINDOW_TAPER
+    window_type = scattering_window_type(window_type)
+    q_vectors = np.asarray(q_vectors, dtype=float)
+    if q_vectors.ndim != 2 or q_vectors.shape[1] != 3:
+        raise ValueError("q_vectors must have shape (N, 3).")
+
+    result = np.ones(len(q_vectors), dtype=complex)
+    for axis in range(3):
+        components = q_vectors[:, axis]
+        values = np.empty(len(components), dtype=complex)
+        for idx, q_component in enumerate(components):
+            values[idx] = window_hat_1d_numeric(
+                round(float(q_component), 12),
+                float(box_size),
+                window_type,
+                float(taper_fraction),
+            )
+        result *= values
+    return result
+
+
 def normalization_mode(normalize_i0: bool | None = None, normalization: str | None = None) -> str:
     """Resolve the requested intensity normalization mode."""
 
@@ -185,7 +370,12 @@ def normalization_mode(normalize_i0: bool | None = None, normalization: str | No
     return normalization
 
 
-def intensity_normalization_factor(total_measure: float, mode: str) -> float:
+def intensity_normalization_factor(
+    total_measure: float,
+    mode: str,
+    *,
+    effective_volume: float | None = None,
+) -> float:
     """
     Return the divisor for I(Q).
 
@@ -200,7 +390,7 @@ def intensity_normalization_factor(total_measure: float, mode: str) -> float:
         return 1.0
     if mode == "i0":
         return total_measure * total_measure
-    box_volume = active_box_size_l() ** 3
+    box_volume = active_box_size_l() ** 3 if effective_volume is None else float(effective_volume)
     if box_volume <= 0.0:
         return total_measure * total_measure
     return total_measure * (total_measure / box_volume)
@@ -358,6 +548,68 @@ def analytic_mean_background_mode() -> str:
     if SUBTRACT_EXPLICIT_BOX_MEAN:
         return "coherent"
     return "none"
+
+
+def use_scattering_window() -> bool:
+    """Return whether a nontrivial smooth scattering window is active."""
+
+    return scattering_window_type() != "none"
+
+
+def windowed_mean_enabled() -> bool:
+    """Return whether the windowed mean amplitude should be subtracted."""
+
+    return bool(SUBTRACT_WINDOWED_MEAN)
+
+
+def scattering_effective_volume() -> float:
+    """Return the volume used for density normalization."""
+
+    if use_scattering_window() or WINDOW_NORMALIZATION == "windowed_measure":
+        return window_volume()
+    return active_box_size_l() ** 3
+
+
+def normalization_volume(buffer_mode: str = "none") -> float:
+    """Return the volume paired with the current normalization measure."""
+
+    volume = scattering_effective_volume()
+    if buffer_mode != "none" and ANALYTIC_MEAN_BUFFER_NORMALIZE_TOTAL:
+        volume *= float((2 * int(ANALYTIC_MEAN_BUFFER_BLOCKS) + 1) ** 3)
+    return volume
+
+
+def maybe_print_window_diagnostics(total_measure: float, *, prefix: str = "scattering") -> None:
+    """Print compact diagnostics for the active scattering window."""
+
+    v_window = scattering_effective_volume()
+    rho = float(total_measure) / v_window if v_window > 0.0 else 0.0
+    print(
+        f"{prefix}: scattering_window={SCATTERING_WINDOW}; "
+        f"scattering_window_taper={SCATTERING_WINDOW_TAPER}; "
+        f"M_windowed={float(total_measure):.6g}; "
+        f"V_windowed={v_window:.6g}; "
+        f"rho_windowed={rho:.6g}; "
+        f"subtract_windowed_mean={bool(SUBTRACT_WINDOWED_MEAN)}"
+    )
+
+
+def current_window_diagnostics(structure: LineStructure | None = None) -> dict[str, float | str | bool]:
+    """Return current window diagnostics, optionally for a built structure."""
+
+    m_windowed = scattering_measure_for_structure(structure) if structure is not None else float("nan")
+    v_windowed = scattering_effective_volume()
+    rho_windowed = m_windowed / v_windowed if v_windowed > 0.0 and np.isfinite(m_windowed) else float("nan")
+    return {
+        "scattering_window": SCATTERING_WINDOW,
+        "scattering_window_taper": float(SCATTERING_WINDOW_TAPER),
+        "M_windowed": float(m_windowed),
+        "V_windowed": float(v_windowed),
+        "rho_windowed": float(rho_windowed),
+        "subtract_windowed_mean": bool(SUBTRACT_WINDOWED_MEAN),
+        "window_mean_method": WINDOW_MEAN_METHOD,
+        "window_normalization": WINDOW_NORMALIZATION,
+    }
 
 
 def box_scattering_intensity_1d(
@@ -555,6 +807,36 @@ def total_line_length(structure: LineStructure, *, weighted: bool = True) -> flo
     if weighted:
         return float(np.sum(lengths * structure.segment_weights))
     return float(np.sum(lengths))
+
+
+def scattering_measure_for_structure(
+    structure: LineStructure,
+    *,
+    amplitude_method: str | None = None,
+) -> float:
+    """Return the current windowed scattering measure for diagnostics."""
+
+    if amplitude_method is None:
+        amplitude_method = SCATTERING_AMPLITUDE_METHOD
+    if amplitude_method == "points":
+        if len(structure.points) == 0:
+            return 0.0
+        return float(np.sum(structure.weights * window_function(structure.points)))
+    if amplitude_method == "line_segments":
+        if len(structure.segment_starts) == 0:
+            return 0.0
+        lengths = np.linalg.norm(structure.segment_ends - structure.segment_starts, axis=1)
+        midpoints = 0.5 * (structure.segment_starts + structure.segment_ends)
+        measure = float(np.sum(lengths * structure.segment_weights * window_function(midpoints)))
+        if len(structure.crosslink_points):
+            measure += float(
+                np.sum(
+                    np.full(len(structure.crosslink_points), float(CROSSLINK_SCATTERING_WEIGHT))
+                    * window_function(structure.crosslink_points)
+                )
+            )
+        return measure
+    raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points' or 'line_segments'.")
 
 
 def _build_fields() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -764,7 +1046,11 @@ def scattering_intensity_1d(
 
     rng = np.random.default_rng(seed)
     directions = isotropic_directions(num_directions, rng)
-    weighted_norm = float(np.sum(weights))
+    window_values = window_function(points)
+    windowed_weights = weights * window_values
+    weighted_norm = float(np.sum(windowed_weights))
+    v_window = scattering_effective_volume()
+    rho_windowed = weighted_norm / v_window if v_window > 0.0 else 0.0
     buffer_mode = analytic_mean_background_mode()
     norm_measure = (
         analytic_buffer_total_measure(weighted_norm)
@@ -772,7 +1058,11 @@ def scattering_intensity_1d(
         else weighted_norm
     )
     mode = normalization_mode(normalize_i0, normalization)
-    norm = intensity_normalization_factor(norm_measure, mode)
+    norm = intensity_normalization_factor(
+        norm_measure,
+        mode,
+        effective_volume=normalization_volume(buffer_mode),
+    )
     intensities = np.empty(len(q), dtype=float)
 
     if flatten_q_directions:
@@ -785,7 +1075,9 @@ def scattering_intensity_1d(
             q_batch = q_vectors[start:stop]
             shell_batch = q_shells[start:stop]
             phase = points @ q_batch.T
-            amplitudes = np.exp(1j * phase).T @ weights
+            amplitudes = np.exp(1j * phase).T @ windowed_weights
+            if windowed_mean_enabled():
+                amplitudes = amplitudes - rho_windowed * window_hat(q_batch)
             if buffer_mode != "none":
                 buffer_amplitudes = analytic_mean_background_amplitude(q_batch, weighted_norm)
                 if buffer_mode == "coherent":
@@ -808,7 +1100,9 @@ def scattering_intensity_1d(
         for start in range(0, len(q_vectors), int(batch_size)):
             q_batch = q_vectors[start : start + int(batch_size)]
             phase = points @ q_batch.T
-            amplitudes = np.exp(1j * phase).T @ weights
+            amplitudes = np.exp(1j * phase).T @ windowed_weights
+            if windowed_mean_enabled():
+                amplitudes = amplitudes - rho_windowed * window_hat(q_batch)
             if buffer_mode != "none":
                 buffer_amplitudes = analytic_mean_background_amplitude(q_batch, weighted_norm)
                 if buffer_mode == "coherent":
@@ -1005,6 +1299,9 @@ def segment_integral_scattering_intensity_1d(
 
     The small-denominator limit is handled as L * exp(i qr1). Optional point
     scatterers, such as crosslink nodes, can be added to the same amplitude.
+    With a nontrivial scattering window, the window is evaluated at the segment
+    midpoint. Very long segments crossing the taper may need subdivision in a
+    later refinement.
     """
 
     starts = np.asarray(segment_starts, dtype=float)
@@ -1046,8 +1343,14 @@ def segment_integral_scattering_intensity_1d(
     rng = np.random.default_rng(seed)
     directions = isotropic_directions(num_directions, rng)
     lengths = np.linalg.norm(ends - starts, axis=1)
-    weighted_lengths = lengths * segment_weights
-    weighted_norm = float(np.sum(weighted_lengths) + np.sum(point_weights))
+    midpoints = 0.5 * (starts + ends)
+    window_mid = window_function(midpoints)
+    weighted_lengths = lengths * segment_weights * window_mid
+    point_windows = window_function(point_positions) if len(point_positions) else np.empty(0, dtype=float)
+    windowed_point_weights = point_weights * point_windows
+    weighted_norm = float(np.sum(weighted_lengths) + np.sum(windowed_point_weights))
+    v_window = scattering_effective_volume()
+    rho_windowed = weighted_norm / v_window if v_window > 0.0 else 0.0
     buffer_mode = analytic_mean_background_mode()
     norm_measure = (
         analytic_buffer_total_measure(weighted_norm)
@@ -1055,7 +1358,11 @@ def segment_integral_scattering_intensity_1d(
         else weighted_norm
     )
     mode = normalization_mode(normalize_i0, normalization)
-    norm = intensity_normalization_factor(norm_measure, mode)
+    norm = intensity_normalization_factor(
+        norm_measure,
+        mode,
+        effective_volume=normalization_volume(buffer_mode),
+    )
     intensities = np.empty(len(q), dtype=float)
     batch_size = max(1, int(batch_size))
 
@@ -1072,7 +1379,9 @@ def segment_integral_scattering_intensity_1d(
             segment_amplitudes = (weighted_lengths[:, None] * midpoint_phase * sinc_factor).sum(axis=0)
             if len(point_positions):
                 point_phase = point_positions @ q_batch.T
-                segment_amplitudes += np.exp(1j * point_phase).T @ point_weights
+                segment_amplitudes += np.exp(1j * point_phase).T @ windowed_point_weights
+            if windowed_mean_enabled():
+                segment_amplitudes = segment_amplitudes - rho_windowed * window_hat(q_batch)
             if buffer_mode != "none":
                 buffer_amplitudes = analytic_mean_background_amplitude(q_batch, weighted_norm)
                 if buffer_mode == "coherent":
@@ -1178,6 +1487,11 @@ def compute_seed_averaged_scattering(
             )
             t_structure = time.perf_counter()
             point_counts.append(len(structure.points))
+            if print_timing:
+                maybe_print_window_diagnostics(
+                    scattering_measure_for_structure(structure),
+                    prefix=f"seed {seed_index}/{len(seeds)} ({seed})",
+                )
             curves.append(structure_scattering_intensity_1d(structure, q))
             t_scatter = time.perf_counter()
             if print_timing:
