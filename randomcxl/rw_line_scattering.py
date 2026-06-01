@@ -269,6 +269,25 @@ def window_volume_1d(
     return float(np.trapz(w, x))
 
 
+@lru_cache(maxsize=64)
+def window_squared_volume_1d(
+    box_size: float,
+    window_type: str,
+    taper_fraction: float,
+    samples: int = 4096,
+) -> float:
+    """Numerically integrate the squared 1D window over one box side."""
+
+    window_type = scattering_window_type(window_type)
+    if window_type == "none":
+        return float(box_size)
+    x = np.linspace(0.0, float(box_size), int(samples))
+    center = 0.5 * float(box_size)
+    u = np.abs(x - center) / center
+    w = _window_1d_from_u(u, window_type, float(taper_fraction))
+    return float(np.trapz(w * w, x))
+
+
 def window_volume(
     box_size: float | None = None,
     window_type: str | None = None,
@@ -282,6 +301,22 @@ def window_volume(
         taper_fraction = SCATTERING_WINDOW_TAPER
     window_type = scattering_window_type(window_type)
     v1 = window_volume_1d(float(box_size), window_type, float(taper_fraction))
+    return v1**3
+
+
+def window_squared_volume(
+    box_size: float | None = None,
+    window_type: str | None = None,
+    taper_fraction: float | None = None,
+) -> float:
+    """Return integral W(r)^2 dr over the active observation box."""
+
+    if box_size is None:
+        box_size = active_box_size_l()
+    if taper_fraction is None:
+        taper_fraction = SCATTERING_WINDOW_TAPER
+    window_type = scattering_window_type(window_type)
+    v1 = window_squared_volume_1d(float(box_size), window_type, float(taper_fraction))
     return v1**3
 
 
@@ -542,6 +577,8 @@ def analytic_mean_buffer_mode(mode: str | None = None) -> str:
 def analytic_mean_background_mode() -> str:
     """Return how analytic mean-background amplitude should be combined."""
 
+    if use_scattering_window() and bool(SUBTRACT_WINDOWED_MEAN):
+        return "none"
     buffer_mode = analytic_mean_buffer_mode()
     if buffer_mode != "none":
         return buffer_mode
@@ -570,6 +607,38 @@ def scattering_effective_volume() -> float:
     return active_box_size_l() ** 3
 
 
+def use_windowed_measure_normalization() -> bool:
+    """Return whether to use finite-sample window-consistent normalization."""
+
+    return WINDOW_NORMALIZATION == "windowed_measure" and use_scattering_window()
+
+
+def windowed_measure_normalization_factor(
+    linear_measure: float,
+    squared_measure: float,
+    mode: str,
+) -> float:
+    """
+    Normalize windowed scattering using finite-sample window-consistent weights.
+
+    For ``i0`` and ``length_density`` this uses
+    rho_b2 * int W^2 dr with rho_b2 estimated as
+    sum b_j^2 W_j^2 / int W^2 dr. The divisor is therefore the finite-sample
+    sum b_j^2 W_j^2. ``linear_measure`` is retained for non-windowed fallback
+    semantics.
+    """
+
+    if mode == "none":
+        return 1.0
+    if mode in {"i0", "length_density"}:
+        return float(squared_measure) if float(squared_measure) > 0.0 else 1.0
+    return intensity_normalization_factor(
+        linear_measure,
+        mode,
+        effective_volume=scattering_effective_volume(),
+    )
+
+
 def normalization_volume(buffer_mode: str = "none") -> float:
     """Return the volume paired with the current normalization measure."""
 
@@ -589,6 +658,7 @@ def maybe_print_window_diagnostics(total_measure: float, *, prefix: str = "scatt
         f"scattering_window_taper={SCATTERING_WINDOW_TAPER}; "
         f"M_windowed={float(total_measure):.6g}; "
         f"V_windowed={v_window:.6g}; "
+        f"V2_windowed={window_squared_volume():.6g}; "
         f"rho_windowed={rho:.6g}; "
         f"subtract_windowed_mean={bool(SUBTRACT_WINDOWED_MEAN)}"
     )
@@ -605,6 +675,7 @@ def current_window_diagnostics(structure: LineStructure | None = None) -> dict[s
         "scattering_window_taper": float(SCATTERING_WINDOW_TAPER),
         "M_windowed": float(m_windowed),
         "V_windowed": float(v_windowed),
+        "V2_windowed": float(window_squared_volume()),
         "rho_windowed": float(rho_windowed),
         "subtract_windowed_mean": bool(SUBTRACT_WINDOWED_MEAN),
         "window_mean_method": WINDOW_MEAN_METHOD,
@@ -1049,6 +1120,7 @@ def scattering_intensity_1d(
     window_values = window_function(points)
     windowed_weights = weights * window_values
     weighted_norm = float(np.sum(windowed_weights))
+    weighted_square_norm = float(np.sum((weights * window_values) ** 2))
     v_window = scattering_effective_volume()
     rho_windowed = weighted_norm / v_window if v_window > 0.0 else 0.0
     buffer_mode = analytic_mean_background_mode()
@@ -1058,11 +1130,14 @@ def scattering_intensity_1d(
         else weighted_norm
     )
     mode = normalization_mode(normalize_i0, normalization)
-    norm = intensity_normalization_factor(
-        norm_measure,
-        mode,
-        effective_volume=normalization_volume(buffer_mode),
-    )
+    if use_windowed_measure_normalization():
+        norm = windowed_measure_normalization_factor(norm_measure, weighted_square_norm, mode)
+    else:
+        norm = intensity_normalization_factor(
+            norm_measure,
+            mode,
+            effective_volume=normalization_volume(buffer_mode),
+        )
     intensities = np.empty(len(q), dtype=float)
 
     if flatten_q_directions:
@@ -1349,6 +1424,10 @@ def segment_integral_scattering_intensity_1d(
     point_windows = window_function(point_positions) if len(point_positions) else np.empty(0, dtype=float)
     windowed_point_weights = point_weights * point_windows
     weighted_norm = float(np.sum(weighted_lengths) + np.sum(windowed_point_weights))
+    weighted_square_norm = float(
+        np.sum((lengths * segment_weights * window_mid) ** 2)
+        + np.sum(windowed_point_weights * windowed_point_weights)
+    )
     v_window = scattering_effective_volume()
     rho_windowed = weighted_norm / v_window if v_window > 0.0 else 0.0
     buffer_mode = analytic_mean_background_mode()
@@ -1358,11 +1437,14 @@ def segment_integral_scattering_intensity_1d(
         else weighted_norm
     )
     mode = normalization_mode(normalize_i0, normalization)
-    norm = intensity_normalization_factor(
-        norm_measure,
-        mode,
-        effective_volume=normalization_volume(buffer_mode),
-    )
+    if use_windowed_measure_normalization():
+        norm = windowed_measure_normalization_factor(norm_measure, weighted_square_norm, mode)
+    else:
+        norm = intensity_normalization_factor(
+            norm_measure,
+            mode,
+            effective_volume=normalization_volume(buffer_mode),
+        )
     intensities = np.empty(len(q), dtype=float)
     batch_size = max(1, int(batch_size))
 
