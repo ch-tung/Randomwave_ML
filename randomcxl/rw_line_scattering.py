@@ -577,7 +577,7 @@ def analytic_mean_buffer_mode(mode: str | None = None) -> str:
 def analytic_mean_background_mode() -> str:
     """Return how analytic mean-background amplitude should be combined."""
 
-    if use_scattering_window() and bool(SUBTRACT_WINDOWED_MEAN):
+    if bool(SUBTRACT_WINDOWED_MEAN):
         return "none"
     buffer_mode = analytic_mean_buffer_mode()
     if buffer_mode != "none":
@@ -610,7 +610,7 @@ def scattering_effective_volume() -> float:
 def use_windowed_measure_normalization() -> bool:
     """Return whether to use finite-sample window-consistent normalization."""
 
-    return WINDOW_NORMALIZATION == "windowed_measure" and use_scattering_window()
+    return WINDOW_NORMALIZATION == "windowed_measure"
 
 
 def windowed_measure_normalization_factor(
