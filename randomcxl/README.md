@@ -35,6 +35,9 @@ rendered branch.
 - `interactive_rw_single_chain_scattering.ipynb`: one-field/single-chain
   scattering notebook for the `Gamma_12` family, with a Gaussian random-wave
   reference.
+- `interactive_rw_cxl_chain_scattering.ipynb`: two-family three-wave
+  crosslinked-chain scattering notebook for `Gamma_12 + Gamma_13`, with
+  tunable `phi_2`/`phi_3` correlation and a four-field Gaussian reference.
 - `smpl/`: compact line-scattering notebooks and Python helpers for analytic
   and conditional-sampling experiments, including monochromatic, general
   wave-number, and four-field line cases.
@@ -183,6 +186,20 @@ The x axis is labeled `Q/k`, where
 `k = 2*pi*<k_cycles>/GRID_SIZE` in grid-coordinate units. The theoretical
 monochromatic density `k^2/(3*pi)` is printed as a reference, while the reduced
 plot uses the window-squared density sampled by the traced line geometry.
+
+The CXL-chain notebook keeps both retained families, `Gamma_12` and
+`Gamma_13`, in a three-wave system. The default `PHI23_CORRELATION_RHO = 0`
+demonstrates independent `phi_1`, `phi_2`, and `phi_3`; changing that parameter
+tunes the correlation between `phi_2` and `phi_3`. In the four-field Gaussian
+comparison this maps to:
+
+```python
+rho13 = 1                       # shared phi_1 between Gamma_12 and Gamma_13
+rho24 = PHI23_CORRELATION_RHO   # tunable phi_2/phi_3 correlation
+```
+
+The total comparison follows the `smpl/rw_4field_line_demo.ipynb` convention:
+`I_total = I_AA + I_BB + 2*I_AB`.
 
 ## Running
 

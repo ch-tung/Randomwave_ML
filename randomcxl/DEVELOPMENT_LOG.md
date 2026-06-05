@@ -507,3 +507,87 @@ SCATTERING_Q_CHUNK_SIZE = 10
   `LINE_SAMPLE_SPACING * family_weight`, so point amplitudes approximate a
   continuous line integral. `SCATTERING_Q_CHUNK_SIZE` controls progress chunks
   for long notebook runs and does not change the scattering formula.
+
+## 2026-06-05 CXL-Chain Scattering Notebook
+
+Added `interactive_rw_cxl_chain_scattering.ipynb` as the three-wave extension of
+the single-chain scattering notebook.
+
+Purpose:
+
+- Keep both retained line families, `Gamma_12` and `Gamma_13`, as the simplest
+  crosslinked-chain scattering test.
+- Start from independent waves with `PHI23_CORRELATION_RHO = 0`.
+- Allow the `phi_2`/`phi_3` correlation to be tuned through the same coupling
+  construction used by `rw_line_network.py`.
+
+The notebook follows the same style as
+`interactive_rw_single_chain_scattering.ipynb`: matching parameter blocks,
+`hann_box` windowing, `line_segments` as the default continuous-line scattering
+method, `Q/k` on the x axis, and the two-panel reduced plot:
+
+```python
+left_y = I(Q)/d^2
+left_guide = pi/(Q*d)
+right_y = left_y / left_guide
+```
+
+For the CXL-chain case,
+
+```python
+d = d12 + d13
+d12 = sum_{Gamma_12}(ds * W^2) / int W^2 dV
+d13 = sum_{Gamma_13}(ds * W^2) / int W^2 dV
+```
+
+The Gaussian comparison follows the four-field setup from
+`smpl/rw_4field_line_demo.ipynb`. With
+`A = Gamma_12 = (phi_1, phi_2)` and
+`B = Gamma_13 = (phi_1, phi_3)`, the four-field correlation parameters are:
+
+```python
+rho13 = 1.0
+rho24 = PHI23_CORRELATION_RHO
+```
+
+Thus independent three-wave fields correspond to `(rho13, rho24) = (1, 0)`.
+The total model comparison is assembled as
+`I_total = I_AA + I_BB + 2*I_AB`. The self terms are scaled by the measured
+window-squared densities `d12` and `d13`, while the cross term is scaled by
+`sqrt(d12*d13)`, so the reduced total uses the same `d = d12 + d13` as the
+trajectory calculation.
+
+The notebook uses the same exposed Gaussian conditional-sampling parameter
+style as the single-chain notebook:
+
+```python
+MODEL_R_MIN = 1e-3
+MODEL_R_MAX = 5e2
+MODEL_NR = 5000
+MODEL_N_SAMP = 2**15
+MODEL_TAIL_START_FRACTION = 0.8
+```
+
+The four-field comparison now passes `MODEL_N_SAMP` directly to
+`make_qmc_normals(...)`, matching the two-wave conditional-sampling convention.
+The Sobol power-of-two check is handled inside the shared helper.
+Both `interactive_rw_single_chain_scattering.ipynb` and
+`interactive_rw_cxl_chain_scattering.ipynb` now expose the same Gaussian
+comparison parameter block:
+
+```python
+MODEL_R_MIN
+MODEL_R_MAX
+MODEL_NR
+MODEL_N_SAMP
+MODEL_TAIL_START_FRACTION
+```
+
+Neither notebook exposes a separate QMC-power variable.
+
+Added module helpers in `rw_line_scattering.py`:
+
+```python
+as_single_s13_structure(...)
+compute_seed_averaged_cxl_chain_scattering(...)
+```

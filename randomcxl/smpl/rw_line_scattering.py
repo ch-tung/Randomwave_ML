@@ -44,6 +44,18 @@ DEFAULT_RADIAL_CHUNK_SIZE = 256
 KDistribution = Literal["single_shell", "gaussian_radial", "uniform_band"]
 
 
+def qmc_power_from_n_samp(n_samp: int) -> int:
+    """Return Sobol ``random_base2`` power for a power-of-two sample count."""
+
+    n_samp = int(n_samp)
+    if n_samp <= 0:
+        raise ValueError("n_samp must be positive.")
+    qmc_power = int(np.log2(n_samp))
+    if 2**qmc_power != n_samp:
+        raise ValueError("Sobol QMC requires n_samp to be a power of two.")
+    return qmc_power
+
+
 @dataclass(frozen=True)
 class FieldKSets:
     """Container for independent sampled k-vector sets for psi_1 and psi_2."""
@@ -647,9 +659,7 @@ def standard_normal_samples(
     if n_samp <= 0:
         raise ValueError("n_samp must be positive.")
     if use_qmc:
-        m = int(np.log2(n_samp))
-        if 2**m != n_samp:
-            raise ValueError("Sobol QMC requires n_samp to be a power of two.")
+        m = qmc_power_from_n_samp(n_samp)
         sampler = qmc.Sobol(d=12, scramble=True, seed=random_seed)
         uniform = sampler.random_base2(m=m)
         uniform = np.clip(uniform, 1.0e-12, 1.0 - 1.0e-12)
@@ -1339,11 +1349,16 @@ class FourFieldScanResult:
     pzeros_cross: np.ndarray
 
 
-def make_qmc_normals(dim: int, qmc_power: int, seed: int = DEFAULT_RANDOM_SEED) -> np.ndarray:
-    """Sobol normal samples with shape (2**qmc_power, dim)."""
+def make_qmc_normals(dim: int, n_samp: int, seed: int = DEFAULT_RANDOM_SEED) -> np.ndarray:
+    """Sobol normal samples with shape ``(n_samp, dim)``.
+
+    ``n_samp`` must be a power of two because Sobol sampling uses
+    ``random_base2``. This matches the two-wave conditional-sampling API, where
+    users specify the actual sample count rather than the Sobol exponent.
+    """
 
     sampler = qmc.Sobol(d=int(dim), scramble=True, seed=seed)
-    u = sampler.random_base2(m=int(qmc_power))
+    u = sampler.random_base2(m=qmc_power_from_n_samp(n_samp))
     u = np.clip(u, 1.0e-12, 1.0 - 1.0e-12)
     return norm.ppf(u)
 
@@ -1727,12 +1742,17 @@ def run_four_field_scan(
     Q_min: float | None = None,
     Q_max: float | None = None,
     NQ: int = 300,
-    qmc_power: int = 14,
+    n_samp: int = DEFAULT_N_SAMP,
+    qmc_power: int | None = None,
     seed: int = DEFAULT_RANDOM_SEED,
     rho_pairs: Sequence[tuple[float, float]] | None = None,
     r_taper_start: float | None = None,
     progress: bool = True,
 ) -> FourFieldScanResult:
+    if qmc_power is not None:
+        # Backward-compatible alias for older callers. New notebooks and APIs
+        # should pass n_samp directly, matching the two-wave sampling helpers.
+        n_samp = 2 ** int(qmc_power)
     if r_min is None:
         r_min = 1.0e-3 / k0
     if r_max is None:
@@ -1745,7 +1765,7 @@ def run_four_field_scan(
     Q_grid = np.logspace(np.log10(Q_min), np.log10(Q_max), int(NQ))
     if r_taper_start is None:
         r_taper_start = 0.75 * r_max
-    xi12 = make_qmc_normals(12, qmc_power, seed)
+    xi12 = make_qmc_normals(12, n_samp, seed)
     rho0 = k0**2 / (3.0 * np.pi)
     w = tail_window(r_grid, r_taper_start, r_max)
 

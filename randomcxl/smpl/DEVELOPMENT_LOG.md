@@ -282,6 +282,12 @@ notebook values: `r in [1e-3/k_eff, 5e2/k_eff]`, `Nr=10000`,
 `Q/k_eff in [0.1, 20]`, `NQ=256`, `tail_start=0.8*r_max`, and
 `2**16` Sobol samples for the conditional Jacobian averages.
 
+QMC sample-count handling is now consistent between the two-wave and four-field
+methods. Public notebook/API settings use `N_samp` directly. Sobol-specific
+power-of-two conversion is handled internally by `make_qmc_normals(...)` and
+`standard_normal_samples(...)`; older `qmc_power` callers are retained only as a
+compatibility path in `run_four_field_scan(...)`.
+
 Both self and cross use the same 12D Sobol normal samples across all `r` values.
 The cross finite-Q transform subtracts the same large-distance baseline
 `rho0**2` before applying the tail window. Limiting checks:

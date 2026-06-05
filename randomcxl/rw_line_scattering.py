@@ -1150,6 +1150,35 @@ def as_single_s12_structure(
     )
 
 
+def as_single_s13_structure(
+    structure: LineStructure,
+    *,
+    line_sample_spacing: float | None = None,
+) -> LineStructure:
+    """
+    Return a copy of ``structure`` retaining only the S13 line family.
+
+    This mirrors ``as_single_s12_structure`` and is useful for comparing the
+    two retained families separately in crosslinked-chain scattering notebooks.
+    """
+
+    if line_sample_spacing is None:
+        line_sample_spacing = LINE_SAMPLE_SPACING
+    s13_points = sample_polyline_points(structure.s13_lines, line_sample_spacing)
+    s13_starts, s13_ends = polyline_segments(structure.s13_lines)
+    point_weight = point_weight_for_line_samples(S13_SCATTERING_WEIGHT, line_sample_spacing)
+    return LineStructure(
+        points=s13_points,
+        weights=np.full(len(s13_points), point_weight, dtype=float),
+        segment_starts=s13_starts,
+        segment_ends=s13_ends,
+        segment_weights=np.full(len(s13_starts), float(S13_SCATTERING_WEIGHT), dtype=float),
+        s12_lines=pv.PolyData(),
+        s13_lines=structure.s13_lines,
+        crosslink_points=np.empty((0, 3), dtype=float),
+    )
+
+
 def single_chain_window_diagnostics(structure: LineStructure) -> dict[str, float | str]:
     """
     Return window diagnostics for a single-chain or line-only structure.
@@ -1326,6 +1355,122 @@ def compute_seed_averaged_single_chain_scattering(
             flush=True,
         )
     return q, mean_intensity, std_intensity, box_intensity, point_counts, window_diagnostics
+
+
+def compute_seed_averaged_cxl_chain_scattering(
+    seeds: Sequence[int] | None = None,
+    *,
+    q: Sequence[float] | None = None,
+    print_timing: bool | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[int],
+    list[dict[str, float | str]],
+    list[dict[str, float | str]],
+    list[dict[str, float | str]],
+]:
+    """
+    Average scattering over seeds for the retained two-family CXL chain.
+
+    The returned curve uses both retained line families, S12 and S13, with no
+    crosslink point scatterers unless the caller explicitly enables them. The
+    diagnostic lists report window measures for the full retained structure and
+    each single-family component.
+    """
+
+    if seeds is None:
+        seeds = structure_seed_values()
+    seeds = [int(seed) for seed in seeds]
+    if not seeds:
+        raise ValueError("at least one seed is required.")
+    if q is None:
+        q = q_values()
+    q = np.asarray(q, dtype=float)
+    if print_timing is None:
+        print_timing = PRINT_TIMING
+
+    curves = []
+    point_counts: list[int] = []
+    full_diagnostics: list[dict[str, float | str]] = []
+    s12_diagnostics: list[dict[str, float | str]] = []
+    s13_diagnostics: list[dict[str, float | str]] = []
+    original_seed = r.RANDOM_SEED
+    t_all = time.perf_counter()
+    if print_timing:
+        print(
+            f"[scatter] starting CXL-chain seed average: {len(seeds)} seeds, {len(q)} Q values, "
+            f"{NUM_Q_DIRECTIONS} directions, Q chunk size {SCATTERING_Q_CHUNK_SIZE}",
+            flush=True,
+        )
+    try:
+        for seed_index, seed in enumerate(seeds, start=1):
+            seed_label = f"seed {seed_index}/{len(seeds)} ({seed})"
+            t_seed = time.perf_counter()
+            r.RANDOM_SEED = seed
+            if print_timing:
+                print(f"[scatter] {seed_label}: building structure...", flush=True)
+            full = build_line_structure(
+                line_sample_spacing=LINE_SAMPLE_SPACING,
+                include_crosslinks=INCLUDE_CROSSLINK_POINTS,
+                print_timing=print_timing,
+                timing_label=seed_label,
+            )
+            t_structure = time.perf_counter()
+            s12 = as_single_s12_structure(full, line_sample_spacing=LINE_SAMPLE_SPACING)
+            s13 = as_single_s13_structure(full, line_sample_spacing=LINE_SAMPLE_SPACING)
+            diag_full = single_chain_window_diagnostics(full)
+            diag_s12 = single_chain_window_diagnostics(s12)
+            diag_s13 = single_chain_window_diagnostics(s13)
+            full_diagnostics.append(diag_full)
+            s12_diagnostics.append(diag_s12)
+            s13_diagnostics.append(diag_s13)
+            point_counts.append(len(full.points))
+            if print_timing:
+                print(
+                    f"[scatter] {seed_label}: full points={len(full.points)}, "
+                    f"segments={len(full.segment_starts)}, "
+                    f"dW2(full,S12,S13)=({diag_full['density_from_w2']:.6g}, "
+                    f"{diag_s12['density_from_w2']:.6g}, {diag_s13['density_from_w2']:.6g})",
+                    flush=True,
+                )
+            curves.append(compute_structure_scattering_chunked(full, q, seed_label=seed_label, print_timing=print_timing))
+            t_scatter = time.perf_counter()
+            if print_timing:
+                print(
+                    f"[scatter] {seed_label} done: structure {t_structure - t_seed:.2f}s, "
+                    f"scatter {t_scatter - t_structure:.2f}s, seed total {t_scatter - t_seed:.2f}s",
+                    flush=True,
+                )
+    finally:
+        r.RANDOM_SEED = original_seed
+
+    t_reduce0 = time.perf_counter()
+    if print_timing:
+        print("[scatter] reducing seed curves and computing box reference...", flush=True)
+    curve_array = np.asarray(curves, dtype=float)
+    mean_intensity = np.mean(curve_array, axis=0)
+    std_intensity = np.std(curve_array, axis=0, ddof=1) if len(curve_array) > 1 else np.zeros_like(mean_intensity)
+    box_intensity = box_scattering_intensity_1d(q)
+    t_done = time.perf_counter()
+    if print_timing:
+        print(
+            f"[scatter] CXL-chain seed average complete: total {t_done - t_all:.2f}s; "
+            f"reduction/reference {t_done - t_reduce0:.2f}s",
+            flush=True,
+        )
+    return (
+        q,
+        mean_intensity,
+        std_intensity,
+        box_intensity,
+        point_counts,
+        full_diagnostics,
+        s12_diagnostics,
+        s13_diagnostics,
+    )
 
 
 def scattering_intensity_1d(
