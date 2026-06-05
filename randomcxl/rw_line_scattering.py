@@ -39,6 +39,10 @@ SCATTERING_SEED = 20260529
 # Number of q-vectors handled per matrix multiply. The full set has
 # NUM_Q * NUM_Q_DIRECTIONS vectors; batching keeps memory bounded.
 SCATTERING_BATCH_SIZE = 32768
+# Number of scalar Q values evaluated per progress chunk in notebook-style
+# drivers. This does not change the scattering formula; it only controls how
+# often long calculations report progress.
+SCATTERING_Q_CHUNK_SIZE = 10
 SCATTERING_FLATTEN_Q_DIRECTIONS = False
 SCATTERING_AMPLITUDE_METHOD = "points"  # "points" or "line_segments"
 SCATTERING_WINDOW = "none"  # "none", "tukey_box", "hann_box", or "gaussian"
@@ -61,6 +65,10 @@ PRINT_TIMING = True
 # PyVista geometry. A smaller spacing gives a better curve integral but costs
 # more in the q-sum.
 LINE_SAMPLE_SPACING = 0.75
+# For point-amplitude line scattering, "unit" treats sampled points as equal
+# bead scatterers, while "arclength" assigns each point weight
+# LINE_SAMPLE_SPACING so the point sum approximates a continuous line integral.
+POINT_WEIGHT_MODE = "unit"  # "unit" or "arclength"
 DYNAMIC_LINE_SAMPLE_SPACING = False
 DYNAMIC_LINE_SAMPLE_EXPONENT = 1.0
 DYNAMIC_LINE_SAMPLE_POWER2_SUBSETS = True
@@ -880,6 +888,33 @@ def total_line_length(structure: LineStructure, *, weighted: bool = True) -> flo
     return float(np.sum(lengths))
 
 
+def point_weight_for_line_samples(
+    family_weight: float,
+    spacing: float | None = None,
+    *,
+    point_weight_mode: str | None = None,
+) -> float:
+    """
+    Return the per-sample weight for point-amplitude line scattering.
+
+    ``POINT_WEIGHT_MODE="unit"`` keeps the historical bead-count model. With
+    ``"arclength"``, each sampled line point carries approximately one sample
+    spacing of line, so the point-amplitude sum approximates a continuous line
+    integral. Crosslink point weights are not affected by this helper.
+    """
+
+    if spacing is None:
+        spacing = LINE_SAMPLE_SPACING
+    if point_weight_mode is None:
+        point_weight_mode = POINT_WEIGHT_MODE
+    mode = str(point_weight_mode).lower()
+    if mode == "unit":
+        return float(family_weight)
+    if mode == "arclength":
+        return float(family_weight) * float(spacing)
+    raise ValueError("POINT_WEIGHT_MODE must be 'unit' or 'arclength'.")
+
+
 def scattering_measure_for_structure(
     structure: LineStructure,
     *,
@@ -1002,10 +1037,20 @@ def build_line_structure(
 
     if len(s12_points):
         point_blocks.append(s12_points)
-        weight_blocks.append(np.full(len(s12_points), float(S12_SCATTERING_WEIGHT)))
+        weight_blocks.append(
+            np.full(
+                len(s12_points),
+                point_weight_for_line_samples(S12_SCATTERING_WEIGHT, line_sample_spacing),
+            )
+        )
     if len(s13_points):
         point_blocks.append(s13_points)
-        weight_blocks.append(np.full(len(s13_points), float(S13_SCATTERING_WEIGHT)))
+        weight_blocks.append(
+            np.full(
+                len(s13_points),
+                point_weight_for_line_samples(S13_SCATTERING_WEIGHT, line_sample_spacing),
+            )
+        )
 
     if include_crosslinks:
         candidates = r.find_crosslink_candidate_midpoints(
@@ -1072,6 +1117,215 @@ def build_line_structure(
         s13_lines,
         crosslink_points,
     )
+
+
+def as_single_s12_structure(
+    structure: LineStructure,
+    *,
+    line_sample_spacing: float | None = None,
+) -> LineStructure:
+    """
+    Return a copy of ``structure`` retaining only the S12 line family.
+
+    This is the one-complex-field / single-chain test case used by the
+    interactive single-chain notebook. Point weights obey ``POINT_WEIGHT_MODE``:
+    ``"unit"`` keeps equal bead weights, while ``"arclength"`` makes the point
+    representation approximate a continuous line integral.
+    """
+
+    if line_sample_spacing is None:
+        line_sample_spacing = LINE_SAMPLE_SPACING
+    s12_points = sample_polyline_points(structure.s12_lines, line_sample_spacing)
+    s12_starts, s12_ends = polyline_segments(structure.s12_lines)
+    point_weight = point_weight_for_line_samples(S12_SCATTERING_WEIGHT, line_sample_spacing)
+    return LineStructure(
+        points=s12_points,
+        weights=np.full(len(s12_points), point_weight, dtype=float),
+        segment_starts=s12_starts,
+        segment_ends=s12_ends,
+        segment_weights=np.full(len(s12_starts), float(S12_SCATTERING_WEIGHT), dtype=float),
+        s12_lines=structure.s12_lines,
+        s13_lines=pv.PolyData(),
+        crosslink_points=np.empty((0, 3), dtype=float),
+    )
+
+
+def single_chain_window_diagnostics(structure: LineStructure) -> dict[str, float | str]:
+    """
+    Return window diagnostics for a single-chain or line-only structure.
+
+    ``linear_measure_w`` and ``linear_measure_w2`` are reported to diagnose how
+    strongly the finite line realization samples the chosen window. They are
+    intentionally separate from the reduced intensity scale when the notebook
+    uses ``I_raw / int(W^2 dV)``.
+    """
+
+    amplitude_method = SCATTERING_AMPLITUDE_METHOD
+    if amplitude_method == "points":
+        window_values = window_function(structure.points) if len(structure.points) else np.empty(0, dtype=float)
+        linear_measure_w = float(np.sum(structure.weights * window_values)) if len(structure.points) else 0.0
+        linear_measure_w2 = float(np.sum(structure.weights * window_values**2)) if len(structure.points) else 0.0
+    elif amplitude_method == "line_segments":
+        lengths = np.linalg.norm(structure.segment_ends - structure.segment_starts, axis=1)
+        midpoints = 0.5 * (structure.segment_starts + structure.segment_ends)
+        window_values = window_function(midpoints) if len(lengths) else np.empty(0, dtype=float)
+        segment_measure = lengths * structure.segment_weights
+        linear_measure_w = float(np.sum(segment_measure * window_values))
+        linear_measure_w2 = float(np.sum(segment_measure * window_values**2))
+    else:
+        raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points' or 'line_segments'.")
+
+    v1 = window_volume()
+    v2 = window_squared_volume()
+    return {
+        "amplitude_method": amplitude_method,
+        "intensity_normalization": normalization_mode(None, INTENSITY_NORMALIZATION),
+        "window_normalization": WINDOW_NORMALIZATION,
+        "point_weight_mode": POINT_WEIGHT_MODE,
+        "window_volume": float(v1),
+        "window_squared_volume": float(v2),
+        "linear_measure_w": linear_measure_w,
+        "linear_measure_w2": linear_measure_w2,
+        "density_from_w": linear_measure_w / v1 if v1 > 0 else float("nan"),
+        "density_from_w2": linear_measure_w2 / v2 if v2 > 0 else float("nan"),
+        "geometric_length": total_line_length(structure, weighted=False),
+        "weighted_segment_length": total_line_length(structure, weighted=True),
+    }
+
+
+def compute_structure_scattering_chunked(
+    structure: LineStructure,
+    q: Sequence[float],
+    *,
+    q_chunk_size: int | None = None,
+    seed_label: str = "seed",
+    print_timing: bool | None = None,
+) -> np.ndarray:
+    """
+    Compute ``structure_scattering_intensity_1d`` in scalar-Q chunks.
+
+    Chunking is useful in notebooks because each chunk can print elapsed time
+    and ETA. It does not change the scattering normalization or direction
+    sampling.
+    """
+
+    if q_chunk_size is None:
+        q_chunk_size = SCATTERING_Q_CHUNK_SIZE
+    if print_timing is None:
+        print_timing = PRINT_TIMING
+    q = np.asarray(q, dtype=float)
+    chunk_size = max(1, int(q_chunk_size))
+    chunks = [(start, min(start + chunk_size, len(q))) for start in range(0, len(q), chunk_size)]
+    out = np.empty(len(q), dtype=float)
+    t0 = time.perf_counter()
+    if print_timing:
+        print(f"[scatter] {seed_label}: scattering {len(q)} Q values in {len(chunks)} chunks of <= {chunk_size}", flush=True)
+    for chunk_index, (start, stop) in enumerate(chunks, start=1):
+        t_chunk = time.perf_counter()
+        out[start:stop] = structure_scattering_intensity_1d(structure, q[start:stop])
+        if print_timing:
+            elapsed = time.perf_counter() - t0
+            chunk_elapsed = time.perf_counter() - t_chunk
+            per_chunk = elapsed / chunk_index
+            remaining = per_chunk * (len(chunks) - chunk_index)
+            print(
+                f"[scatter] {seed_label}: chunk {chunk_index}/{len(chunks)} "
+                f"Q[{start}:{stop}] done in {chunk_elapsed:.2f}s; "
+                f"elapsed {elapsed:.2f}s, eta {remaining:.2f}s",
+                flush=True,
+            )
+    if print_timing:
+        print(f"[scatter] {seed_label}: scattering chunks complete in {time.perf_counter() - t0:.2f}s", flush=True)
+    return out
+
+
+def compute_seed_averaged_single_chain_scattering(
+    seeds: Sequence[int] | None = None,
+    *,
+    q: Sequence[float] | None = None,
+    print_timing: bool | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int], list[dict[str, float | str]]]:
+    """
+    Average scattering over seeds while retaining only the S12 line family.
+
+    Returns ``q, mean_intensity, std_intensity, box_intensity, point_counts,
+    window_diagnostics``. The returned intensities use the current global
+    scattering settings, including ``INTENSITY_NORMALIZATION``.
+    """
+
+    if seeds is None:
+        seeds = structure_seed_values()
+    seeds = [int(seed) for seed in seeds]
+    if not seeds:
+        raise ValueError("at least one seed is required.")
+    if q is None:
+        q = q_values()
+    q = np.asarray(q, dtype=float)
+    if print_timing is None:
+        print_timing = PRINT_TIMING
+
+    curves = []
+    point_counts: list[int] = []
+    window_diagnostics: list[dict[str, float | str]] = []
+    original_seed = r.RANDOM_SEED
+    t_all = time.perf_counter()
+    if print_timing:
+        print(
+            f"[scatter] starting single-chain seed average: {len(seeds)} seeds, {len(q)} Q values, "
+            f"{NUM_Q_DIRECTIONS} directions, Q chunk size {SCATTERING_Q_CHUNK_SIZE}",
+            flush=True,
+        )
+    try:
+        for seed_index, seed in enumerate(seeds, start=1):
+            seed_label = f"seed {seed_index}/{len(seeds)} ({seed})"
+            t_seed = time.perf_counter()
+            r.RANDOM_SEED = seed
+            if print_timing:
+                print(f"[scatter] {seed_label}: building structure...", flush=True)
+            full = build_line_structure(
+                line_sample_spacing=LINE_SAMPLE_SPACING,
+                include_crosslinks=False,
+                print_timing=print_timing,
+                timing_label=seed_label,
+            )
+            t_structure = time.perf_counter()
+            one = as_single_s12_structure(full, line_sample_spacing=LINE_SAMPLE_SPACING)
+            diag = single_chain_window_diagnostics(one)
+            window_diagnostics.append(diag)
+            point_counts.append(len(one.points))
+            if print_timing:
+                print(
+                    f"[scatter] {seed_label}: S12 points={len(one.points)}, "
+                    f"segments={len(one.segment_starts)}, M_W={diag['linear_measure_w']:.6g}, "
+                    f"M_W2={diag['linear_measure_w2']:.6g}",
+                    flush=True,
+                )
+            curves.append(compute_structure_scattering_chunked(one, q, seed_label=seed_label, print_timing=print_timing))
+            t_scatter = time.perf_counter()
+            if print_timing:
+                print(
+                    f"[scatter] {seed_label} done: structure {t_structure - t_seed:.2f}s, "
+                    f"scatter {t_scatter - t_structure:.2f}s, seed total {t_scatter - t_seed:.2f}s",
+                    flush=True,
+                )
+    finally:
+        r.RANDOM_SEED = original_seed
+
+    t_reduce0 = time.perf_counter()
+    if print_timing:
+        print("[scatter] reducing seed curves and computing box reference...", flush=True)
+    curve_array = np.asarray(curves, dtype=float)
+    mean_intensity = np.mean(curve_array, axis=0)
+    std_intensity = np.std(curve_array, axis=0, ddof=1) if len(curve_array) > 1 else np.zeros_like(mean_intensity)
+    box_intensity = box_scattering_intensity_1d(q)
+    t_done = time.perf_counter()
+    if print_timing:
+        print(
+            f"[scatter] single-chain seed average complete: total {t_done - t_all:.2f}s; "
+            f"reduction/reference {t_done - t_reduce0:.2f}s",
+            flush=True,
+        )
+    return q, mean_intensity, std_intensity, box_intensity, point_counts, window_diagnostics
 
 
 def scattering_intensity_1d(
@@ -1263,10 +1517,20 @@ def _points_from_structure_lines(structure: LineStructure, spacing: float) -> tu
     s13_points = sample_polyline_points(structure.s13_lines, spacing)
     if len(s12_points):
         point_blocks.append(s12_points)
-        weight_blocks.append(np.full(len(s12_points), float(S12_SCATTERING_WEIGHT)))
+        weight_blocks.append(
+            np.full(
+                len(s12_points),
+                point_weight_for_line_samples(S12_SCATTERING_WEIGHT, spacing),
+            )
+        )
     if len(s13_points):
         point_blocks.append(s13_points)
-        weight_blocks.append(np.full(len(s13_points), float(S13_SCATTERING_WEIGHT)))
+        weight_blocks.append(
+            np.full(
+                len(s13_points),
+                point_weight_for_line_samples(S13_SCATTERING_WEIGHT, spacing),
+            )
+        )
     if len(structure.crosslink_points):
         point_blocks.append(structure.crosslink_points)
         weight_blocks.append(np.full(len(structure.crosslink_points), float(CROSSLINK_SCATTERING_WEIGHT)))
@@ -1288,10 +1552,20 @@ def _points_from_structure_lines_power2_subset(
     s13_points = sample_polyline_power2_subset(structure.s13_lines, base_spacing, stride)
     if len(s12_points):
         point_blocks.append(s12_points)
-        weight_blocks.append(np.full(len(s12_points), float(S12_SCATTERING_WEIGHT)))
+        weight_blocks.append(
+            np.full(
+                len(s12_points),
+                point_weight_for_line_samples(S12_SCATTERING_WEIGHT, base_spacing),
+            )
+        )
     if len(s13_points):
         point_blocks.append(s13_points)
-        weight_blocks.append(np.full(len(s13_points), float(S13_SCATTERING_WEIGHT)))
+        weight_blocks.append(
+            np.full(
+                len(s13_points),
+                point_weight_for_line_samples(S13_SCATTERING_WEIGHT, base_spacing),
+            )
+        )
     if len(structure.crosslink_points):
         point_blocks.append(structure.crosslink_points)
         weight_blocks.append(np.full(len(structure.crosslink_points), float(CROSSLINK_SCATTERING_WEIGHT)))

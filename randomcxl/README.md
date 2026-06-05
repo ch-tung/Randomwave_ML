@@ -25,8 +25,19 @@ rendered branch.
 - `rw_line_network.py`: reusable script with field generation,
   k-vector sampling, vortex-line tracing, smoothing, crosslink detection, and
   PyVista rendering.
+- `rw_line_scattering.py`: scattering utilities for traced line networks,
+  including point and line-segment amplitudes, smooth-window corrections,
+  seed-averaged scattering, and single-chain helper functions.
 - `interactive_rw_line_network.ipynb`: notebook interface for tuning
   sampling, tracing, crosslink, and render settings.
+- `interactive_rw_line_scattering.ipynb`: full retained-network scattering
+  notebook.
+- `interactive_rw_single_chain_scattering.ipynb`: one-field/single-chain
+  scattering notebook for the `Gamma_12` family, with a Gaussian random-wave
+  reference.
+- `smpl/`: compact line-scattering notebooks and Python helpers for analytic
+  and conditional-sampling experiments, including monochromatic, general
+  wave-number, and four-field line cases.
 - `figure_coupling/`: coupling sweep figures and the settings used to generate
   them.
 - `schematic.ipynb`: notebook used to generate the schematic figures.
@@ -129,6 +140,49 @@ Useful controls:
 The notebook exposes controls for PyVista window size, camera zoom, bounding-box
 visibility, surface colors/opacities, tube colors/opacities, and optional mesh
 edge display on surfaces and tubes.
+
+## Scattering Workflows
+
+`rw_line_scattering.py` evaluates orientationally averaged line scattering from
+the traced geometry. Two amplitude methods are available:
+
+- `SCATTERING_AMPLITUDE_METHOD = "line_segments"`: integrates each traced
+  segment analytically and is the preferred continuous-line calculation for
+  high-`Q` asymptote checks.
+- `SCATTERING_AMPLITUDE_METHOD = "points"`: samples lines as bead scatterers.
+  This is useful for visualization and debugging, but at sufficiently high `Q`
+  it develops a point self-term floor controlled by `LINE_SAMPLE_SPACING`.
+
+Useful scattering controls:
+
+- `SCATTERING_WINDOW = "none" | "tukey_box" | "hann_box" | "gaussian"` applies
+  a smooth observation window to the line geometry.
+- `SUBTRACT_WINDOWED_MEAN` subtracts the smooth mean-density amplitude
+  associated with the selected window.
+- `INTENSITY_NORMALIZATION = "none" | "i0" | "length_density"` controls the
+  normalization applied inside the scattering routine.
+- `POINT_WEIGHT_MODE = "unit" | "arclength"` controls point-sample weights when
+  using the point amplitude method. `"unit"` preserves equal bead weights;
+  `"arclength"` assigns each sampled line point
+  `LINE_SAMPLE_SPACING * family_weight`.
+- `SCATTERING_Q_CHUNK_SIZE` controls progress chunks for long notebook runs; it
+  does not change the scattering formula.
+
+The single-chain notebook uses `Gamma_12` only and plots reduced units designed
+to compare a finite traced line with the Gaussian random-wave reference:
+
+```python
+I(Q) = I_raw(Q) / int W(r)^2 dV
+d = sum(ds * W(r)^2) / int W(r)^2 dV
+left_y = I(Q) / d^2
+left_guide = pi / (Q*d)
+right_y = left_y / left_guide
+```
+
+The x axis is labeled `Q/k`, where
+`k = 2*pi*<k_cycles>/GRID_SIZE` in grid-coordinate units. The theoretical
+monochromatic density `k^2/(3*pi)` is printed as a reference, while the reduced
+plot uses the window-squared density sampled by the traced line geometry.
 
 ## Running
 
