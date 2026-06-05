@@ -14,6 +14,7 @@ The reported 1D ``I(Q)`` is an orientational average over random q-directions.
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -44,7 +45,7 @@ SCATTERING_BATCH_SIZE = 32768
 # often long calculations report progress.
 SCATTERING_Q_CHUNK_SIZE = 10
 SCATTERING_FLATTEN_Q_DIRECTIONS = False
-SCATTERING_AMPLITUDE_METHOD = "points"  # "points" or "line_segments"
+SCATTERING_AMPLITUDE_METHOD = "points"  # "points", "balls", or "line_segments"
 SCATTERING_WINDOW = "none"  # "none", "tukey_box", "hann_box", or "gaussian"
 SCATTERING_WINDOW_TAPER = 0.15
 SUBTRACT_WINDOWED_MEAN = True
@@ -60,6 +61,7 @@ NUM_SEED_AVERAGE = 1
 STRUCTURE_SEED_START = 894894
 STRUCTURE_SEED_STRIDE = 1009
 PRINT_TIMING = True
+NECKLACE_ALPHA_3 = float(np.sqrt(15.0 / 8.0))
 
 # Point sampling along vortex lines, in the same grid-coordinate units as the
 # PyVista geometry. A smaller spacing gives a better curve integral but costs
@@ -69,6 +71,7 @@ LINE_SAMPLE_SPACING = 0.75
 # bead scatterers, while "arclength" assigns each point weight
 # LINE_SAMPLE_SPACING so the point sum approximates a continuous line integral.
 POINT_WEIGHT_MODE = "unit"  # "unit" or "arclength"
+BALL_DIAMETER_OVER_SPACING = 1.0
 DYNAMIC_LINE_SAMPLE_SPACING = False
 DYNAMIC_LINE_SAMPLE_EXPONENT = 1.0
 DYNAMIC_LINE_SAMPLE_POWER2_SUBSETS = True
@@ -924,7 +927,7 @@ def scattering_measure_for_structure(
 
     if amplitude_method is None:
         amplitude_method = SCATTERING_AMPLITUDE_METHOD
-    if amplitude_method == "points":
+    if amplitude_method in {"points", "balls"}:
         if len(structure.points) == 0:
             return 0.0
         return float(np.sum(structure.weights * window_function(structure.points)))
@@ -942,7 +945,7 @@ def scattering_measure_for_structure(
                 )
             )
         return measure
-    raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points' or 'line_segments'.")
+    raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points', 'balls', or 'line_segments'.")
 
 
 def _build_fields() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1190,7 +1193,7 @@ def single_chain_window_diagnostics(structure: LineStructure) -> dict[str, float
     """
 
     amplitude_method = SCATTERING_AMPLITUDE_METHOD
-    if amplitude_method == "points":
+    if amplitude_method in {"points", "balls"}:
         window_values = window_function(structure.points) if len(structure.points) else np.empty(0, dtype=float)
         linear_measure_w = float(np.sum(structure.weights * window_values)) if len(structure.points) else 0.0
         linear_measure_w2 = float(np.sum(structure.weights * window_values**2)) if len(structure.points) else 0.0
@@ -1202,7 +1205,7 @@ def single_chain_window_diagnostics(structure: LineStructure) -> dict[str, float
         linear_measure_w = float(np.sum(segment_measure * window_values))
         linear_measure_w2 = float(np.sum(segment_measure * window_values**2))
     else:
-        raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points' or 'line_segments'.")
+        raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points', 'balls', or 'line_segments'.")
 
     v1 = window_volume()
     v2 = window_squared_volume()
@@ -1357,6 +1360,280 @@ def compute_seed_averaged_single_chain_scattering(
     return q, mean_intensity, std_intensity, box_intensity, point_counts, window_diagnostics
 
 
+def _necklace_harmonics(
+    beta: float,
+    alpha: float = NECKLACE_ALPHA_3,
+    m_max: int | None = None,
+    tol: float = 1e-10,
+    *,
+    cap: int = 20000,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Return damped necklace harmonics and weights."""
+
+    beta = float(beta)
+    alpha = float(alpha)
+    tol = float(tol)
+    if beta <= 0.0:
+        raise ValueError("beta must be positive.")
+    if alpha <= 0.0:
+        raise ValueError("alpha must be positive.")
+    if tol <= 0.0 or tol >= 1.0:
+        raise ValueError("tol must be between 0 and 1.")
+
+    if m_max is None:
+        m_max_int = max(1, int(np.ceil(alpha / beta * np.log(1.0 / tol))))
+    else:
+        m_max_int = int(m_max)
+        if m_max_int < 1:
+            raise ValueError("m_max must be positive.")
+
+    if m_max_int > cap:
+        warnings.warn(
+            f"necklace harmonic cutoff {m_max_int} exceeds cap {cap}; using {cap}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        m_max_int = cap
+
+    m = np.arange(1, m_max_int + 1, dtype=float)
+    weights = np.exp(-m * beta / alpha)
+    return m, weights, m_max_int
+
+
+def _necklace_sum(
+    q: Sequence[float],
+    beta: float,
+    alpha: float = NECKLACE_ALPHA_3,
+    m_max: int | None = None,
+    tol: float = 1e-10,
+    *,
+    max_matrix_elements: int = 2_000_000,
+) -> tuple[np.ndarray, float, int]:
+    """
+    Return ``S(q) = 1 + 2 sum_m w_m sinc(m q beta / pi)`` and ``S(0)``.
+
+    The public necklace factors use dimensionless ``q=Q/k_eff`` and
+    ``beta=b*k_eff``. ``np.sinc(x/pi)`` evaluates ``sin(x)/x`` safely at
+    zero.
+    """
+
+    q_arr = np.asarray(q, dtype=float)
+    q_flat = q_arr.ravel()
+    m, weights, m_max_int = _necklace_harmonics(beta, alpha=alpha, m_max=m_max, tol=tol)
+    s_q = np.ones_like(q_flat, dtype=float)
+    s0 = float(1.0 + 2.0 * np.sum(weights))
+    if q_flat.size == 0:
+        return s_q.reshape(q_arr.shape), s0, m_max_int
+
+    chunk = max(1, int(max_matrix_elements // max(1, q_flat.size)))
+    beta = float(beta)
+    for start in range(0, len(m), chunk):
+        stop = min(start + chunk, len(m))
+        phase = m[start:stop, None] * q_flat[None, :] * beta
+        s_q += 2.0 * np.sum(weights[start:stop, None] * np.sinc(phase / np.pi), axis=0)
+    return s_q.reshape(q_arr.shape), s0, m_max_int
+
+
+def necklace_modulation(
+    q: Sequence[float],
+    beta: float,
+    alpha: float = NECKLACE_ALPHA_3,
+    m_max: int | None = None,
+    tol: float = 1e-10,
+) -> np.ndarray:
+    """
+    Normalized bead-necklace modulation for a continuous line scattering curve.
+
+    ``q`` is ``Q/k_eff`` and ``beta`` is ``b*k_eff``. The normalization divides
+    by the zero-Q harmonic sum, so ``M(0)=1`` and the average SLD per arclength
+    is preserved when bead scattering length is ``B=lambda*b``.
+    """
+
+    s_q, s0, _ = _necklace_sum(q, beta, alpha=alpha, m_max=m_max, tol=tol)
+    return s_q / s0
+
+
+def necklace_asymptotic_factor(
+    q: Sequence[float],
+    beta: float,
+    alpha: float = NECKLACE_ALPHA_3,
+    m_max: int | None = None,
+    tol: float = 1e-10,
+) -> np.ndarray:
+    """
+    Local straight-line necklace factor for the asymptotic ``Q^-1`` result.
+
+    This is useful as a diagnostic, but it should not replace the normalized
+    modulation when converting a full finite-Q continuous curve.
+    """
+
+    q_arr = np.asarray(q, dtype=float)
+    s_q, _, _ = _necklace_sum(q_arr, beta, alpha=alpha, m_max=m_max, tol=tol)
+    return (q_arr * float(beta) / np.pi) * s_q
+
+
+def uniform_sphere_amplitude_form_factor(q: Sequence[float], diameter: float) -> np.ndarray:
+    """
+    Normalized amplitude form factor for a uniform spherical bead.
+
+    ``diameter`` is in the same length unit paired with ``q``. The returned
+    amplitude is normalized to 1 at ``Q=0``. Multiply intensities by
+    ``abs(F)^2``.
+    """
+
+    q_arr = np.asarray(q, dtype=float)
+    diameter = float(diameter)
+    if diameter <= 0.0:
+        raise ValueError("diameter must be positive.")
+
+    x = 0.5 * q_arr * diameter
+    out = np.ones_like(x, dtype=float)
+    small = np.abs(x) < 1e-5
+    if np.any(~small):
+        xs = x[~small]
+        out[~small] = 3.0 * (np.sin(xs) - xs * np.cos(xs)) / (xs**3)
+    if np.any(small):
+        xs = x[small]
+        out[small] = 1.0 - xs**2 / 10.0 + xs**4 / 280.0
+    return out
+
+
+def sphere_bead_form_factor(
+    q: Sequence[float],
+    beta: float,
+    diameter_over_spacing: float = 1.0,
+) -> np.ndarray:
+    """
+    Amplitude form factor for a uniform spherical bead in dimensionless units.
+
+    ``q`` is ``Q/k_eff`` and ``beta=b*k_eff``. The bead diameter is
+    ``diameter_over_spacing*b``; the default therefore sets bead diameter equal
+    to the necklace spacing.
+    """
+
+    beta = float(beta)
+    diameter_over_spacing = float(diameter_over_spacing)
+    if beta <= 0.0:
+        raise ValueError("beta must be positive.")
+    if diameter_over_spacing <= 0.0:
+        raise ValueError("diameter_over_spacing must be positive.")
+    return uniform_sphere_amplitude_form_factor(q, beta * diameter_over_spacing)
+
+
+def bead_necklace_parameters_from_beta(
+    beta: float,
+    k_eff: float,
+    *,
+    diameter_over_spacing: float = 1.0,
+    line_sld: float = 1.0,
+) -> dict[str, float]:
+    """
+    Return physical bead parameters from dimensionless ``beta=b*k_eff``.
+
+    ``line_sld`` is the continuous scattering length per arclength ``lambda``.
+    Each bead carries ``B=lambda*b`` so the average arclength SLD is preserved.
+    The bead volume SLD is then ``B/V_bead`` for a sphere of the chosen
+    diameter.
+    """
+
+    beta = float(beta)
+    k_eff = float(k_eff)
+    diameter_over_spacing = float(diameter_over_spacing)
+    line_sld = float(line_sld)
+    if beta <= 0.0:
+        raise ValueError("beta must be positive.")
+    if k_eff <= 0.0:
+        raise ValueError("k_eff must be positive.")
+    if diameter_over_spacing <= 0.0:
+        raise ValueError("diameter_over_spacing must be positive.")
+
+    spacing = beta / k_eff
+    diameter = diameter_over_spacing * spacing
+    radius = 0.5 * diameter
+    volume = 4.0 * np.pi * radius**3 / 3.0
+    bead_scattering_length = line_sld * spacing
+    bead_volume_sld = bead_scattering_length / volume if volume > 0.0 else float("inf")
+    return {
+        "beta": beta,
+        "k_eff": k_eff,
+        "spacing_b": spacing,
+        "diameter": diameter,
+        "radius": radius,
+        "diameter_over_spacing": diameter_over_spacing,
+        "line_sld_lambda": line_sld,
+        "bead_scattering_length_B": bead_scattering_length,
+        "bead_volume": volume,
+        "bead_volume_sld": bead_volume_sld,
+    }
+
+
+def convert_continuous_to_necklace(
+    Q: Sequence[float],
+    I_cont: Sequence[float],
+    k_eff: float,
+    beta_values: Sequence[float],
+    alpha: float = NECKLACE_ALPHA_3,
+    mode: str = "normalized",
+    sld_scale: float = 1.0,
+    bead_form_factor: bool = False,
+    diameter_over_spacing: float = 1.0,
+    m_max: int | None = None,
+    tol: float = 1e-10,
+    print_diagnostics: bool = True,
+) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray]]:
+    """
+    Convert continuous line scattering curves into bead-necklace estimates.
+
+    ``Q`` and ``I_cont`` are on the same grid. ``k_eff`` maps the x-axis to
+    ``q=Q/k_eff``. Each beta is ``b*k_eff``; when ``B != lambda*b``, pass
+    ``sld_scale=(B/(lambda*b))**2``. Set ``bead_form_factor=True`` to multiply
+    by a spherical bead form factor squared; by default the bead diameter is
+    equal to the spacing ``b``.
+    """
+
+    Q = np.asarray(Q, dtype=float)
+    I_cont = np.asarray(I_cont, dtype=float)
+    if Q.shape != I_cont.shape:
+        raise ValueError("Q and I_cont must have the same shape.")
+    k_eff = float(k_eff)
+    if k_eff <= 0.0:
+        raise ValueError("k_eff must be positive.")
+    mode_key = str(mode).lower()
+    if mode_key not in {"normalized", "asymptotic"}:
+        raise ValueError("mode must be 'normalized' or 'asymptotic'.")
+
+    q = Q / k_eff
+    curves: dict[float, np.ndarray] = {}
+    factors: dict[float, np.ndarray] = {}
+    for beta_in in beta_values:
+        beta = float(beta_in)
+        if mode_key == "normalized":
+            factor = necklace_modulation(q, beta, alpha=alpha, m_max=m_max, tol=tol)
+        else:
+            factor = necklace_asymptotic_factor(q, beta, alpha=alpha, m_max=m_max, tol=tol)
+        if bead_form_factor:
+            form_factor = sphere_bead_form_factor(q, beta, diameter_over_spacing=diameter_over_spacing)
+            factor = factor * form_factor**2
+        curves[beta] = I_cont * factor * float(sld_scale)
+        factors[beta] = factor
+
+        if print_diagnostics:
+            _, _, used_m_max = _necklace_sum(q[:1], beta, alpha=alpha, m_max=m_max, tol=tol)
+            factor_zero = necklace_modulation([0.0], beta, alpha=alpha, m_max=m_max, tol=tol)[0]
+            if bead_form_factor:
+                factor_zero *= sphere_bead_form_factor([0.0], beta, diameter_over_spacing=diameter_over_spacing)[0] ** 2
+            damping = float(np.exp(-beta / float(alpha)))
+            q1 = float(2.0 * np.pi / beta)
+            print(
+                f"[necklace] beta={beta:.6g}, m_max={used_m_max}, "
+                f"M(q=0)={float(factor_zero):.12g}, "
+                f"min={float(np.nanmin(factor)):.12g}, max={float(np.nanmax(factor)):.12g}, "
+                f"q1=2*pi/beta={q1:.6g}, exp(-beta/alpha)={damping:.6g}",
+                flush=True,
+            )
+    return curves, factors
+
+
 def compute_seed_averaged_cxl_chain_scattering(
     seeds: Sequence[int] | None = None,
     *,
@@ -1478,6 +1755,7 @@ def scattering_intensity_1d(
     q: Sequence[float],
     *,
     weights: np.ndarray | None = None,
+    amplitude_form_factor=None,
     num_directions: int | None = None,
     seed: int | None = None,
     batch_size: int | None = None,
@@ -1490,6 +1768,10 @@ def scattering_intensity_1d(
 
     The result is normalized by ``sum(weights)^2`` when ``normalize_i0`` is True,
     so I(Q=0) would be 1 for a single-component positive-density structure.
+    If ``amplitude_form_factor`` is supplied, it is evaluated at ``|Q|`` and
+    multiplies both the explicit bead amplitude and the smooth mean background
+    amplitude. This keeps the integrated bead scattering length scale set by
+    ``weights`` while adding a finite-volume bead shape.
     """
 
     points = np.asarray(points, dtype=float)
@@ -1549,11 +1831,16 @@ def scattering_intensity_1d(
             q_batch = q_vectors[start:stop]
             shell_batch = q_shells[start:stop]
             phase = points @ q_batch.T
-            amplitudes = np.exp(1j * phase).T @ windowed_weights
+            form = (
+                np.asarray(amplitude_form_factor(np.linalg.norm(q_batch, axis=1)), dtype=float)
+                if amplitude_form_factor is not None
+                else 1.0
+            )
+            amplitudes = (np.exp(1j * phase).T @ windowed_weights) * form
             if windowed_mean_enabled():
-                amplitudes = amplitudes - rho_windowed * window_hat(q_batch)
+                amplitudes = amplitudes - rho_windowed * window_hat(q_batch) * form
             if buffer_mode != "none":
-                buffer_amplitudes = analytic_mean_background_amplitude(q_batch, weighted_norm)
+                buffer_amplitudes = analytic_mean_background_amplitude(q_batch, weighted_norm) * form
                 if buffer_mode == "coherent":
                     amplitudes = amplitudes + buffer_amplitudes
                     buffer_extra = 0.0
@@ -1574,11 +1861,16 @@ def scattering_intensity_1d(
         for start in range(0, len(q_vectors), int(batch_size)):
             q_batch = q_vectors[start : start + int(batch_size)]
             phase = points @ q_batch.T
-            amplitudes = np.exp(1j * phase).T @ windowed_weights
+            form = (
+                np.asarray(amplitude_form_factor(np.linalg.norm(q_batch, axis=1)), dtype=float)
+                if amplitude_form_factor is not None
+                else 1.0
+            )
+            amplitudes = (np.exp(1j * phase).T @ windowed_weights) * form
             if windowed_mean_enabled():
-                amplitudes = amplitudes - rho_windowed * window_hat(q_batch)
+                amplitudes = amplitudes - rho_windowed * window_hat(q_batch) * form
             if buffer_mode != "none":
-                buffer_amplitudes = analytic_mean_background_amplitude(q_batch, weighted_norm)
+                buffer_amplitudes = analytic_mean_background_amplitude(q_batch, weighted_norm) * form
                 if buffer_mode == "coherent":
                     amplitudes = amplitudes + buffer_amplitudes
                     shell_intensity += float(np.sum(np.abs(amplitudes) ** 2))
@@ -1592,6 +1884,41 @@ def scattering_intensity_1d(
         intensities[iq] = shell_intensity / (len(q_vectors) * norm)
 
     return intensities
+
+
+def ball_scattering_intensity_1d(
+    points: np.ndarray,
+    q: Sequence[float],
+    *,
+    weights: np.ndarray | None = None,
+    diameter: float | None = None,
+    diameter_over_spacing: float | None = None,
+    **kwargs,
+) -> np.ndarray:
+    """
+    Orientationally averaged scattering from uniform spherical beads.
+
+    ``weights`` are the integrated scattering lengths of the beads. With
+    ``POINT_WEIGHT_MODE='arclength'`` and line family weight one, this means
+    ``B=lambda*b`` and preserves the continuous arclength SLD at low Q. The
+    sphere form factor is normalized to one at Q=0, so it changes the shape but
+    not the low-Q intensity scale.
+    """
+
+    if diameter is None:
+        if diameter_over_spacing is None:
+            diameter_over_spacing = BALL_DIAMETER_OVER_SPACING
+        diameter = float(diameter_over_spacing) * float(LINE_SAMPLE_SPACING)
+    diameter = float(diameter)
+    if diameter <= 0.0:
+        raise ValueError("ball diameter must be positive.")
+    return scattering_intensity_1d(
+        points,
+        q,
+        weights=weights,
+        amplitude_form_factor=lambda q_abs: uniform_sphere_amplitude_form_factor(q_abs, diameter),
+        **kwargs,
+    )
 
 
 def dynamic_sample_spacing_for_q(
@@ -1925,6 +2252,16 @@ def structure_scattering_intensity_1d(
             weights=structure.weights,
             normalization=normalization,
         )
+    if amplitude_method == "balls":
+        if DYNAMIC_LINE_SAMPLE_SPACING:
+            raise NotImplementedError("DYNAMIC_LINE_SAMPLE_SPACING is not implemented for ball amplitudes.")
+        return ball_scattering_intensity_1d(
+            structure.points,
+            q,
+            weights=structure.weights,
+            diameter_over_spacing=BALL_DIAMETER_OVER_SPACING,
+            normalization=normalization,
+        )
     if amplitude_method == "line_segments":
         crosslink_weights = (
             np.full(len(structure.crosslink_points), float(CROSSLINK_SCATTERING_WEIGHT))
@@ -1940,7 +2277,7 @@ def structure_scattering_intensity_1d(
             point_weights=crosslink_weights,
             normalization=normalization,
         )
-    raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points' or 'line_segments'.")
+    raise ValueError("SCATTERING_AMPLITUDE_METHOD must be 'points', 'balls', or 'line_segments'.")
 
 
 def compute_current_scattering() -> tuple[np.ndarray, np.ndarray, LineStructure]:

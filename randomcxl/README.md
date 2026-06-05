@@ -35,6 +35,10 @@ rendered branch.
 - `interactive_rw_single_chain_scattering.ipynb`: one-field/single-chain
   scattering notebook for the `Gamma_12` family, with a Gaussian random-wave
   reference.
+- `interactive_rw_single_chain_necklace_scattering.ipynb`: bead-necklace
+  single-chain scattering notebook comparing traced point beads, traced
+  continuous segments, and a Gaussian continuous curve post-processed by the
+  curvature-damped necklace modulation.
 - `interactive_rw_cxl_chain_scattering.ipynb`: two-family three-wave
   crosslinked-chain scattering notebook for `Gamma_12 + Gamma_13`, with
   tunable `phi_2`/`phi_3` correlation and a four-field Gaussian reference.
@@ -152,9 +156,15 @@ the traced geometry. Two amplitude methods are available:
 - `SCATTERING_AMPLITUDE_METHOD = "line_segments"`: integrates each traced
   segment analytically and is the preferred continuous-line calculation for
   high-`Q` asymptote checks.
-- `SCATTERING_AMPLITUDE_METHOD = "points"`: samples lines as bead scatterers.
-  This is useful for visualization and debugging, but at sufficiently high `Q`
-  it develops a point self-term floor controlled by `LINE_SAMPLE_SPACING`.
+- `SCATTERING_AMPLITUDE_METHOD = "points"`: samples lines as zero-volume bead
+  scatterers. This is useful for visualization and debugging, but at
+  sufficiently high `Q` it develops a point self-term floor controlled by
+  `LINE_SAMPLE_SPACING`.
+- `SCATTERING_AMPLITUDE_METHOD = "balls"`: uses the same bead centers and
+  integrated bead scattering lengths as `"points"`, but multiplies each bead
+  amplitude by the normalized uniform-sphere form factor. With
+  `POINT_WEIGHT_MODE = "arclength"`, each bead carries `B=lambda*b`; the
+  sphere volume SLD is therefore `B/V_bead`.
 
 Useful scattering controls:
 
@@ -186,6 +196,26 @@ The x axis is labeled `Q/k`, where
 `k = 2*pi*<k_cycles>/GRID_SIZE` in grid-coordinate units. The theoretical
 monochromatic density `k^2/(3*pi)` is printed as a reference, while the reduced
 plot uses the window-squared density sampled by the traced line geometry.
+
+The necklace notebook uses the same reduced units, but deliberately increases
+`LINE_SAMPLE_SPACING = b` and treats point samples as finite beads with
+`POINT_WEIGHT_MODE = "arclength"`. The easiest control is the dimensionless
+spacing `beta=b*k`, converted to physical notebook settings by
+`rw_line_scattering.bead_necklace_parameters_from_beta(...)`. The Gaussian
+continuous curve can be post-processed with:
+
+```python
+beta = b*k
+L_c = sqrt(15/8) / k
+I_neck(Q) = I_cont(Q) * M(Q/k, beta) * P_sphere(Q)
+```
+
+where `M` is the normalized curvature-damped necklace modulation implemented in
+`rw_line_scattering.necklace_modulation(...)`. The default bead diameter equals
+the spacing `b`, and `P_sphere(Q)` is the normalized spherical bead form factor
+squared. The normalized form preserves `M(0)=P_sphere(0)=1`, so the average
+arclength SLD is unchanged when each bead carries scattering length
+`B=lambda*b`.
 
 The CXL-chain notebook keeps both retained families, `Gamma_12` and
 `Gamma_13`, in a three-wave system. The default `PHI23_CORRELATION_RHO = 0`

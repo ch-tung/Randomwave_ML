@@ -591,3 +591,95 @@ Added module helpers in `rw_line_scattering.py`:
 as_single_s13_structure(...)
 compute_seed_averaged_cxl_chain_scattering(...)
 ```
+
+## Single-Chain Necklace Scattering
+
+Added `interactive_rw_single_chain_necklace_scattering.ipynb` to test the
+effect of replacing continuous arclength SLD by beads with spacing
+`b = LINE_SAMPLE_SPACING`.
+
+The notebook keeps the single-chain normalization style:
+
+```python
+I(Q) = I_raw(Q) / int W(r)^2 dV
+d = sum(ds * W(r)^2) / int W(r)^2 dV
+N = d**2
+x = Q/k
+y = I(Q)/d**2
+```
+
+It builds each traced `Gamma_12` structure once per seed and evaluates bead
+ball amplitudes with `POINT_WEIGHT_MODE = "arclength"` and
+`SCATTERING_AMPLITUDE_METHOD = "balls"`. The `"balls"` method uses the sampled
+bead centers and integrated bead scattering lengths `B=lambda*b`, but multiplies
+each bead amplitude, the windowed mean subtraction, and analytic mean-buffer
+terms by the normalized uniform-sphere amplitude form factor. This applies the
+finite bead shape at amplitude level and preserves the low-Q intensity scale.
+
+The Gaussian conditional-sampling continuous curve is converted to a bead
+necklace estimate with:
+
+```python
+alpha_3 = sqrt(15/8)
+beta = b*k
+L_c = alpha_3/k
+I_neck(Q) = I_cont(Q) * M(Q/k, beta) * P_sphere(Q)
+```
+
+where `M` is normalized so `M(0)=1`. The bead diameter is set equal to the
+spacing by default, so `P_sphere(Q)` is the normalized uniform-sphere form
+factor squared with `P_sphere(0)=1`. This preserves the average arclength SLD
+when each bead carries scattering length `B = lambda*b`; the helper also reports
+the corresponding bead volume SLD `B/V_bead`.
+
+Added reusable post-processing helpers in `rw_line_scattering.py`:
+
+```python
+necklace_modulation(...)
+necklace_asymptotic_factor(...)
+sphere_bead_form_factor(...)
+uniform_sphere_amplitude_form_factor(...)
+ball_scattering_intensity_1d(...)
+bead_necklace_parameters_from_beta(...)
+convert_continuous_to_necklace(...)
+```
+
+The harmonic sum is chunked over necklace index `m` to avoid allocating a large
+`m by Q` matrix. Diagnostics print `beta`, harmonic cutoff, `M(q=0)`, min/max
+factor, first bead feature `q_1 = 2*pi/beta`, and curvature damping
+`exp(-beta/alpha_3)`. The notebook plot also marks the finite-box feature
+`2*pi/(L/2)` with a red dashed line.
+
+Updated the necklace notebook right-hand panel to show the bead model factors
+directly: the necklace structure modulation `M`, the spherical bead form factor
+squared, and their product. The trajectory/model intensity comparison remains
+on the left-hand panel.
+
+The necklace notebook Gaussian reference now supports non-monochromatic radial
+k spectra through:
+
+```python
+MODEL_K_DISTRIBUTION
+MODEL_K0
+MODEL_R_SIGMA_K
+MODEL_R_K_MIN
+MODEL_R_K_MAX
+MODEL_NUM_K
+```
+
+The model uses `smpl/rw_line_scattering.py::make_radial_k_quadrature(...)` to
+build deterministic `k_radii, k_weights` for `single_shell`,
+`gaussian_radial`, or `uniform_band`. The absolute intensity scaling now uses
+the model density `rho_L = <k^2>/(3*pi)` rather than assuming the
+monochromatic value `1/(3*pi)`.
+
+Applied the same spectrum-aware Gaussian model controls to
+`interactive_rw_single_chain_scattering.ipynb` and
+`interactive_rw_cxl_chain_scattering.ipynb`. The single-chain notebook now uses
+weighted radial quadrature for `compute_CL_general(...)` and rescales by
+`<k^2>/(3*pi)`. The CXL-chain notebook now computes four-field self/cross
+terms from precomputed radial wave statistics
+(`compute_wave_stats_for_r_grid(...)`,
+`compute_self_correlation_from_wave_stats(...)`, and
+`compute_cross_correlation_from_wave_stats(...)`) instead of assuming the
+monochromatic covariance.
