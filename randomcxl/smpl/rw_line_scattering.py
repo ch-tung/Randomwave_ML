@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import warnings
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
@@ -41,7 +42,13 @@ DEFAULT_RANDOM_SEED = 12345
 DEFAULT_OUTPUT_DIR = "smpl/rw_line_scattering_output"
 SMALL_X = 1.0e-4
 DEFAULT_RADIAL_CHUNK_SIZE = 256
+DEFAULT_CONDITIONAL_U_BATCH_SIZE = 64
+DEFAULT_CONDITIONAL_ST_BATCH_SIZE = 256
 KDistribution = Literal["single_shell", "gaussian_radial", "uniform_band"]
+JacobianMethod = Literal["direct_12d", "conditional_6d_2d"]
+SamplingMethod = Literal["qmc", "random"]
+STSamplingMethod = Literal["quadrature", "qmc"]
+STTransform = Literal["rational", "logistic"]
 
 
 def qmc_power_from_n_samp(n_samp: int) -> int:
@@ -670,6 +677,52 @@ def standard_normal_samples(
     return z[:, :6], z[:, 6:]
 
 
+def standard_normal_matrix(
+    n_samp: int,
+    dim: int,
+    *,
+    sampling: SamplingMethod = "qmc",
+    random_seed: int = DEFAULT_RANDOM_SEED,
+) -> np.ndarray:
+    """Generate standard-normal samples with either Sobol QMC or pseudorandom MC."""
+
+    n_samp = int(n_samp)
+    dim = int(dim)
+    if n_samp <= 0:
+        raise ValueError("n_samp must be positive.")
+    if dim <= 0:
+        raise ValueError("dim must be positive.")
+    sampling = str(sampling).lower()
+    if sampling == "qmc":
+        sampler = qmc.Sobol(d=dim, scramble=True, seed=random_seed)
+        uniform = sampler.random_base2(m=qmc_power_from_n_samp(n_samp))
+        uniform = np.clip(uniform, 1.0e-12, 1.0 - 1.0e-12)
+        return norm.ppf(uniform)
+    if sampling == "random":
+        rng = np.random.default_rng(random_seed)
+        return rng.standard_normal((n_samp, dim))
+    raise ValueError("sampling must be 'qmc' or 'random'.")
+
+
+def symmetric_covariance_sqrt(
+    sigma: np.ndarray,
+    *,
+    tol: float = 1.0e-10,
+) -> np.ndarray:
+    """Return a symmetric square root of a positive semidefinite covariance."""
+
+    sigma = 0.5 * (np.asarray(sigma, dtype=float) + np.asarray(sigma, dtype=float).T)
+    eigvals, eigvecs = np.linalg.eigh(sigma)
+    scale = max(float(np.max(np.abs(eigvals))), 1.0)
+    min_allowed = -float(tol) * scale
+    if float(np.min(eigvals)) < min_allowed:
+        raise np.linalg.LinAlgError(
+            f"covariance is materially indefinite: min eigenvalue={float(np.min(eigvals)):.6g}"
+        )
+    eigvals = np.clip(eigvals, 0.0, None)
+    return (eigvecs * np.sqrt(eigvals)) @ eigvecs.T
+
+
 def make_r_grid(
     r_min: float,
     r_max: float,
@@ -757,26 +810,704 @@ def sample_MJ_for_r_general(
     return float(np.mean(x))
 
 
+def cross_product_projector(u: np.ndarray) -> np.ndarray:
+    """Return ``K(u)=|u|^2 I - u u^T`` so ``|u x v|^2 = v^T K(u) v``."""
+
+    u = np.asarray(u, dtype=float)
+    if u.shape != (3,):
+        raise ValueError("u must have shape (3,).")
+    return float(np.dot(u, u)) * np.eye(3) - np.outer(u, u)
+
+
+def cross_product_projector_batch(u: np.ndarray) -> np.ndarray:
+    """Vectorized ``K(u)=|u|^2 I-u u^T`` for an array with shape ``(..., 3)``."""
+
+    u = np.asarray(u, dtype=float)
+    if u.shape[-1] != 3:
+        raise ValueError("u must have trailing shape 3.")
+    norm2 = np.sum(u * u, axis=-1)
+    return norm2[..., None, None] * np.eye(3) - u[..., :, None] * u[..., None, :]
+
+
+def perpendicular_frame_batch(u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``norm(u)`` and two orthonormal vectors perpendicular to each row."""
+
+    u = np.asarray(u, dtype=float)
+    if u.ndim != 2 or u.shape[1] != 3:
+        raise ValueError("u must have shape (n, 3).")
+    norms = np.linalg.norm(u, axis=1)
+    unit = np.zeros_like(u)
+    nonzero = norms > np.finfo(float).tiny
+    unit[nonzero] = u[nonzero] / norms[nonzero, None]
+
+    axis_index = np.argmin(np.abs(unit), axis=1)
+    refs = np.eye(3)[axis_index]
+    e1 = np.cross(unit, refs)
+    e1_norm = np.linalg.norm(e1, axis=1)
+    good = e1_norm > np.finfo(float).tiny
+    e1[good] /= e1_norm[good, None]
+    e1[~good] = np.array([1.0, 0.0, 0.0])
+    e2 = np.cross(unit, e1)
+    e2_norm = np.linalg.norm(e2, axis=1)
+    good_e2 = e2_norm > np.finfo(float).tiny
+    e2[good_e2] /= e2_norm[good_e2, None]
+    e2[~good_e2] = np.array([0.0, 1.0, 0.0])
+    frames = np.stack((e1, e2), axis=-1)
+    return norms, frames
+
+
+def make_cross_product_quadratic_matrices(U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the 6x6 matrices A0(U), Ar(U) for the two cross-product norms."""
+
+    U = np.asarray(U, dtype=float)
+    if U.shape != (6,):
+        raise ValueError("U must have shape (6,).")
+    A0 = np.zeros((6, 6), dtype=float)
+    Ar = np.zeros((6, 6), dtype=float)
+    A0[:3, :3] = cross_product_projector(U[:3])
+    Ar[3:, 3:] = cross_product_projector(U[3:])
+    return A0, Ar
+
+
+def make_cross_product_quadratic_matrices_batch(U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized 6x6 matrices ``A0(U), Ar(U)`` for ``U`` with shape ``(n, 6)``."""
+
+    U = np.asarray(U, dtype=float)
+    if U.ndim != 2 or U.shape[1] != 6:
+        raise ValueError("U must have shape (n, 6).")
+    A0 = np.zeros((len(U), 6, 6), dtype=float)
+    Ar = np.zeros((len(U), 6, 6), dtype=float)
+    A0[:, :3, :3] = cross_product_projector_batch(U[:, :3])
+    Ar[:, 3:, 3:] = cross_product_projector_batch(U[:, 3:])
+    return A0, Ar
+
+
+def make_cross_product_low_rank_factors_batch(U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return 6x2 factors ``L0, Lr`` so ``A0=L0 L0.T`` and ``Ar=Lr Lr.T``.
+
+    Each 3D cross-product projector is rank 2:
+    ``|u x v|^2 = v.T (|u|^2 I-u u.T) v``.
+    """
+
+    U = np.asarray(U, dtype=float)
+    if U.ndim != 2 or U.shape[1] != 6:
+        raise ValueError("U must have shape (n, 6).")
+    norm0, frame0 = perpendicular_frame_batch(U[:, :3])
+    normr, framer = perpendicular_frame_batch(U[:, 3:])
+    L0 = np.zeros((len(U), 6, 2), dtype=float)
+    Lr = np.zeros((len(U), 6, 2), dtype=float)
+    L0[:, :3, :] = norm0[:, None, None] * frame0
+    Lr[:, 3:, :] = normr[:, None, None] * framer
+    return L0, Lr
+
+
+def gaussian_quadratic_determinant(
+    sigma_half: np.ndarray,
+    A0: np.ndarray,
+    Ar: np.ndarray,
+    t: float,
+    s: float,
+    *,
+    diagnostic: str = "",
+    eig_tol: float = 1.0e-9,
+) -> float:
+    """
+    Return ``det(I + 2 Sigma_half (t A0 + s Ar) Sigma_half)^(-1/2)``.
+
+    The determinant matrix is symmetrized before `slogdet`; materially
+    nonpositive determinants raise a diagnostic error.
+    """
+
+    B = float(t) * A0 + float(s) * Ar
+    mat = np.eye(6) + 2.0 * (sigma_half @ B @ sigma_half)
+    mat = 0.5 * (mat + mat.T)
+    sign, logdet = np.linalg.slogdet(mat)
+    if sign <= 0:
+        eigvals = np.linalg.eigvalsh(mat)
+        if float(np.min(eigvals)) < -eig_tol:
+            raise np.linalg.LinAlgError(
+                f"nonpositive determinant in gaussian_quadratic_determinant "
+                f"({diagnostic}); min eigenvalue={float(np.min(eigvals)):.6g}, "
+                f"t={float(t):.6g}, s={float(s):.6g}"
+            )
+        eigvals = np.clip(eigvals, 0.0, None)
+        logdet = float(np.sum(np.log(np.maximum(eigvals, np.finfo(float).tiny))))
+    return float(np.exp(-0.5 * logdet))
+
+
+def gaussian_quadratic_determinant_batch(
+    sigma_half: np.ndarray,
+    A0: np.ndarray,
+    Ar: np.ndarray,
+    t: np.ndarray,
+    s: np.ndarray,
+    *,
+    diagnostic: str = "",
+    eig_tol: float = 1.0e-9,
+) -> np.ndarray:
+    """
+    Batched determinant helper for many ``U`` samples and ``t,s`` nodes.
+
+    ``A0`` and ``Ar`` have shape ``(n_U, 6, 6)``. ``t`` and ``s`` are 1D node
+    arrays. The return value has shape ``(n_U, n_nodes)``.
+    """
+
+    sigma_half = np.asarray(sigma_half, dtype=float)
+    A0 = np.asarray(A0, dtype=float)
+    Ar = np.asarray(Ar, dtype=float)
+    t = np.asarray(t, dtype=float)
+    s = np.asarray(s, dtype=float)
+    B = t[None, :, None, None] * A0[:, None, :, :] + s[None, :, None, None] * Ar[:, None, :, :]
+    mats = np.eye(6) + 2.0 * np.einsum("ij,...jk,kl->...il", sigma_half, B, sigma_half, optimize=True)
+    mats = 0.5 * (mats + np.swapaxes(mats, -1, -2))
+    sign, logdet = np.linalg.slogdet(mats)
+    bad = sign <= 0
+    if np.any(bad):
+        eigvals = np.linalg.eigvalsh(mats[bad])
+        min_eig = float(np.min(eigvals))
+        if min_eig < -eig_tol:
+            raise np.linalg.LinAlgError(
+                f"nonpositive determinant in gaussian_quadratic_determinant_batch "
+                f"({diagnostic}); min eigenvalue={min_eig:.6g}"
+            )
+        clipped = np.clip(eigvals, 0.0, None)
+        logdet = np.array(logdet, copy=True)
+        logdet[bad] = np.sum(np.log(np.maximum(clipped, np.finfo(float).tiny)), axis=-1)
+    return np.exp(-0.5 * logdet)
+
+
+def _positive_det_factor_from_logdet_mats(
+    mats: np.ndarray,
+    *,
+    diagnostic: str = "",
+    eig_tol: float = 1.0e-9,
+) -> np.ndarray:
+    """Return ``det(mats)^(-1/2)`` for stacked small SPD matrices."""
+
+    mats = 0.5 * (mats + np.swapaxes(mats, -1, -2))
+    sign, logdet = np.linalg.slogdet(mats)
+    bad = sign <= 0
+    if np.any(bad):
+        eigvals = np.linalg.eigvalsh(mats[bad])
+        min_eig = float(np.min(eigvals))
+        if min_eig < -eig_tol:
+            raise np.linalg.LinAlgError(
+                f"nonpositive low-rank determinant ({diagnostic}); min eigenvalue={min_eig:.6g}"
+            )
+        clipped = np.clip(eigvals, 0.0, None)
+        logdet = np.array(logdet, copy=True)
+        logdet[bad] = np.sum(np.log(np.maximum(clipped, np.finfo(float).tiny)), axis=-1)
+    return np.exp(-0.5 * logdet)
+
+
+def gaussian_quadratic_determinants_lowrank_batch(
+    sigma: np.ndarray,
+    L0: np.ndarray,
+    Lr: np.ndarray,
+    t: np.ndarray,
+    s: np.ndarray,
+    *,
+    diagnostic: str = "",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Low-rank determinant lemma version of the three auxiliary determinants.
+
+    With ``A0=L0 L0.T`` and ``Ar=Lr Lr.T``,
+    ``det(I + 2 Sigma_half (t*A0+s*Ar) Sigma_half)`` equals
+    ``det(I + 2 X.T Sigma X)``, where ``X=[sqrt(t)L0, sqrt(s)Lr]``.
+    The mixed term is therefore only a 4x4 determinant.
+    """
+
+    sigma = np.asarray(sigma, dtype=float)
+    L0 = np.asarray(L0, dtype=float)
+    Lr = np.asarray(Lr, dtype=float)
+    t = np.asarray(t, dtype=float)
+    s = np.asarray(s, dtype=float)
+    G00 = np.einsum("nki,kl,nlj->nij", L0, sigma, L0, optimize=True)
+    Grr = np.einsum("nki,kl,nlj->nij", Lr, sigma, Lr, optimize=True)
+    G0r = np.einsum("nki,kl,nlj->nij", L0, sigma, Lr, optimize=True)
+
+    eye2 = np.eye(2)
+    mats_t0 = eye2 + 2.0 * t[None, :, None, None] * G00[:, None, :, :]
+    mats_0s = eye2 + 2.0 * s[None, :, None, None] * Grr[:, None, :, :]
+
+    n_u = len(L0)
+    n_st = len(t)
+    mats_ts = np.zeros((n_u, n_st, 4, 4), dtype=float)
+    mats_ts[..., :2, :2] = eye2 + 2.0 * t[None, :, None, None] * G00[:, None, :, :]
+    mats_ts[..., 2:, 2:] = eye2 + 2.0 * s[None, :, None, None] * Grr[:, None, :, :]
+    cross_scale = 2.0 * np.sqrt(t * s)[None, :, None, None]
+    mats_ts[..., :2, 2:] = cross_scale * G0r[:, None, :, :]
+    mats_ts[..., 2:, :2] = cross_scale * np.swapaxes(G0r, -1, -2)[:, None, :, :]
+
+    return (
+        _positive_det_factor_from_logdet_mats(mats_t0, diagnostic=f"{diagnostic}, t0"),
+        _positive_det_factor_from_logdet_mats(mats_0s, diagnostic=f"{diagnostic}, 0s"),
+        _positive_det_factor_from_logdet_mats(mats_ts, diagnostic=f"{diagnostic}, ts"),
+    )
+
+
+def auxiliary_integrand_st(
+    t: float,
+    s: float,
+    U: np.ndarray,
+    sigma_half: np.ndarray,
+    *,
+    diagnostic: str = "",
+) -> float:
+    """Return the finite positive-quadrant integrand for ``G(U; r)``."""
+
+    if t <= 0.0 or s <= 0.0:
+        return 0.0
+    A0, Ar = make_cross_product_quadratic_matrices(U)
+    d_t0 = gaussian_quadratic_determinant(sigma_half, A0, Ar, t, 0.0, diagnostic=diagnostic)
+    d_0s = gaussian_quadratic_determinant(sigma_half, A0, Ar, 0.0, s, diagnostic=diagnostic)
+    d_ts = gaussian_quadratic_determinant(sigma_half, A0, Ar, t, s, diagnostic=diagnostic)
+    F = 1.0 - d_t0 - d_0s + d_ts
+    return float(F / (4.0 * np.pi * (t ** 1.5) * (s ** 1.5)))
+
+
+def make_st_nodes(
+    n_samp_st: int,
+    *,
+    sampling: STSamplingMethod = "quadrature",
+    transform: STTransform = "rational",
+    tau_t: float = 1.0,
+    tau_s: float = 1.0,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build positive-quadrant nodes and weights for the auxiliary integral.
+
+    The default rational map is ``t=tau*x/(1-x)``, ``s=tau*y/(1-y)`` from
+    the unit square. With deterministic quadrature, ``n_samp_st`` is treated as
+    an approximate total node budget and rounded up to a square tensor rule.
+    """
+
+    n_samp_st = int(n_samp_st)
+    if n_samp_st <= 0:
+        raise ValueError("n_samp_st must be positive.")
+    sampling = str(sampling).lower()
+    transform = str(transform).lower()
+    tau_t = float(tau_t)
+    tau_s = float(tau_s)
+    if tau_t <= 0.0 or tau_s <= 0.0:
+        raise ValueError("tau_t and tau_s must be positive.")
+
+    if sampling == "quadrature":
+        n_side = int(np.ceil(np.sqrt(n_samp_st)))
+        x_1d, w_1d = np.polynomial.legendre.leggauss(n_side)
+        x_1d = 0.5 * (x_1d + 1.0)
+        w_1d = 0.5 * w_1d
+        x, y = np.meshgrid(x_1d, x_1d, indexing="ij")
+        wx, wy = np.meshgrid(w_1d, w_1d, indexing="ij")
+        unit = np.column_stack((x.ravel(), y.ravel()))
+        unit_w = (wx * wy).ravel()
+    elif sampling == "qmc":
+        sampler = qmc.Sobol(d=2, scramble=True, seed=random_seed)
+        unit = sampler.random_base2(m=qmc_power_from_n_samp(n_samp_st))
+        unit = np.clip(unit, 1.0e-12, 1.0 - 1.0e-12)
+        unit_w = np.full(len(unit), 1.0 / len(unit), dtype=float)
+    else:
+        raise ValueError("st_sampling must be 'quadrature' or 'qmc'.")
+
+    x = unit[:, 0]
+    y = unit[:, 1]
+    if transform == "rational":
+        t = tau_t * x / (1.0 - x)
+        s = tau_s * y / (1.0 - y)
+        jac = tau_t / (1.0 - x) ** 2 * tau_s / (1.0 - y) ** 2
+    elif transform == "logistic":
+        # x in (0,1) -> z in (-inf,inf) -> t=tau*exp(z)
+        zt = np.log(x) - np.log1p(-x)
+        zs = np.log(y) - np.log1p(-y)
+        t = tau_t * np.exp(zt)
+        s = tau_s * np.exp(zs)
+        jac = (t / (x * (1.0 - x))) * (s / (y * (1.0 - y)))
+    else:
+        raise ValueError("st_transform must be 'rational' or 'logistic'.")
+
+    nodes = np.column_stack((t, s))
+    weights = unit_w * jac
+    return nodes, weights
+
+
+def evaluate_inner_st_integral(
+    U: np.ndarray,
+    sigma_half: np.ndarray,
+    st_nodes: np.ndarray,
+    st_weights: np.ndarray,
+    *,
+    diagnostic: str = "",
+) -> float:
+    """Evaluate ``G(U; r)`` with precomputed positive-quadrant nodes."""
+
+    U = np.asarray(U, dtype=float)
+    A0, Ar = make_cross_product_quadratic_matrices(U)
+    total = 0.0
+    for node_index, ((t, s), weight) in enumerate(zip(st_nodes, st_weights)):
+        d_t0 = gaussian_quadratic_determinant(
+            sigma_half, A0, Ar, float(t), 0.0, diagnostic=f"{diagnostic}, st={node_index}"
+        )
+        d_0s = gaussian_quadratic_determinant(
+            sigma_half, A0, Ar, 0.0, float(s), diagnostic=f"{diagnostic}, st={node_index}"
+        )
+        d_ts = gaussian_quadratic_determinant(
+            sigma_half, A0, Ar, float(t), float(s), diagnostic=f"{diagnostic}, st={node_index}"
+        )
+        F = 1.0 - d_t0 - d_0s + d_ts
+        total += float(weight) * F / (4.0 * np.pi * (float(t) ** 1.5) * (float(s) ** 1.5))
+    return float(total)
+
+
+def evaluate_inner_st_integrals_batched(
+    U_samples: np.ndarray,
+    sigma_half: np.ndarray,
+    st_nodes: np.ndarray,
+    st_weights: np.ndarray,
+    *,
+    u_batch_size: int = DEFAULT_CONDITIONAL_U_BATCH_SIZE,
+    st_batch_size: int = DEFAULT_CONDITIONAL_ST_BATCH_SIZE,
+    diagnostic: str = "",
+) -> np.ndarray:
+    """
+    Evaluate ``G(U; r)`` for many outer samples with batched 6x6 determinants.
+
+    This computes the same integral as ``evaluate_inner_st_integral`` but avoids
+    the scalar Python loop over every ``(U, t, s)`` determinant. Memory use is
+    controlled by the two batch sizes.
+    """
+
+    U_samples = np.asarray(U_samples, dtype=float)
+    if U_samples.ndim != 2 or U_samples.shape[1] != 6:
+        raise ValueError("U_samples must have shape (n, 6).")
+    st_nodes = np.asarray(st_nodes, dtype=float)
+    st_weights = np.asarray(st_weights, dtype=float)
+    if st_nodes.ndim != 2 or st_nodes.shape[1] != 2:
+        raise ValueError("st_nodes must have shape (n, 2).")
+    if st_weights.shape != (len(st_nodes),):
+        raise ValueError("st_weights must have shape (len(st_nodes),).")
+
+    u_batch_size = int(u_batch_size)
+    st_batch_size = int(st_batch_size)
+    if u_batch_size <= 0 or st_batch_size <= 0:
+        raise ValueError("u_batch_size and st_batch_size must be positive.")
+
+    t_all = st_nodes[:, 0]
+    s_all = st_nodes[:, 1]
+    kernel_weights = st_weights / (4.0 * np.pi * np.power(t_all, 1.5) * np.power(s_all, 1.5))
+    values = np.empty(len(U_samples), dtype=float)
+
+    for u_start in range(0, len(U_samples), u_batch_size):
+        u_stop = min(u_start + u_batch_size, len(U_samples))
+        A0, Ar = make_cross_product_quadratic_matrices_batch(U_samples[u_start:u_stop])
+        block_values = np.zeros(u_stop - u_start, dtype=float)
+        for st_start in range(0, len(st_nodes), st_batch_size):
+            st_stop = min(st_start + st_batch_size, len(st_nodes))
+            t = t_all[st_start:st_stop]
+            s = s_all[st_start:st_stop]
+            d_t0 = gaussian_quadratic_determinant_batch(
+                sigma_half,
+                A0,
+                Ar,
+                t,
+                np.zeros_like(s),
+                diagnostic=f"{diagnostic}, U={u_start}:{u_stop}, t0={st_start}:{st_stop}",
+            )
+            d_0s = gaussian_quadratic_determinant_batch(
+                sigma_half,
+                A0,
+                Ar,
+                np.zeros_like(t),
+                s,
+                diagnostic=f"{diagnostic}, U={u_start}:{u_stop}, 0s={st_start}:{st_stop}",
+            )
+            d_ts = gaussian_quadratic_determinant_batch(
+                sigma_half,
+                A0,
+                Ar,
+                t,
+                s,
+                diagnostic=f"{diagnostic}, U={u_start}:{u_stop}, ts={st_start}:{st_stop}",
+            )
+            F = 1.0 - d_t0 - d_0s + d_ts
+            block_values += F @ kernel_weights[st_start:st_stop]
+        values[u_start:u_stop] = block_values
+    return values
+
+
+def evaluate_inner_st_integrals_lowrank(
+    U_samples: np.ndarray,
+    sigma: np.ndarray,
+    st_nodes: np.ndarray,
+    st_weights: np.ndarray,
+    *,
+    u_batch_size: int = DEFAULT_CONDITIONAL_U_BATCH_SIZE,
+    st_batch_size: int = DEFAULT_CONDITIONAL_ST_BATCH_SIZE,
+    diagnostic: str = "",
+) -> np.ndarray:
+    """
+    Evaluate ``G(U; r)`` with the rank-2 projector determinant reduction.
+
+    This is algebraically equivalent to ``evaluate_inner_st_integrals_batched``
+    but uses 2x2 and 4x4 determinants through the matrix determinant lemma
+    instead of stacked 6x6 determinants.
+    """
+
+    U_samples = np.asarray(U_samples, dtype=float)
+    if U_samples.ndim != 2 or U_samples.shape[1] != 6:
+        raise ValueError("U_samples must have shape (n, 6).")
+    sigma = 0.5 * (np.asarray(sigma, dtype=float) + np.asarray(sigma, dtype=float).T)
+    if sigma.shape != (6, 6):
+        raise ValueError("sigma must have shape (6, 6).")
+    st_nodes = np.asarray(st_nodes, dtype=float)
+    st_weights = np.asarray(st_weights, dtype=float)
+    if st_nodes.ndim != 2 or st_nodes.shape[1] != 2:
+        raise ValueError("st_nodes must have shape (n, 2).")
+    if st_weights.shape != (len(st_nodes),):
+        raise ValueError("st_weights must have shape (len(st_nodes),).")
+
+    u_batch_size = int(u_batch_size)
+    st_batch_size = int(st_batch_size)
+    if u_batch_size <= 0 or st_batch_size <= 0:
+        raise ValueError("u_batch_size and st_batch_size must be positive.")
+
+    t_all = st_nodes[:, 0]
+    s_all = st_nodes[:, 1]
+    kernel_weights = st_weights / (4.0 * np.pi * np.power(t_all, 1.5) * np.power(s_all, 1.5))
+    values = np.empty(len(U_samples), dtype=float)
+
+    for u_start in range(0, len(U_samples), u_batch_size):
+        u_stop = min(u_start + u_batch_size, len(U_samples))
+        L0, Lr = make_cross_product_low_rank_factors_batch(U_samples[u_start:u_stop])
+        block_values = np.zeros(u_stop - u_start, dtype=float)
+        for st_start in range(0, len(st_nodes), st_batch_size):
+            st_stop = min(st_start + st_batch_size, len(st_nodes))
+            d_t0, d_0s, d_ts = gaussian_quadratic_determinants_lowrank_batch(
+                sigma,
+                L0,
+                Lr,
+                t_all[st_start:st_stop],
+                s_all[st_start:st_stop],
+                diagnostic=f"{diagnostic}, U={u_start}:{u_stop}, st={st_start}:{st_stop}",
+            )
+            F = 1.0 - d_t0 - d_0s + d_ts
+            block_values += F @ kernel_weights[st_start:st_stop]
+        values[u_start:u_stop] = block_values
+    return values
+
+
+@dataclass(frozen=True)
+class ConditionalMJDiagnostics:
+    """Diagnostics for the 6D+2D conditional M_J estimator."""
+
+    mean: float
+    stderr: float
+    sample_std: float
+    n_samp_U: int
+    n_samp_st: int
+    st_nodes_used: int
+    tau: float
+    U_sampling: str
+    st_sampling: str
+    st_transform: str
+
+
+@dataclass(frozen=True)
+class LowQAsymptoticFit:
+    """Diagnostics for the quadratic low-Q line-intensity continuation."""
+
+    Q_grid: np.ndarray
+    I_original: np.ndarray
+    I_stabilized: np.ndarray
+    I_asymptotic: np.ndarray
+    replaced_mask: np.ndarray
+    fit_mask: np.ndarray
+    I0: float
+    I2: float
+    q_fit_min: float
+    q_fit_max: float
+    q_replace_max: float
+    relative_rmse: float
+    q_resolution: float
+
+
+def estimate_MJ_conditional_with_nodes(
+    sigma: np.ndarray,
+    z_u: np.ndarray,
+    st_nodes: np.ndarray,
+    st_weights: np.ndarray,
+) -> tuple[float, float, float]:
+    """Estimate conditional ``M_J`` using reused outer samples and st nodes."""
+
+    sigma = 0.5 * (np.asarray(sigma, dtype=float) + np.asarray(sigma, dtype=float).T)
+    sigma_half = symmetric_covariance_sqrt(sigma)
+    z_u = np.asarray(z_u, dtype=float)
+    if z_u.ndim != 2 or z_u.shape[1] != 6:
+        raise ValueError("z_u must have shape (N_samp_U, 6).")
+    U_samples = z_u @ sigma_half.T
+    values = evaluate_inner_st_integrals_lowrank(
+        U_samples,
+        sigma,
+        st_nodes,
+        st_weights,
+        diagnostic="estimate_MJ_conditional_with_nodes",
+    )
+    mean = float(np.mean(values))
+    sample_std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    stderr = sample_std / np.sqrt(max(len(values), 1))
+    return mean, sample_std, stderr
+
+
+def estimate_MJ_conditional(
+    sigma: np.ndarray,
+    *,
+    N_samp_U: int,
+    N_samp_st: int,
+    U_sampling: SamplingMethod = "qmc",
+    st_sampling: STSamplingMethod = "quadrature",
+    st_transform: STTransform = "rational",
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    st_random_seed: int | None = None,
+    z_u: np.ndarray | None = None,
+    tau: float | None = None,
+    return_diagnostics: bool = False,
+) -> float | tuple[float, ConditionalMJDiagnostics]:
+    """
+    Estimate M_J with a 6D outer Gaussian average and 2D deterministic/QMC integral.
+
+    ``tau`` is the rational/logistic map scale for both positive variables.
+    If omitted, it is set to ``1/a^2`` using the average one-component
+    gradient variance ``a=trace(sigma)/6``.
+    """
+
+    sigma = 0.5 * (np.asarray(sigma, dtype=float) + np.asarray(sigma, dtype=float).T)
+    a_eff = max(float(np.trace(sigma) / 6.0), np.finfo(float).tiny)
+    if tau is None:
+        tau = 1.0 / max(a_eff * a_eff, np.finfo(float).tiny)
+    tau = float(tau)
+
+    if z_u is None:
+        z_u = standard_normal_matrix(
+            int(N_samp_U),
+            6,
+            sampling=U_sampling,
+            random_seed=random_seed,
+        )
+    else:
+        z_u = np.asarray(z_u, dtype=float)
+        if z_u.ndim != 2 or z_u.shape[1] != 6:
+            raise ValueError("z_u must have shape (N_samp_U, 6).")
+        N_samp_U = len(z_u)
+    if st_random_seed is None:
+        st_random_seed = random_seed + 1009
+    st_nodes, st_weights = make_st_nodes(
+        int(N_samp_st),
+        sampling=st_sampling,
+        transform=st_transform,
+        tau_t=tau,
+        tau_s=tau,
+        random_seed=st_random_seed,
+    )
+    mean, sample_std, stderr = estimate_MJ_conditional_with_nodes(sigma, z_u, st_nodes, st_weights)
+    diagnostics = ConditionalMJDiagnostics(
+        mean=mean,
+        stderr=stderr,
+        sample_std=sample_std,
+        n_samp_U=int(N_samp_U),
+        n_samp_st=int(N_samp_st),
+        st_nodes_used=len(st_nodes),
+        tau=tau,
+        U_sampling=str(U_sampling),
+        st_sampling=str(st_sampling),
+        st_transform=str(st_transform),
+    )
+    return (mean, diagnostics) if return_diagnostics else mean
+
+
 def compute_CL(
     r_grid: np.ndarray,
     k0: float,
-    n_samp: int,
+    n_samp: int | None = None,
     *,
     use_qmc: bool = True,
     random_seed: int = DEFAULT_RANDOM_SEED,
     progress: bool = True,
+    jacobian_method: JacobianMethod = "direct_12d",
+    N_samp_U: int | None = None,
+    N_samp_st: int = 2**8,
+    U_sampling: SamplingMethod | None = None,
+    st_sampling: STSamplingMethod = "quadrature",
+    st_transform: STTransform = "rational",
+    st_tau: float | None = None,
+    n_jobs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute M_J(r) and C_L(r) over the supplied positive r grid."""
 
-    z_u, z_v = standard_normal_samples(n_samp, use_qmc=use_qmc, random_seed=random_seed)
+    jacobian_method = str(jacobian_method).lower()
+    if N_samp_U is None:
+        if n_samp is None:
+            N_samp_U = DEFAULT_N_SAMP
+        else:
+            N_samp_U = int(n_samp)
+    elif n_samp is not None and int(n_samp) != int(N_samp_U):
+        warnings.warn(
+            "Both n_samp and N_samp_U were supplied; using N_samp_U. "
+            "n_samp is retained only as a compatibility alias.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    N_samp_U = int(N_samp_U)
+    if U_sampling is None:
+        U_sampling = "qmc" if use_qmc else "random"
+    n_jobs = max(1, int(n_jobs))
+
+    if jacobian_method == "direct_12d":
+        z_u, z_v = standard_normal_samples(N_samp_U, use_qmc=use_qmc, random_seed=random_seed)
+        st_nodes = st_weights = None
+    elif jacobian_method == "conditional_6d_2d":
+        z_u = standard_normal_matrix(N_samp_U, 6, sampling=U_sampling, random_seed=random_seed)
+        z_v = None
+        if st_tau is None:
+            a = float(k0) ** 2 / 3.0
+            st_tau = 1.0 / max(a * a, np.finfo(float).tiny)
+        st_nodes, st_weights = make_st_nodes(
+            int(N_samp_st),
+            sampling=st_sampling,
+            transform=st_transform,
+            tau_t=float(st_tau),
+            tau_s=float(st_tau),
+            random_seed=random_seed + 1009,
+        )
+    else:
+        raise ValueError("jacobian_method must be 'direct_12d' or 'conditional_6d_2d'.")
+
     m_j = np.empty_like(r_grid, dtype=float)
     t0 = time.perf_counter()
     report_every = max(1, len(r_grid) // 20)
-    for idx, r_value in enumerate(r_grid):
-        m_j[idx] = sample_MJ_for_r(float(r_value), k0, z_u, z_v)
-        if progress and ((idx + 1) % report_every == 0 or idx + 1 == len(r_grid)):
-            elapsed = time.perf_counter() - t0
-            print(f"M_J samples: {idx + 1}/{len(r_grid)} r values ({elapsed:.1f}s)")
+
+    def compute_one(r_value: float) -> float:
+        if jacobian_method == "direct_12d":
+            return sample_MJ_for_r(float(r_value), k0, z_u, z_v)
+        sigma = conditional_covariance(float(r_value), k0)
+        mean, _, _ = estimate_MJ_conditional_with_nodes(sigma, z_u, st_nodes, st_weights)
+        return mean
+
+    if n_jobs == 1:
+        iterator = ((idx, compute_one(float(r_value))) for idx, r_value in enumerate(r_grid))
+    else:
+        executor = ThreadPoolExecutor(max_workers=n_jobs)
+        iterator = enumerate(executor.map(compute_one, [float(r) for r in r_grid]))
+    try:
+        for idx, value in iterator:
+            m_j[idx] = value
+            if progress and ((idx + 1) % report_every == 0 or idx + 1 == len(r_grid)):
+                elapsed = time.perf_counter() - t0
+                print(f"M_J {jacobian_method}: {idx + 1}/{len(r_grid)} r values ({elapsed:.1f}s)")
+    finally:
+        if n_jobs != 1:
+            executor.shutdown(wait=True)
 
     g = g_mono(r_grid, k0)
     denom = 4.0 * np.pi**2 * np.maximum(1.0 - g * g, np.finfo(float).tiny)
@@ -787,24 +1518,86 @@ def compute_CL(
 def compute_CL_general(
     r_grid: np.ndarray,
     k_radii: np.ndarray,
-    n_samp: int,
+    n_samp: int | None = None,
     *,
     k_weights: np.ndarray | None = None,
     use_qmc: bool = True,
     random_seed: int = DEFAULT_RANDOM_SEED,
     progress: bool = True,
+    jacobian_method: JacobianMethod = "direct_12d",
+    N_samp_U: int | None = None,
+    N_samp_st: int = 2**8,
+    U_sampling: SamplingMethod | None = None,
+    st_sampling: STSamplingMethod = "quadrature",
+    st_transform: STTransform = "rational",
+    st_tau: float | None = None,
+    n_jobs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute M_J(r) and C_L(r) using a numerical radial k-spectrum covariance."""
 
-    z_u, z_v = standard_normal_samples(n_samp, use_qmc=use_qmc, random_seed=random_seed)
+    jacobian_method = str(jacobian_method).lower()
+    if N_samp_U is None:
+        if n_samp is None:
+            N_samp_U = DEFAULT_N_SAMP
+        else:
+            N_samp_U = int(n_samp)
+    elif n_samp is not None and int(n_samp) != int(N_samp_U):
+        warnings.warn(
+            "Both n_samp and N_samp_U were supplied; using N_samp_U. "
+            "n_samp is retained only as a compatibility alias.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    N_samp_U = int(N_samp_U)
+    if U_sampling is None:
+        U_sampling = "qmc" if use_qmc else "random"
+    n_jobs = max(1, int(n_jobs))
+
+    if jacobian_method == "direct_12d":
+        z_u, z_v = standard_normal_samples(N_samp_U, use_qmc=use_qmc, random_seed=random_seed)
+        st_nodes = st_weights = None
+    elif jacobian_method == "conditional_6d_2d":
+        z_u = standard_normal_matrix(N_samp_U, 6, sampling=U_sampling, random_seed=random_seed)
+        z_v = None
+        if st_tau is None:
+            a = gradient_variance_from_k_radii(k_radii, k_weights=k_weights)
+            st_tau = 1.0 / max(a * a, np.finfo(float).tiny)
+        st_nodes, st_weights = make_st_nodes(
+            int(N_samp_st),
+            sampling=st_sampling,
+            transform=st_transform,
+            tau_t=float(st_tau),
+            tau_s=float(st_tau),
+            random_seed=random_seed + 1009,
+        )
+    else:
+        raise ValueError("jacobian_method must be 'direct_12d' or 'conditional_6d_2d'.")
+
     m_j = np.empty_like(r_grid, dtype=float)
     t0 = time.perf_counter()
     report_every = max(1, len(r_grid) // 20)
-    for idx, r_value in enumerate(r_grid):
-        m_j[idx] = sample_MJ_for_r_general(float(r_value), k_radii, z_u, z_v, k_weights=k_weights)
-        if progress and ((idx + 1) % report_every == 0 or idx + 1 == len(r_grid)):
-            elapsed = time.perf_counter() - t0
-            print(f"M_J samples: {idx + 1}/{len(r_grid)} r values ({elapsed:.1f}s)")
+
+    def compute_one(r_value: float) -> float:
+        if jacobian_method == "direct_12d":
+            return sample_MJ_for_r_general(float(r_value), k_radii, z_u, z_v, k_weights=k_weights)
+        sigma = conditional_covariance_from_radial_spectrum(float(r_value), k_radii, k_weights=k_weights)
+        mean, _, _ = estimate_MJ_conditional_with_nodes(sigma, z_u, st_nodes, st_weights)
+        return mean
+
+    if n_jobs == 1:
+        iterator = ((idx, compute_one(float(r_value))) for idx, r_value in enumerate(r_grid))
+    else:
+        executor = ThreadPoolExecutor(max_workers=n_jobs)
+        iterator = enumerate(executor.map(compute_one, [float(r) for r in r_grid]))
+    try:
+        for idx, value in iterator:
+            m_j[idx] = value
+            if progress and ((idx + 1) % report_every == 0 or idx + 1 == len(r_grid)):
+                elapsed = time.perf_counter() - t0
+                print(f"M_J {jacobian_method}: {idx + 1}/{len(r_grid)} r values ({elapsed:.1f}s)")
+    finally:
+        if n_jobs != 1:
+            executor.shutdown(wait=True)
 
     g, _, _ = radial_covariance_numeric(r_grid, k_radii, k_weights=k_weights)
     denom = 4.0 * np.pi**2 * np.maximum(1.0 - g * g, np.finfo(float).tiny)
@@ -825,6 +1618,9 @@ def compute_coherent_transform_diagnostics(
     rho0: float,
     *,
     r_taper_start: float | None = None,
+    use_asymptotic: bool = False,
+    lowq_fit_bounds: tuple[float | None, float | None] | None = None,
+    lowq_replace_max: float | None = None,
 ) -> dict[str, np.ndarray | float]:
     """Transform full C_L with consistent background subtraction and windowing.
 
@@ -850,6 +1646,17 @@ def compute_coherent_transform_diagnostics(
     cl_transform_raw = cl_coherent
     cl_transform = cl_coherent * w_tail
     plateau = np.full_like(c_l, rho0**2)
+    i_raw = hankel_transform(r_grid, cl_transform_raw, q_grid)
+    i_windowed = hankel_transform(r_grid, cl_transform, q_grid)
+    lowq_fit = stabilize_low_q_quadratic(
+        q_grid,
+        i_windowed,
+        r_grid=r_grid,
+        r_taper_start=float(r_taper_start),
+        fit_bounds=lowq_fit_bounds,
+        q_replace_max=lowq_replace_max,
+    )
+    i_output = lowq_fit.I_stabilized if use_asymptotic else i_windowed
 
     return {
         "CL": c_l,
@@ -857,14 +1664,184 @@ def compute_coherent_transform_diagnostics(
         "CL_transform_raw": cl_transform_raw,
         "CL_transform": cl_transform,
         "w_tail": w_tail,
-        "I_coherent_raw": hankel_transform(r_grid, cl_transform_raw, q_grid),
-        "I_coherent_windowed": hankel_transform(r_grid, cl_transform, q_grid),
+        "I_coherent_raw": i_raw,
+        "I_coherent_windowed": i_output,
+        "I_coherent_windowed_original": i_windowed,
+        "I_lowQ_asymptotic": lowq_fit.I_asymptotic,
+        "I_lowQ_stabilized": lowq_fit.I_stabilized,
+        "lowQ_replaced_mask": lowq_fit.replaced_mask,
+        "lowQ_fit_mask": lowq_fit.fit_mask,
+        "lowQ_I0": lowq_fit.I0,
+        "lowQ_I2": lowq_fit.I2,
+        "lowQ_fit_min": lowq_fit.q_fit_min,
+        "lowQ_fit_max": lowq_fit.q_fit_max,
+        "lowQ_replace_max": lowq_fit.q_replace_max,
+        "lowQ_relative_rmse": lowq_fit.relative_rmse,
+        "lowQ_q_resolution": lowq_fit.q_resolution,
+        "use_asymptotic": bool(use_asymptotic),
         "I_full_windowed": hankel_transform(r_grid, c_l * w_tail, q_grid),
         "I_plateau_windowed": hankel_transform(r_grid, plateau * w_tail, q_grid),
         "rho0": rho0,
         "rho0_squared": float(rho0**2),
         "r_max": r_max,
         "r_taper_start": float(r_taper_start),
+    }
+
+
+def _fit_quadratic_low_q(q: np.ndarray, intensity: np.ndarray, mask: np.ndarray) -> tuple[float, float, float]:
+    x = q[mask] ** 2
+    y = intensity[mask]
+    if x.size < 2:
+        return (float("nan"), float("nan"), float("inf"))
+    coeff = np.polyfit(x, y, deg=1)
+    i2 = float(coeff[0])
+    i0 = float(coeff[1])
+    y_fit = i0 + i2 * x
+    denom = max(float(np.sqrt(np.mean(y * y))), np.finfo(float).tiny)
+    rel_rmse = float(np.sqrt(np.mean((y - y_fit) ** 2)) / denom)
+    return i0, i2, rel_rmse
+
+
+def stabilize_low_q_quadratic(
+    q_grid: np.ndarray,
+    intensity: np.ndarray,
+    *,
+    r_grid: np.ndarray,
+    r_taper_start: float | None = None,
+    fit_bounds: tuple[float | None, float | None] | None = None,
+    q_replace_max: float | None = None,
+    min_fit_points: int = 6,
+) -> LowQAsymptoticFit:
+    """Fit ``I(Q)=I0+I2 Q^2`` and replace the low-Q finite-window ringing.
+
+    The automatic fit avoids the least reliable finite-box modes below roughly
+    ``2*pi/r_max``. Candidate upper bounds are tested over the lowest available
+    Q range, and the window with the smallest relative quadratic residual is
+    used. Supplying ``fit_bounds`` overrides the automatic bounds.
+    """
+
+    q = np.asarray(q_grid, dtype=float)
+    i_original = np.asarray(intensity, dtype=float)
+    r = np.asarray(r_grid, dtype=float)
+    if q.shape != i_original.shape:
+        raise ValueError("q_grid and intensity must have the same shape.")
+    if q.ndim != 1 or q.size < max(3, int(min_fit_points)):
+        raise ValueError("q_grid must be one-dimensional with enough points.")
+    if np.any(q <= 0.0):
+        raise ValueError("q_grid values must be positive for low-Q fitting.")
+    if r.ndim != 1 or r.size < 2 or np.any(r <= 0.0):
+        raise ValueError("r_grid must be a positive one-dimensional grid.")
+
+    finite = np.isfinite(i_original)
+    r_max = float(np.max(r))
+    q_resolution = 2.0 * np.pi / r_max
+    if r_taper_start is not None:
+        taper_width = max(r_max - float(r_taper_start), np.finfo(float).tiny)
+        q_resolution = min(q_resolution, np.pi / taper_width)
+
+    if fit_bounds is not None:
+        q_fit_min = float(q[0] if fit_bounds[0] is None else fit_bounds[0])
+        q_fit_max = float(q[-1] if fit_bounds[1] is None else fit_bounds[1])
+        fit_mask = finite & (q >= q_fit_min) & (q <= q_fit_max)
+        if np.count_nonzero(fit_mask) < min_fit_points:
+            raise ValueError("low-Q fit_bounds select too few finite Q points.")
+        i0, i2, rel_rmse = _fit_quadratic_low_q(q, i_original, fit_mask)
+    else:
+        q_fit_min_floor = max(float(q[0]), q_resolution)
+        start_idx = int(np.searchsorted(q, q_fit_min_floor, side="left"))
+        start_idx = min(start_idx, max(0, q.size - int(min_fit_points)))
+        candidates: list[tuple[float, float, float, np.ndarray]] = []
+        max_stop = min(q.size, start_idx + max(int(min_fit_points) + 12, q.size // 3))
+        for stop in range(start_idx + int(min_fit_points), max_stop + 1):
+            mask = finite.copy()
+            mask[:start_idx] = False
+            mask[stop:] = False
+            if np.count_nonzero(mask) < min_fit_points:
+                continue
+            i0_try, i2_try, err_try = _fit_quadratic_low_q(q, i_original, mask)
+            if np.isfinite(i0_try) and np.isfinite(i2_try) and np.isfinite(err_try):
+                candidates.append((err_try, i0_try, i2_try, mask))
+        if not candidates:
+            fit_mask = finite.copy()
+            fit_mask[:start_idx] = False
+            fit_mask[start_idx + int(min_fit_points):] = False
+            i0, i2, rel_rmse = _fit_quadratic_low_q(q, i_original, fit_mask)
+        else:
+            rel_rmse, i0, i2, fit_mask = min(candidates, key=lambda item: item[0])
+        q_fit_values = q[fit_mask]
+        q_fit_min = float(q_fit_values[0])
+        q_fit_max = float(q_fit_values[-1])
+
+    i_asymptotic = i0 + i2 * q * q
+    if q_replace_max is None:
+        q_replace_max = q_fit_max
+    q_replace_max = float(q_replace_max)
+    replaced = q <= q_replace_max
+    i_stabilized = i_original.copy()
+    i_stabilized[replaced] = i_asymptotic[replaced]
+
+    return LowQAsymptoticFit(
+        Q_grid=q.copy(),
+        I_original=i_original.copy(),
+        I_stabilized=i_stabilized,
+        I_asymptotic=i_asymptotic,
+        replaced_mask=replaced,
+        fit_mask=fit_mask.copy(),
+        I0=float(i0),
+        I2=float(i2),
+        q_fit_min=float(q_fit_min),
+        q_fit_max=float(q_fit_max),
+        q_replace_max=q_replace_max,
+        relative_rmse=float(rel_rmse),
+        q_resolution=float(q_resolution),
+    )
+
+
+def line_low_q_moments_from_CL(
+    r_grid: np.ndarray,
+    c_l: np.ndarray,
+    rho0: float,
+    *,
+    window: np.ndarray | None = None,
+) -> dict[str, float | np.ndarray]:
+    """Compute direct real-space low-Q moments from ``C_L(r)-rho0^2``.
+
+    The returned coefficients correspond to
+
+    ``I0 = 4*pi int r^2 [C_L(r)-rho0^2] dr``
+
+    and
+
+    ``I2 = -(2*pi/3) int r^4 [C_L(r)-rho0^2] dr``.
+
+    A finite-r window may be supplied to match the transform window used in
+    numerical Hankel transforms.
+    """
+
+    r = np.asarray(r_grid, dtype=float)
+    c = np.asarray(c_l, dtype=float)
+    if r.shape != c.shape:
+        raise ValueError("r_grid and c_l must have the same shape.")
+    if r.ndim != 1 or r.size < 2 or np.any(r <= 0.0):
+        raise ValueError("r_grid must be a positive one-dimensional grid.")
+    coherent = c - float(rho0) ** 2
+    if window is None:
+        w = np.ones_like(r, dtype=float)
+    else:
+        w = np.asarray(window, dtype=float)
+        if w.shape != r.shape:
+            raise ValueError("window must have the same shape as r_grid.")
+    moment2_integrand = r * r * coherent * w
+    moment4_integrand = r**4 * coherent * w
+    moment2 = float(simpson(moment2_integrand, x=r))
+    moment4 = float(simpson(moment4_integrand, x=r))
+    return {
+        "I0": 4.0 * np.pi * moment2,
+        "I2": -(2.0 * np.pi / 3.0) * moment4,
+        "moment2": moment2,
+        "moment4": moment4,
+        "coherent": coherent,
+        "window": w,
     }
 
 
@@ -1347,6 +2324,345 @@ class FourFieldScanResult:
     I_cross: np.ndarray
     M_cross: np.ndarray
     pzeros_cross: np.ndarray
+
+
+@dataclass(frozen=True)
+class LineScatteringSpectrum:
+    """Minimal package for a uniform-line intensity curve used by mask models."""
+
+    Q_grid: np.ndarray
+    I_L: np.ndarray
+    rho0: float
+    mu2: float | None = None
+    k_radii: np.ndarray | None = None
+    k_weights: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class HeterogeneousLineScatteringResult:
+    """Components of the independent heterogeneous-mask line intensity."""
+
+    Q_grid: np.ndarray
+    I_h: np.ndarray
+    I_highQ: np.ndarray
+    p_H: float
+    sigma_H_squared: float
+    alpha_H: float
+    kappa_H: float
+    uniform_component: np.ndarray
+    smoothed_line_component: np.ndarray
+    mask_component: np.ndarray
+    approximation: str
+    q_max: float
+    rho0: float
+
+
+def make_line_scattering_spectrum(
+    Q_grid: np.ndarray,
+    I_L: np.ndarray,
+    rho0: float | None = None,
+    *,
+    mu2: float | None = None,
+    k_radii: np.ndarray | None = None,
+    k_weights: np.ndarray | None = None,
+) -> LineScatteringSpectrum:
+    """Create the smallest result object needed by ``heterogeneous_line_scattering``."""
+
+    if rho0 is None:
+        if mu2 is not None:
+            rho0 = float(mu2) / (3.0 * np.pi)
+        elif k_radii is not None:
+            rho0 = rho0_from_k_radii(k_radii, k_weights=k_weights)
+        else:
+            raise ValueError("rho0, mu2, or k_radii is required.")
+    if mu2 is None and k_radii is not None:
+        mu2 = 3.0 * np.pi * float(rho0)
+    return LineScatteringSpectrum(
+        Q_grid=np.asarray(Q_grid, dtype=float),
+        I_L=np.asarray(I_L, dtype=float),
+        rho0=float(rho0),
+        mu2=None if mu2 is None else float(mu2),
+        k_radii=None if k_radii is None else np.asarray(k_radii, dtype=float),
+        k_weights=None if k_weights is None else np.asarray(k_weights, dtype=float),
+    )
+
+
+def _get_line_result_value(line_result: object, names: Sequence[str]) -> object | None:
+    for name in names:
+        if isinstance(line_result, dict) and name in line_result:
+            return line_result[name]
+        try:
+            if name in line_result:  # type: ignore[operator]
+                return line_result[name]  # type: ignore[index]
+        except (TypeError, KeyError):
+            pass
+        if hasattr(line_result, name):
+            return getattr(line_result, name)
+    return None
+
+
+def _coerce_line_scattering_spectrum(line_result: object) -> LineScatteringSpectrum:
+    """Accept current dict/npz/dataclass outputs and return a uniform interface."""
+
+    if isinstance(line_result, LineScatteringSpectrum):
+        return line_result
+    if isinstance(line_result, tuple) and len(line_result) >= 3:
+        return make_line_scattering_spectrum(line_result[0], line_result[1], line_result[2])
+
+    q_grid = _get_line_result_value(line_result, ("Q_grid", "q_grid", "Q", "q"))
+    i_l = _get_line_result_value(line_result, ("I_L", "I_Q", "I_total", "I_self", "intensity"))
+    if q_grid is None or i_l is None:
+        raise ValueError("line_result must provide Q_grid/Q and I_L/I_Q/I_total.")
+
+    rho0 = _get_line_result_value(line_result, ("rho0", "line_density"))
+    mu2 = _get_line_result_value(line_result, ("mu2", "mu_2"))
+    k_radii = _get_line_result_value(line_result, ("k_radii", "k_nodes"))
+    k_weights = _get_line_result_value(line_result, ("k_weights", "weights"))
+    k0 = _get_line_result_value(line_result, ("k0", "k_eff"))
+    if rho0 is None:
+        if mu2 is not None:
+            rho0 = float(mu2) / (3.0 * np.pi)
+        elif k_radii is not None:
+            rho0 = rho0_from_k_radii(k_radii, k_weights=k_weights)
+        elif k0 is not None:
+            rho0 = float(k0) ** 2 / (3.0 * np.pi)
+        else:
+            raise ValueError("line_result must provide rho0, mu2, k_radii, or k0.")
+    return make_line_scattering_spectrum(
+        q_grid,
+        i_l,
+        float(rho0),
+        mu2=None if mu2 is None else float(mu2),
+        k_radii=None if k_radii is None else np.asarray(k_radii, dtype=float),
+        k_weights=None if k_weights is None else np.asarray(k_weights, dtype=float),
+    )
+
+
+def mask_occupancy_parameters(k_H: float, b: float) -> dict[str, float | str]:
+    """Return p_H, sigma_H^2, alpha_H, and kappa_H for the clipped mask."""
+
+    if k_H < 0.0:
+        raise ValueError("k_H must be nonnegative.")
+    p_H = float(norm.sf(float(b)))
+    sigma2 = float(p_H * (1.0 - p_H))
+    alpha = float(norm.pdf(float(b)) * float(k_H) / np.sqrt(6.0 * np.pi))
+    tiny = np.finfo(float).tiny
+    if p_H <= tiny or sigma2 <= tiny and p_H < 0.5:
+        return {"p_H": p_H, "sigma_H_squared": sigma2, "alpha_H": alpha, "kappa_H": 0.0, "state": "empty"}
+    if (1.0 - p_H) <= tiny or sigma2 <= tiny and p_H >= 0.5:
+        return {"p_H": p_H, "sigma_H_squared": sigma2, "alpha_H": alpha, "kappa_H": 0.0, "state": "full"}
+    kappa = alpha / sigma2 if alpha > 0.0 else 0.0
+    return {"p_H": p_H, "sigma_H_squared": sigma2, "alpha_H": alpha, "kappa_H": float(kappa), "state": "partial"}
+
+
+def smooth_mask_kernel(Q: np.ndarray | float, kappa_H: float) -> np.ndarray:
+    """K_H(Q)=8*pi*kappa_H/(Q^2+kappa_H^2)^2."""
+
+    Q = np.asarray(Q, dtype=float)
+    kappa_H = float(kappa_H)
+    if kappa_H <= 0.0:
+        return np.zeros_like(Q, dtype=float)
+    return 8.0 * np.pi * kappa_H / (Q * Q + kappa_H * kappa_H) ** 2
+
+
+def _validate_q_grid(q_grid: np.ndarray, i_l: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    q_grid = np.asarray(q_grid, dtype=float)
+    i_l = np.asarray(i_l, dtype=float)
+    if q_grid.shape != i_l.shape:
+        raise ValueError("Q_grid and I_L must have the same shape.")
+    if q_grid.ndim != 1:
+        raise ValueError("Q_grid and I_L must be one-dimensional.")
+    if len(q_grid) < 2:
+        raise ValueError("At least two Q samples are required.")
+    order = np.argsort(q_grid)
+    q_sorted = q_grid[order]
+    i_sorted = i_l[order]
+    if np.any(np.diff(q_sorted) <= 0.0):
+        raise ValueError("Q_grid values must be unique.")
+    if np.any(q_sorted < 0.0):
+        raise ValueError("Q_grid values must be nonnegative.")
+    return q_sorted, i_sorted
+
+
+def smoothing_operator_A(
+    Q: np.ndarray,
+    q_grid: np.ndarray,
+    I_L: np.ndarray,
+    kappa_H: float,
+    rho0: float,
+    *,
+    q_max: float | None = None,
+    refine_grid: bool = True,
+    points_per_kappa: float = 5.0,
+    max_refined_points: int = 50_000,
+) -> tuple[np.ndarray, float]:
+    """Evaluate A_kappa[I_L](Q) using the finite grid plus analytic line tail."""
+
+    Q = np.asarray(Q, dtype=float)
+    q_grid, I_L = _validate_q_grid(q_grid, I_L)
+    kappa_H = float(kappa_H)
+    rho0 = float(rho0)
+    if kappa_H <= 0.0:
+        return I_L.copy() if Q.shape == I_L.shape and np.allclose(Q, q_grid) else np.interp(Q, q_grid, I_L), float(q_grid[-1])
+    if q_max is None:
+        q_max = float(q_grid[-1])
+    q_max = float(q_max)
+    finite = q_grid <= q_max
+    if np.count_nonzero(finite) < 2:
+        raise ValueError("q_max must include at least two available I_L grid points.")
+    q_finite = q_grid[finite]
+    i_finite = I_L[finite]
+    q_cut = float(q_finite[-1])
+    if refine_grid and kappa_H > 0.0 and q_finite.size >= 2:
+        target_step = kappa_H / max(float(points_per_kappa), 1.0)
+        current_step = float(np.max(np.diff(q_finite)))
+        needed = int(np.ceil((q_cut - float(q_finite[0])) / max(target_step, np.finfo(float).tiny))) + 1
+        if current_step > target_step and needed <= int(max_refined_points):
+            q_refined = np.linspace(float(q_finite[0]), q_cut, needed)
+            i_refined = np.interp(q_refined, q_finite, i_finite)
+            q_finite = q_refined
+            i_finite = i_refined
+
+    out = np.empty_like(Q, dtype=float)
+    for idx, q_value in enumerate(Q):
+        q_value = float(q_value)
+        if np.isclose(q_value, 0.0, rtol=0.0, atol=1.0e-14):
+            # A_kappa[I_L](0) = 4*kappa/pi * int q^2 I_L(q)/(q^2+kappa^2)^2 dq.
+            integrand = q_finite * q_finite * i_finite / (q_finite * q_finite + kappa_H * kappa_H) ** 2
+            finite_part = 4.0 * kappa_H / np.pi * float(simpson(integrand, x=q_finite))
+            tail_part = 2.0 * kappa_H * rho0 / (q_cut * q_cut + kappa_H * kappa_H)
+            out[idx] = finite_part + tail_part
+            continue
+
+        # A_kappa^<[I_L](Q), evaluated only over the supplied finite q grid.
+        kernel = 1.0 / ((q_value - q_finite) ** 2 + kappa_H * kappa_H)
+        kernel -= 1.0 / ((q_value + q_finite) ** 2 + kappa_H * kappa_H)
+        finite_part = kappa_H / (np.pi * q_value) * float(simpson(q_finite * i_finite * kernel, x=q_finite))
+        # A_kappa^>(Q;Q_max), using I_L(q) ~= pi*rho0/q above q_cut.
+        tail_part = rho0 / q_value * (
+            np.arctan((q_cut + q_value) / kappa_H)
+            - np.arctan((q_cut - q_value) / kappa_H)
+        )
+        out[idx] = finite_part + tail_part
+    return out, q_cut
+
+
+def heterogeneous_highQ_intensity(
+    Q: np.ndarray,
+    rho0: float,
+    p_H: float,
+    alpha_H: float,
+    *,
+    high_q_min: float | None = None,
+) -> np.ndarray:
+    """High-Q heterogeneous asymptote, exposed separately from the smooth model."""
+
+    Q = np.asarray(Q, dtype=float)
+    if high_q_min is not None and np.any(Q < float(high_q_min)):
+        warnings.warn(
+            "heterogeneous high-Q approximation evaluated below high_q_min.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    out = np.zeros_like(Q, dtype=float)
+    positive = Q > 0.0
+    q_pos = Q[positive]
+    if q_pos.size:
+        out[positive] = (
+            np.pi * float(p_H) * float(rho0) / q_pos
+            - 2.0 * float(alpha_H) * float(rho0) / (q_pos * q_pos)
+            + 8.0 * np.pi * float(alpha_H) * float(rho0) ** 2 / (q_pos**4)
+        )
+    singular = ~positive
+    if np.any(singular) and (p_H != 0.0 or alpha_H != 0.0):
+        out[singular] = np.inf
+    return out
+
+
+def heterogeneous_line_scattering(
+    line_result: object,
+    k_H: float,
+    b: float,
+    *,
+    approximation: Literal["smooth", "highQ", "high_q"] = "smooth",
+    q_max: float | None = None,
+    high_q_min: float | None = None,
+    return_components: bool = False,
+) -> np.ndarray | HeterogeneousLineScatteringResult:
+    """Apply an independent smooth clipped mask to an existing uniform-line result."""
+
+    spectrum = _coerce_line_scattering_spectrum(line_result)
+    Q, I_L = _validate_q_grid(spectrum.Q_grid, spectrum.I_L)
+    params = mask_occupancy_parameters(float(k_H), float(b))
+    p_H = float(params["p_H"])
+    sigma2 = float(params["sigma_H_squared"])
+    alpha = float(params["alpha_H"])
+    kappa = float(params["kappa_H"])
+    state = str(params["state"])
+
+    if state == "full":
+        uniform_component = I_L.copy()
+        smoothed_component = np.zeros_like(I_L)
+        mask_component = np.zeros_like(I_L)
+        smooth_total = I_L.copy()
+        q_cut = float(Q[-1])
+    elif state == "empty":
+        uniform_component = np.zeros_like(I_L)
+        smoothed_component = np.zeros_like(I_L)
+        mask_component = np.zeros_like(I_L)
+        smooth_total = np.zeros_like(I_L)
+        q_cut = float(Q[-1])
+    else:
+        # I_h^smooth = p_H^2 I_L + sigma_H^2 A_kappa[I_L] + rho0^2 sigma_H^2 K_H.
+        A_kappa, q_cut = smoothing_operator_A(Q, Q, I_L, kappa, spectrum.rho0, q_max=q_max)
+        uniform_component = p_H * p_H * I_L
+        smoothed_component = sigma2 * A_kappa
+        mask_component = spectrum.rho0**2 * sigma2 * smooth_mask_kernel(Q, kappa)
+        smooth_total = uniform_component + smoothed_component + mask_component
+
+    approximation = str(approximation)
+    if approximation == "high_q":
+        approximation = "highQ"
+    if approximation == "smooth":
+        total = smooth_total
+    elif approximation == "highQ":
+        total = heterogeneous_highQ_intensity(
+            Q,
+            spectrum.rho0,
+            p_H,
+            alpha,
+            high_q_min=high_q_min,
+        )
+    else:
+        raise ValueError("approximation must be 'smooth' or 'highQ'.")
+
+    if not return_components:
+        return total
+    if approximation == "highQ":
+        highQ = total
+    else:
+        highQ = heterogeneous_highQ_intensity(
+            Q,
+            spectrum.rho0,
+            p_H,
+            alpha,
+            high_q_min=high_q_min,
+        )
+    return HeterogeneousLineScatteringResult(
+        Q_grid=Q,
+        I_h=total,
+        I_highQ=highQ,
+        p_H=p_H,
+        sigma_H_squared=sigma2,
+        alpha_H=alpha,
+        kappa_H=kappa,
+        uniform_component=uniform_component,
+        smoothed_line_component=smoothed_component,
+        mask_component=mask_component,
+        approximation=approximation,
+        q_max=q_cut,
+        rho0=float(spectrum.rho0),
+    )
 
 
 def make_qmc_normals(dim: int, n_samp: int, seed: int = DEFAULT_RANDOM_SEED) -> np.ndarray:
@@ -1849,6 +3165,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--Q-max", type=float, default=None)
     parser.add_argument("--NQ", type=int, default=DEFAULT_NQ)
     parser.add_argument("--N-samp", type=int, default=DEFAULT_N_SAMP)
+    parser.add_argument("--jacobian-method", choices=["direct_12d", "conditional_6d_2d"], default="direct_12d")
+    parser.add_argument("--N-samp-U", type=int, default=None)
+    parser.add_argument("--N-samp-st", type=int, default=2**8)
+    parser.add_argument("--U-sampling", choices=["qmc", "random"], default=None)
+    parser.add_argument("--st-sampling", choices=["quadrature", "qmc"], default="quadrature")
+    parser.add_argument("--st-transform", choices=["rational", "logistic"], default="rational")
+    parser.add_argument("--st-tau", type=float, default=None)
+    parser.add_argument("--n-jobs", type=int, default=1)
     parser.add_argument("--no-qmc", action="store_true")
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
@@ -1918,6 +3242,14 @@ def main() -> None:
         use_qmc=not args.no_qmc,
         random_seed=int(args.seed),
         progress=not args.quiet,
+        jacobian_method=args.jacobian_method,
+        N_samp_U=args.N_samp_U,
+        N_samp_st=int(args.N_samp_st),
+        U_sampling=args.U_sampling,
+        st_sampling=args.st_sampling,
+        st_transform=args.st_transform,
+        st_tau=args.st_tau,
+        n_jobs=int(args.n_jobs),
     )
     use_singular_split = not args.no_singular_split
     r_taper_start = 0.75 * r_max if args.tail_start is None else float(args.tail_start)
@@ -1990,6 +3322,14 @@ def main() -> None:
         Q_max=q_max,
         NQ=int(args.NQ),
         N_samp=int(args.N_samp),
+        jacobian_method=args.jacobian_method,
+        N_samp_U=-1 if args.N_samp_U is None else int(args.N_samp_U),
+        N_samp_st=int(args.N_samp_st),
+        U_sampling="" if args.U_sampling is None else args.U_sampling,
+        st_sampling=args.st_sampling,
+        st_transform=args.st_transform,
+        st_tau=np.nan if args.st_tau is None else float(args.st_tau),
+        n_jobs=int(args.n_jobs),
         use_qmc=not args.no_qmc,
         random_seed=int(args.seed),
         subtract_background=True,

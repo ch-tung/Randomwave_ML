@@ -303,3 +303,267 @@ identical in the current notebook, `I_total = 2*I_AA + 2*I_AB`. The notebook
 plots `I_AA`, `I_AB`, and `I_total` for each selected `(rho13, rho24)` pair,
 and overlays the self-only total reference `2*I_AA` as a black dashed curve on
 the total panels.
+
+## Conditional 6D+2D Jacobian Estimator
+
+Added a selectable estimator for the two-field self-correlation Jacobian
+average `M_J(r)`.
+
+The original estimator remains available as:
+
+```python
+jacobian_method = "direct_12d"
+```
+
+It samples two independent 6D conditional gradient vectors directly and
+estimates:
+
+```python
+M_J(r) = E[|u_0 x v_0| |u_r x v_r|]
+```
+
+The new estimator is:
+
+```python
+jacobian_method = "conditional_6d_2d"
+```
+
+It samples only the outer 6D vector `U=[u_0,u_r]` and evaluates the Gaussian
+average over `V=[v_0,v_r]` through the square-root Laplace representation. For
+fixed `U`, the code forms:
+
+```python
+K(u) = |u|^2 I - u u.T
+A0 = blockdiag(K(u_0), 0)
+Ar = blockdiag(0, K(u_r))
+```
+
+and computes the deterministic auxiliary integral over positive `t,s` using:
+
+```python
+D(t,s) = det(I + 2 Sigma_half (t*A0 + s*Ar) Sigma_half)^(-1/2)
+F(t,s) = 1 - D(t,0) - D(0,s) + D(t,s)
+```
+
+The positive quadrant is mapped from the unit square by default with:
+
+```python
+t = tau*x/(1-x)
+s = tau*y/(1-y)
+```
+
+where `tau` is chosen from the covariance scale unless supplied internally.
+The determinant path uses `slogdet`, symmetrizes the 6x6 matrix, and raises a
+diagnostic error if the matrix is materially indefinite.
+
+The first implementation evaluated the inner integral with scalar Python loops:
+one `slogdet` triplet for every `(U,t,s)` combination. This was correct but
+slow. The conditional path now batches the determinant work:
+
+```python
+evaluate_inner_st_integrals_batched(...)
+```
+
+This broadcasts a chunk of outer `U` samples against a chunk of `t,s` nodes and
+uses NumPy's stacked `slogdet` on arrays of 6x6 matrices. The scalar
+`evaluate_inner_st_integral(...)` remains as a readable reference/debug path.
+A small sanity benchmark with `64` outer samples and about `64` inner nodes gave
+identical values to roundoff and about a `3.8x` speedup for the inner integral.
+The conditional estimator can still be slower than `direct_12d` for large scans,
+because it pays the full `N_samp_U*N_samp_st` determinant cost.
+
+The default conditional path was further optimized with the matrix determinant
+lemma. Since each cross-product quadratic form is rank 2,
+
+```python
+A0 = L0 @ L0.T
+Ar = Lr @ Lr.T
+```
+
+the determinant
+
+```python
+det(I + 2*Sigma_half @ (t*A0+s*Ar) @ Sigma_half)
+```
+
+is evaluated in the low-rank column space:
+
+```python
+det(I + 2*X.T @ Sigma @ X)
+X = [sqrt(t)*L0, sqrt(s)*Lr]
+```
+
+This reduces the mixed determinant from 6x6 to 4x4, and the one-sided
+determinants to 2x2. The full 6x6 batched path remains available as
+`evaluate_inner_st_integrals_batched(...)`; the default estimator uses
+`evaluate_inner_st_integrals_lowrank(...)`. A local check with `64` outer
+samples and about `64` inner nodes matched the scalar 6x6 reference to
+`~1.5e-15`, with the low-rank path about `5.5x` faster than batched 6x6 and
+about `80x` faster than the original scalar loop for that inner-integral test.
+
+For long `r_grid` scans, `compute_CL(...)` and `compute_CL_general(...)` now
+reuse the same outer standard-normal samples and the same positive-quadrant
+`t,s` nodes across all `r` values. The shared map scale defaults to
+`st_tau=1/a**2`, with `a=k0**2/3` for the monochromatic model and
+`a=<k**2>/3` for a radial spectrum. A custom `st_tau` can be supplied if a
+specific quadrature map scale is desired. The functions also accept `n_jobs`;
+values above one use a thread pool over `r` values. This is intentionally
+thread-based rather than process-based to avoid repeatedly copying large QMC
+arrays on Windows. A smoke check gave identical serial/threaded results for the
+conditional estimator.
+
+Public controls added to `compute_CL(...)` and `compute_CL_general(...)`:
+
+```python
+jacobian_method = "direct_12d" | "conditional_6d_2d"
+N_samp_U
+N_samp_st
+U_sampling = "qmc" | "random"
+st_sampling = "quadrature" | "qmc"
+st_transform = "rational" | "logistic"
+st_tau
+n_jobs
+```
+
+The old positional `n_samp` remains a compatibility alias for `N_samp_U`; if
+both are supplied inconsistently, a deprecation warning is issued and
+`N_samp_U` wins.
+
+The existing notebooks `rw_line_scattering_demo.ipynb` and
+`rw_line_general.ipynb` now expose these controls while defaulting to
+`direct_12d`, preserving previous behavior.
+
+Added `rw_line_mj_qmc_efficiency_benchmark.ipynb` to compare the old direct
+12D QMC estimator against the conditional 6D+2D estimator. The benchmark
+reports:
+
+- sample budgets (`N_samp_U`, `N_samp_st`);
+- wall time;
+- `M_J(r)` at representative separations;
+- absolute and relative error against a high-sample direct reference;
+- error versus runtime plots;
+- a log-log fit to the direct-sampling walltime/error scaling line, with each
+  conditional estimator point reported as a ratio relative to that fitted
+  direct baseline at the same wall time.
+
+The benchmark intentionally does not assume the conditional method is faster;
+it measures the full cost, including the two-dimensional auxiliary integral.
+It now uses the same full `r` and `Q` ranges as `rw_line_scattering_demo.ipynb`
+by default (`r in [2e-3/k0, 5e2/k0]`, `Nr=5000`, `Q/k0 in [0.1, 20]`,
+`NQ=1001`) and times the full path:
+
+```python
+M_J(r) -> C_L(r) -> coherent/windowed I(Q)
+```
+
+The main efficiency score is the relative L2 error of the coherent real-space
+correlation `C_L-rho0^2` against the high-sample direct reference. The final
+`I(Q)` error is still printed as a secondary end-to-end transform diagnostic.
+
+## 2026-06-23 Heterogeneous Mask Demo Notebook Updates
+
+- Updated `rw_hetero_demo.ipynb` so the notebook is the main control surface
+  for the heterogeneous-mask examples.
+- Removed the redundant `Selected Full Curve` block.
+- Set the main demo parameter block to `r_sigma_k = 0.2`.
+- Kept the lower `Quick View` decomposition plot, now selecting
+  `k_H/<k> = 0.1` and `b = -1`, with a printed status line showing the active
+  `k_H/<k>`, `b`, and `r_sigma_k`.
+- Added a status-printing spectrum-width scan that fixes `k_H/<k> = 0.1` and
+  `b = -1`, then recomputes the full uniform-line workflow for
+  `r_sigma_k = 0.5, 0.2, 0.1`.
+- Added a status-printing clipping-level scan that fixes `k_H/<k> = 0.1` and
+  `r_sigma_k = 0.2`, then scans `b = -2, -1, 0` while plotting the three
+  smooth-model components separately.
+- Preserved the existing mean-`k` Q-axis convention and the enlarged real-space
+  grid (`r_max_factor = 600`, `Nr = 5000`) used for the `Q/<k> = 0.05..20`
+  evaluation window.
+- The smoothed-line contribution continues to use the refined-grid
+  `smoothing_operator_A(...)` path with `q_max = max(Q_grid)`, avoiding the
+  earlier numerical splice artifact near `Q/<k> ~ 10`.
+- Reorganized `rw_hetero_demo.py` so it contains reusable notebook/tool
+  functions only. Demo parameter choices such as `K_H_OVER_K_VALUES`,
+  `B_VALUES`, spectrum settings, grid sizes, and output path are now declared
+  explicitly in `rw_hetero_demo.ipynb` and passed into the helper functions.
+- Removed the script-style `main()`/CLI wrapper and hidden module defaults from
+  `rw_hetero_demo.py`; the heterogeneous physics kernels remain in
+  `rw_line_scattering.py`, while the demo module handles notebook-facing
+  orchestration, plotting, and table/report export.
+
+## 2026-06-25 Heterogeneous Demo Call Organization
+
+- Added `evaluate_heterogeneous_case(...)` in `rw_hetero_demo.py` so notebook
+  quick views and grid evaluations share the same single-case call path.
+- Updated `evaluate_heterogeneous_grid(...)` to accept either scalar or
+  one-dimensional sequence inputs for `k_h_over_k_values` and `b_values`.
+- Updated `rw_hetero_demo.ipynb` so the quick view evaluates one explicit case
+  (`k_H/<k> = 0.10`, `b = -1`) instead of selecting from the saved grid.
+- Set the notebook grid parameters explicitly to
+  `K_H_OVER_K_VALUES = (0.10, 0.05)` and `B_VALUES = (-1.0, 0.0)`.
+- Replaced direct heterogeneous calls in the scan section with
+  `demo.evaluate_heterogeneous_case(...)` for a more coherent workflow.
+- Repaired the joint `r_sigma_k`/`b` scan section in `rw_hetero_demo.ipynb`:
+  scan parameters are now declared in the main parameter block, the scan data
+  cell actually constructs `sigma_b_scan_results`, and both plot cells guard
+  against being run before the scan data cell.
+- Added a local static notebook-order check and fake-data execution check for
+  the scan plot cells after the repair.
+
+## 2026-06-25 Low-Q Asymptotic Line-Scattering Stabilization
+
+- Added `LowQAsymptoticFit` diagnostics and `stabilize_low_q_quadratic(...)`
+  to `rw_line_scattering.py`.
+- Extended `compute_coherent_transform_diagnostics(...)` with
+  `use_asymptotic`, `lowq_fit_bounds`, and `lowq_replace_max` options.
+  With `use_asymptotic=True`, the returned `I_coherent_windowed` uses the
+  fitted low-`Q` form `I(Q)=I0+I2 Q^2` in the selected replacement range while
+  retaining the original finite-window transform outside that range.
+- The automatic fit skips modes below the finite-`r_max` resolution estimate
+  and chooses a low-`Q` quadratic window by minimizing the relative residual;
+  explicit fit and replacement bounds can still be supplied by the caller.
+- Threaded `use_asymptotic` through `rw_hetero_demo.compute_uniform_line_scattering`
+  and attached the low-`Q` fit diagnostics to the returned line result.
+- Added `rw_line_asymp.ipynb`, reusing the `rw_line_general.ipynb` parameter
+  convention while computing its own `C_L(r)` and transforms inside the
+  notebook, to compare the original finite-window transform with the low-`Q`
+  stitched result.
+- Added direct real-space moment reporting through
+  `line_low_q_moments_from_CL(...)`, with a notebook note that these moments
+  are sensitive tail-convergence diagnostics because the integrands are
+  weighted by `r^2` and `r^4`.
+- Updated `rw_line_asymp.ipynb` to compute a separate
+  `N_samp_ref = 2**16` reference curve. The low-`Q` quadratic fit remains based
+  only on the lower-count `N_samp` calculation, while the reference is plotted
+  as a black comparison line and used for relative-error plots with and without
+  the low-`Q` fit.
+
+## 2026-06-25 Heterogeneous Demo Low-Q Stitch Integration
+
+- Extended `rw_hetero_demo.compute_uniform_line_scattering(...)` with
+  `lowq_fit_bounds_over_k` and `lowq_replace_max_over_k`, so notebook fit and
+  replacement ranges can be specified in the same `Q/<k>` convention used by
+  the plots.
+- The returned uniform-line result now keeps both the stitched `I_L` and the
+  raw finite-window `I_L_original`, plus low-`Q` fit masks and diagnostics.
+- Updated `rw_hetero_demo.ipynb` with explicit low-`Q stitch controls:
+  `use_lowq_stitch`, `lowq_fit_min_over_k`, `lowq_fit_max_over_k`, and
+  `lowq_replace_max_over_k`.
+- The main heterogeneous calculation and the `r_sigma_k`/`b` scans now pass
+  the same stitch settings into the uniform-line calculation before applying
+  the heterogeneous mask layer.
+
+## 2026-06-25 Heterogeneous Demo Parameter And Import Cleanup
+
+- Standardized the random-line scattering module alias to
+  `import rw_line_scattering as rls` in `rw_hetero_demo.py` and
+  `rw_hetero_demo.ipynb`.
+- Reorganized the `rw_hetero_demo.ipynb` parameter block into labeled sections:
+  line-wave spectrum, saved heterogeneous grid, Quick View case, joint scan
+  settings, output location, nonuniform real-space grid, Q grid,
+  conditional-Jacobian sampling, and low-`Q` stitch controls.
+- Clarified which parameters drive the saved demo grid versus the Quick View
+  and scanned calculations, using `QUICK_*` and `SCAN_*` names for those
+  notebook-only workflows.
+- Exposed the mixed nonuniform real-space grid settings explicitly in the
+  notebook parameter block: `r_grid_mode`, `r_min_factor`, `r_split_factor`,
+  `r_max_factor`, `Nr`, and `Nr_small`.
