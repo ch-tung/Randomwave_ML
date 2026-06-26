@@ -510,6 +510,7 @@ def evaluate_heterogeneous_line_guess(
     parameters: Mapping[str, float],
     model_settings: Mapping[str, float | int | str | bool | None] | None = None,
     log_error_floor: float = 0.04,
+    regression_loss: str | None = None,
 ) -> HeterogeneousFitResult:
     """Evaluate one heterogeneous-line trial and solve only the scale factor."""
 
@@ -569,12 +570,23 @@ def evaluate_heterogeneous_line_guess(
     hetero = rls.heterogeneous_line_scattering(line, k_H=k_h, b=b, return_components=True)
     raw = np.interp(np.log(q_obs), np.log(hetero.Q_grid), hetero.I_h)
     raw = np.maximum(raw, np.finfo(float).tiny)
-    err_log = np.maximum(e_obs / np.maximum(i_obs, np.finfo(float).tiny), float(log_error_floor))
-    weights = 1.0 / (err_log * err_log)
-    log_scale = float(np.sum(weights * (np.log(i_obs) - np.log(raw))) / np.sum(weights))
-    scale = float(np.exp(log_scale))
-    model = scale * raw
-    residual = (np.log(model) - np.log(i_obs)) / err_log
+    loss_mode = str(regression_loss or model_settings.get("regression_loss", "log")).lower()
+    if loss_mode == "relative":
+        err_abs = np.maximum(e_obs, float(log_error_floor) * np.maximum(np.abs(i_obs), np.finfo(float).tiny))
+        weights = 1.0 / (err_abs * err_abs)
+        scale = float(np.sum(weights * raw * i_obs) / max(np.sum(weights * raw * raw), np.finfo(float).tiny))
+        scale = max(scale, np.finfo(float).tiny)
+        model = scale * raw
+        residual = (model - i_obs) / err_abs
+    elif loss_mode == "log":
+        err_log = np.maximum(e_obs / np.maximum(i_obs, np.finfo(float).tiny), float(log_error_floor))
+        weights = 1.0 / (err_log * err_log)
+        log_scale = float(np.sum(weights * (np.log(i_obs) - np.log(raw))) / np.sum(weights))
+        scale = float(np.exp(log_scale))
+        model = scale * raw
+        residual = (np.log(model) - np.log(i_obs)) / err_log
+    else:
+        raise ValueError("regression_loss must be 'relative' or 'log'.")
     params = {
         "scale": scale,
         "mean_k": mean_k,
@@ -617,6 +629,7 @@ def fit_heterogeneous_line_least_squares(
     max_nfev: int = 12,
     anchor_weight: float = 2.0,
     log_error_floor: float = 0.03,
+    regression_loss: str | None = None,
     verbose: int = 0,
 ) -> HeterogeneousFitResult:
     """Constrained first-pass fit of the smooth heterogeneous-line model.
@@ -624,7 +637,8 @@ def fit_heterogeneous_line_least_squares(
     The nonlinear search uses four active parameters: ``mean_k``,
     ``r_sigma_k``, ``k_H_over_k``, and ``b``. The overall scale is solved at
     each trial by weighted log-amplitude matching, then high- and low-Q anchor
-    residuals are added as soft constraints.
+    residuals are added as soft constraints. Set ``regression_loss="relative"``
+    to fit exact relative residuals instead of log residuals.
     """
 
     rls = _import_line_scattering()
@@ -700,14 +714,25 @@ def fit_heterogeneous_line_least_squares(
         cache[key] = (model_grid, line, hetero)
         return cache[key]
 
+    loss_mode = str(regression_loss or model_settings.get("regression_loss", "log")).lower()
+    if loss_mode not in {"relative", "log"}:
+        raise ValueError("regression_loss must be 'relative' or 'log'.")
+
     def scaled_model_and_residual(params: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         raw, line, hetero = evaluate_raw(params)
         raw = np.maximum(raw, np.finfo(float).tiny)
-        err_log = np.maximum(e_obs / np.maximum(i_obs, np.finfo(float).tiny), float(log_error_floor))
-        weights = 1.0 / (err_log * err_log)
-        log_scale = float(np.sum(weights * (np.log(i_obs) - np.log(raw))) / np.sum(weights))
-        scale = float(np.exp(log_scale))
-        residual = (np.log(scale * raw) - np.log(i_obs)) / err_log
+        if loss_mode == "relative":
+            err_abs = np.maximum(e_obs, float(log_error_floor) * np.maximum(np.abs(i_obs), np.finfo(float).tiny))
+            weights = 1.0 / (err_abs * err_abs)
+            scale = float(np.sum(weights * raw * i_obs) / max(np.sum(weights * raw * raw), np.finfo(float).tiny))
+            scale = max(scale, np.finfo(float).tiny)
+            residual = (scale * raw - i_obs) / err_abs
+        else:
+            err_log = np.maximum(e_obs / np.maximum(i_obs, np.finfo(float).tiny), float(log_error_floor))
+            weights = 1.0 / (err_log * err_log)
+            log_scale = float(np.sum(weights * (np.log(i_obs) - np.log(raw))) / np.sum(weights))
+            scale = float(np.exp(log_scale))
+            residual = (np.log(scale * raw) - np.log(i_obs)) / err_log
         anchor_residuals: list[float] = []
         if highq_coefficient_anchor is not None:
             p_h = float(hetero.p_H)
