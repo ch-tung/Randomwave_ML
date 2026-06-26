@@ -27,6 +27,7 @@ if __name__ == "__main__":
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import simpson
+from scipy.stats import gamma as gamma_dist
 from scipy.stats import norm, qmc
 
 
@@ -81,7 +82,7 @@ SMALL_X = 1.0e-4
 DEFAULT_RADIAL_CHUNK_SIZE = 256
 DEFAULT_CONDITIONAL_U_BATCH_SIZE = 64
 DEFAULT_CONDITIONAL_ST_BATCH_SIZE = 256
-KDistribution = Literal["single_shell", "gaussian_radial", "uniform_band"]
+KDistribution = Literal["single_shell", "gaussian_radial", "gamma_radial", "uniform_band"]
 JacobianMethod = Literal["direct_12d", "conditional_6d_2d"]
 SamplingMethod = Literal["qmc", "random"]
 STSamplingMethod = Literal["quadrature", "qmc"]
@@ -163,6 +164,23 @@ def _positive_gaussian_radii_from_unit(
     return float(k0) + float(sigma_k) * norm.ppf(u)
 
 
+def _gamma_radii_from_unit(
+    u: np.ndarray,
+    k0: float,
+    sigma_k: float,
+) -> np.ndarray:
+    mean = float(k0)
+    sigma = float(sigma_k)
+    if mean <= 0.0:
+        raise ValueError("k0 must be positive for gamma_radial.")
+    if sigma <= 0.0:
+        raise ValueError("sigma_k must be positive for gamma_radial.")
+    shape = (mean / sigma) ** 2
+    scale = sigma * sigma / mean
+    u = np.clip(np.asarray(u, dtype=float), 1.0e-12, 1.0 - 1.0e-12)
+    return gamma_dist.ppf(u, a=shape, scale=scale)
+
+
 def sample_k_vectors(
     count: int,
     distribution: KDistribution,
@@ -196,6 +214,22 @@ def sample_k_vectors(
             while np.any(radii <= 0.0):
                 bad = radii <= 0.0
                 radii[bad] = rng.normal(float(k0), float(sigma_k), size=np.count_nonzero(bad))
+    elif distribution == "gamma_radial":
+        if sigma_k is None:
+            sigma_k = 0.15 * float(k0)
+        if use_qmc:
+            u = _sobol_points(count, 3, qmc_seed)[:, 2]
+            radii = _gamma_radii_from_unit(u, float(k0), float(sigma_k))
+        else:
+            mean = float(k0)
+            sigma = float(sigma_k)
+            if mean <= 0.0:
+                raise ValueError("k0 must be positive for gamma_radial.")
+            if sigma <= 0.0:
+                raise ValueError("sigma_k must be positive for gamma_radial.")
+            shape = (mean / sigma) ** 2
+            scale = sigma * sigma / mean
+            radii = rng.gamma(shape, scale, size=count)
     elif distribution == "uniform_band":
         if k_min is None:
             k_min = 0.7 * float(k0)
@@ -237,6 +271,10 @@ def make_radial_k_quadrature(
         if sigma_k <= 0.0:
             raise ValueError("sigma_k must be positive for gaussian_radial.")
         return _positive_gaussian_radii_from_unit(u, float(k0), float(sigma_k)), weights
+    if distribution == "gamma_radial":
+        if sigma_k is None:
+            sigma_k = 0.15 * float(k0)
+        return _gamma_radii_from_unit(u, float(k0), float(sigma_k)), weights
     if distribution == "uniform_band":
         if k_min is None:
             k_min = 0.7 * float(k0)
@@ -3426,7 +3464,7 @@ def save_four_field_scan_outputs(result: FourFieldScanResult, output_dir: str | 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--k0", type=float, default=DEFAULT_K0)
-    parser.add_argument("--k-distribution", choices=["single_shell", "gaussian_radial", "uniform_band"], default="single_shell")
+    parser.add_argument("--k-distribution", choices=["single_shell", "gaussian_radial", "gamma_radial", "uniform_band"], default="single_shell")
     parser.add_argument("--num-modes", type=int, default=4096)
     parser.add_argument("--r-sigma-k", type=float, default=0.15)
     parser.add_argument("--r-k-min", type=float, default=0.7)
