@@ -805,6 +805,8 @@ class HeterogeneousPreview:
     mask_threshold: float
     p_H: float
     k_line: float
+    k_distribution: str
+    r_sigma_k: float
     k_H: float
     lateral_size: float
     thickness: float
@@ -822,6 +824,29 @@ def sample_isotropic_k_vectors(num_modes: int, k0: float, rng: np.random.Generat
     directions = rng.normal(size=(num_modes, 3))
     directions /= np.linalg.norm(directions, axis=1)[:, None]
     return float(k0) * directions
+
+
+def sample_preview_k_vectors(
+    num_modes: int,
+    k0: float,
+    rng: np.random.Generator,
+    *,
+    k_distribution: str = "single_shell",
+    r_sigma_k: float = 0.0,
+    random_seed: int = 12345,
+) -> np.ndarray:
+    if k_distribution == "single_shell":
+        return sample_isotropic_k_vectors(num_modes, k0, rng)
+    rls = _import_line_scattering()
+    return rls.sample_k_vectors(
+        int(num_modes),
+        k_distribution,
+        rng,
+        k0=float(k0),
+        sigma_k=float(r_sigma_k) * float(k0),
+        use_qmc=False,
+        qmc_seed=int(random_seed),
+    )
 
 
 def random_wave_field(
@@ -1068,6 +1093,8 @@ def render_fit_heterogeneous_preview(
     *,
     output_path: str | Path | None = None,
     visual_k_line: float = 10.0,
+    line_k_distribution: str = "single_shell",
+    line_r_sigma_k: float | None = None,
     random_seed: int = 12345,
     num_line_modes: int = 128,
     nx: int = 160,
@@ -1104,6 +1131,11 @@ def render_fit_heterogeneous_preview(
     k_h_over_k = float(fit_parameters["k_H_over_k"])
     p_H = float(fit_parameters.get("p_H", 1.0))
     k_line = float(visual_k_line)
+    r_sigma_k = (
+        float(fit_parameters.get("r_sigma_k", 0.15))
+        if line_r_sigma_k is None
+        else float(line_r_sigma_k)
+    )
     k_H = max(k_h_over_k * k_line, np.finfo(float).eps)
     xi_dab = 1.0 / k_H
     lateral_size = float(lateral_size_over_mask_length) / k_H
@@ -1112,7 +1144,14 @@ def render_fit_heterogeneous_preview(
     rng = np.random.default_rng(random_seed)
     x, y, z, X, Y, Z = make_coordinates(nx, ny, nz, lateral_size, lateral_size, thickness)
     spacing = (x[1] - x[0], y[1] - y[0], z[1] - z[0])
-    k_vectors = sample_isotropic_k_vectors(num_line_modes, k_line, rng)
+    k_vectors = sample_preview_k_vectors(
+        num_line_modes,
+        k_line,
+        rng,
+        k_distribution=str(line_k_distribution),
+        r_sigma_k=r_sigma_k,
+        random_seed=random_seed,
+    )
     phi_real = random_wave_field(X, Y, Z, k_vectors, rng)
     phi_imag = random_wave_field(X, Y, Z, k_vectors, rng)
     mask_field = dab_filtered_gaussian_field((nx, ny, nz), spacing, xi_dab, rng)
@@ -1241,6 +1280,8 @@ def render_fit_heterogeneous_preview(
         mask_threshold=mask_threshold,
         p_H=p_H,
         k_line=k_line,
+        k_distribution=str(line_k_distribution),
+        r_sigma_k=r_sigma_k,
         k_H=k_H,
         lateral_size=lateral_size,
         thickness=thickness,
