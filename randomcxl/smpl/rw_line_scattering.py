@@ -40,6 +40,43 @@ DEFAULT_NQ = 300
 DEFAULT_N_SAMP = 2**14
 DEFAULT_RANDOM_SEED = 12345
 DEFAULT_OUTPUT_DIR = "smpl/rw_line_scattering_output"
+DEFAULT_HETERO_K_DISTRIBUTION = "gaussian_radial"
+DEFAULT_HETERO_NUM_MODES_K = 2**10
+DEFAULT_HETERO_K_SAMPLING = "qmc"
+DEFAULT_HETERO_R_GRID_MODE = "mixed"
+DEFAULT_HETERO_R_MIN_FACTOR = 1.0e-3
+DEFAULT_HETERO_R_SPLIT_FACTOR = 5.0
+DEFAULT_HETERO_R_MAX_FACTOR = 250.0
+DEFAULT_HETERO_NR = 5000
+DEFAULT_HETERO_NR_SMALL = 1200
+DEFAULT_HETERO_TAIL_START_FRACTION = 0.8
+DEFAULT_HETERO_N_SAMP = 2**14
+DEFAULT_HETERO_N_SAMP_ST = 2**8
+DEFAULT_HETERO_USE_QMC = True
+DEFAULT_HETERO_JACOBIAN_METHOD = "direct_12d"
+DEFAULT_HETERO_USE_ASYMPTOTIC = True
+DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF = (0.35, 0.8)
+DEFAULT_HETERO_LOWQ_REPLACE_MAX_OVER_K_EFF = 0.5
+DEFAULT_HETERO_LINE_SCATTERING_SETTINGS = {
+    "k_distribution": DEFAULT_HETERO_K_DISTRIBUTION,
+    "num_modes_k": DEFAULT_HETERO_NUM_MODES_K,
+    "k_sampling": DEFAULT_HETERO_K_SAMPLING,
+    "r_grid_mode": DEFAULT_HETERO_R_GRID_MODE,
+    "r_min_factor": DEFAULT_HETERO_R_MIN_FACTOR,
+    "r_split_factor": DEFAULT_HETERO_R_SPLIT_FACTOR,
+    "r_max_factor": DEFAULT_HETERO_R_MAX_FACTOR,
+    "Nr": DEFAULT_HETERO_NR,
+    "Nr_small": DEFAULT_HETERO_NR_SMALL,
+    "tail_start_fraction": DEFAULT_HETERO_TAIL_START_FRACTION,
+    "N_samp": DEFAULT_HETERO_N_SAMP,
+    "N_samp_U": DEFAULT_HETERO_N_SAMP,
+    "N_samp_st": DEFAULT_HETERO_N_SAMP_ST,
+    "use_qmc": DEFAULT_HETERO_USE_QMC,
+    "jacobian_method": DEFAULT_HETERO_JACOBIAN_METHOD,
+    "use_asymptotic": DEFAULT_HETERO_USE_ASYMPTOTIC,
+    "lowq_fit_bounds_over_k_eff": DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF,
+    "lowq_replace_max_over_k_eff": DEFAULT_HETERO_LOWQ_REPLACE_MAX_OVER_K_EFF,
+}
 SMALL_X = 1.0e-4
 DEFAULT_RADIAL_CHUNK_SIZE = 256
 DEFAULT_CONDITIONAL_U_BATCH_SIZE = 64
@@ -2387,6 +2424,208 @@ def make_line_scattering_spectrum(
     )
 
 
+def make_radial_line_spectrum(
+    *,
+    k0_nominal: float,
+    r_sigma_k: float,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    k_distribution: KDistribution = DEFAULT_HETERO_K_DISTRIBUTION,  # type: ignore[assignment]
+    num_modes_k: int = DEFAULT_HETERO_NUM_MODES_K,
+    k_sampling: Literal["qmc", "random", "quadrature"] = DEFAULT_HETERO_K_SAMPLING,  # type: ignore[assignment]
+) -> tuple[np.ndarray, np.ndarray | None, dict[str, float | str]]:
+    """Construct a radial line-wave spectrum and its basic moment metadata."""
+
+    if k_sampling == "quadrature":
+        k_radii, k_weights = make_radial_k_quadrature(
+            int(num_modes_k),
+            k_distribution,
+            k0=float(k0_nominal),
+            sigma_k=float(r_sigma_k) * float(k0_nominal),
+        )
+    elif k_sampling in {"qmc", "random"}:
+        k_rng = np.random.default_rng(int(random_seed))
+        k_sets = make_field_k_sets(
+            int(num_modes_k),
+            k_distribution,
+            k_rng,
+            k0=float(k0_nominal),
+            r_sigma_k=float(r_sigma_k),
+            shared_k_vectors=True,
+            use_qmc_k=(k_sampling == "qmc"),
+            qmc_seed=int(random_seed),
+        )
+        k_radii = k_radii_from_vectors(k_sets.psi1)
+        k_weights = None
+    else:
+        raise ValueError("k_sampling must be 'qmc', 'random', or 'quadrature'.")
+
+    a = gradient_variance_from_k_radii(k_radii, k_weights=k_weights)
+    rho0 = a / np.pi
+    mu2 = 3.0 * a
+    k_eff = float(np.sqrt(mu2))
+    k_mean = float(np.mean(k_radii) if k_weights is None else np.dot(k_weights, k_radii))
+    k_std = float(
+        np.std(k_radii)
+        if k_weights is None
+        else np.sqrt(np.dot(k_weights, (k_radii - k_mean) ** 2))
+    )
+    meta = {
+        "k0_nominal": float(k0_nominal),
+        "k_distribution": str(k_distribution),
+        "num_modes_k": int(num_modes_k),
+        "r_sigma_k": float(r_sigma_k),
+        "random_seed": int(random_seed),
+        "k_sampling": str(k_sampling),
+        "k_eff": k_eff,
+        "k_mean": k_mean,
+        "k_std": k_std,
+        "mu2": float(mu2),
+        "rho0": float(rho0),
+        "a": float(a),
+    }
+    return k_radii, k_weights, meta
+
+
+def compute_uniform_line_scattering(
+    *,
+    k0_nominal: float = DEFAULT_K0,
+    r_sigma_k: float,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    k_distribution: KDistribution = DEFAULT_HETERO_K_DISTRIBUTION,  # type: ignore[assignment]
+    num_modes_k: int = DEFAULT_HETERO_NUM_MODES_K,
+    k_sampling: Literal["qmc", "random", "quadrature"] = DEFAULT_HETERO_K_SAMPLING,  # type: ignore[assignment]
+    Nr: int = DEFAULT_HETERO_NR,
+    NQ: int = 256,
+    r_min_factor: float = DEFAULT_HETERO_R_MIN_FACTOR,
+    r_max_factor: float = DEFAULT_HETERO_R_MAX_FACTOR,
+    Q_min_factor: float = 0.05,
+    Q_max_factor: float = 20.0,
+    N_samp_U: int = DEFAULT_HETERO_N_SAMP,
+    N_samp_st: int = DEFAULT_HETERO_N_SAMP_ST,
+    r_grid_mode: str = DEFAULT_HETERO_R_GRID_MODE,
+    r_split_factor: float | None = DEFAULT_HETERO_R_SPLIT_FACTOR,
+    Nr_small: int | None = DEFAULT_HETERO_NR_SMALL,
+    jacobian_method: JacobianMethod = DEFAULT_HETERO_JACOBIAN_METHOD,  # type: ignore[assignment]
+    use_asymptotic: bool = DEFAULT_HETERO_USE_ASYMPTOTIC,
+    lowq_fit_bounds: tuple[float | None, float | None] | None = None,
+    lowq_replace_max: float | None = None,
+    lowq_fit_bounds_over_k: tuple[float | None, float | None] | None = None,
+    lowq_replace_max_over_k: float | None = None,
+    lowq_fit_bounds_over_k_eff: tuple[float | None, float | None] | None = DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF,
+    lowq_replace_max_over_k_eff: float | None = DEFAULT_HETERO_LOWQ_REPLACE_MAX_OVER_K_EFF,
+    tail_start_fraction: float = DEFAULT_HETERO_TAIL_START_FRACTION,
+    use_qmc: bool = DEFAULT_HETERO_USE_QMC,
+    progress: bool = True,
+) -> LineScatteringSpectrum:
+    """Compute a uniform random-line scattering spectrum with reusable metadata.
+
+    This is the core callable used before applying ``heterogeneous_line_scattering``.
+    The defaults are tuned for the heterogeneous-mask workflows over the current
+    Q range of interest.
+    """
+
+    k_radii, k_weights, meta = make_radial_line_spectrum(
+        k0_nominal=k0_nominal,
+        k_distribution=k_distribution,
+        num_modes_k=num_modes_k,
+        r_sigma_k=r_sigma_k,
+        random_seed=random_seed,
+        k_sampling=k_sampling,
+    )
+    k_eff = float(meta["k_eff"])
+    k_mean = float(meta["k_mean"])
+    rho0 = float(meta["rho0"])
+    mu2 = float(meta["mu2"])
+    if lowq_fit_bounds_over_k is not None:
+        lowq_fit_bounds = tuple(
+            None if value is None else float(value) * k_mean for value in lowq_fit_bounds_over_k
+        )  # type: ignore[assignment]
+    elif lowq_fit_bounds_over_k_eff is not None:
+        lowq_fit_bounds = tuple(
+            None if value is None else float(value) * k_eff for value in lowq_fit_bounds_over_k_eff
+        )  # type: ignore[assignment]
+    if lowq_replace_max_over_k is not None:
+        lowq_replace_max = float(lowq_replace_max_over_k) * k_mean
+    elif lowq_replace_max_over_k_eff is not None:
+        lowq_replace_max = float(lowq_replace_max_over_k_eff) * k_eff
+    if (
+        lowq_fit_bounds is None
+        and lowq_fit_bounds_over_k is None
+        and lowq_fit_bounds_over_k_eff is None
+    ):
+        lowq_fit_bounds = (
+            DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF[0] * k_eff,
+            DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF[1] * k_eff,
+        )
+    if (
+        lowq_replace_max is None
+        and lowq_replace_max_over_k is None
+        and lowq_replace_max_over_k_eff is None
+    ):
+        lowq_replace_max = DEFAULT_HETERO_LOWQ_REPLACE_MAX_OVER_K_EFF * k_eff
+
+    r_grid = make_r_grid(
+        float(r_min_factor) / k_eff,
+        float(r_max_factor) / k_eff,
+        int(Nr),
+        mode=r_grid_mode,
+        r_split=None if r_split_factor is None else float(r_split_factor) / k_eff,
+        n_small=Nr_small,
+    )
+    q_grid = np.geomspace(float(Q_min_factor) * k_mean, float(Q_max_factor) * k_mean, int(NQ))
+
+    m_j, c_l = compute_CL_general(
+        r_grid,
+        k_radii,
+        None,
+        k_weights=k_weights,
+        use_qmc=bool(use_qmc),
+        random_seed=int(random_seed),
+        progress=progress,
+        jacobian_method=jacobian_method,
+        N_samp_U=int(N_samp_U),
+        N_samp_st=int(N_samp_st),
+        st_sampling="quadrature",
+        n_jobs=1,
+    )
+    diag = compute_coherent_transform_diagnostics(
+        r_grid,
+        c_l,
+        q_grid,
+        rho0,
+        r_taper_start=float(tail_start_fraction) * float(r_grid[-1]),
+        use_asymptotic=use_asymptotic,
+        lowq_fit_bounds=lowq_fit_bounds if use_asymptotic else None,
+        lowq_replace_max=lowq_replace_max if use_asymptotic else None,
+    )
+    result = make_line_scattering_spectrum(
+        q_grid,
+        np.asarray(diag["I_coherent_windowed"], dtype=float),
+        rho0,
+        mu2=mu2,
+        k_radii=k_radii,
+        k_weights=k_weights,
+    )
+    object.__setattr__(result, "r_grid", r_grid)
+    object.__setattr__(result, "M_J", m_j)
+    object.__setattr__(result, "C_L", c_l)
+    object.__setattr__(result, "I_L_original", diag["I_coherent_windowed_original"])
+    object.__setattr__(result, "I_L_lowQ_asymptotic", diag["I_lowQ_asymptotic"])
+    object.__setattr__(result, "lowQ_fit_mask", diag["lowQ_fit_mask"])
+    object.__setattr__(result, "lowQ_replaced_mask", diag["lowQ_replaced_mask"])
+    object.__setattr__(result, "lowQ_I0", diag["lowQ_I0"])
+    object.__setattr__(result, "lowQ_I2", diag["lowQ_I2"])
+    object.__setattr__(result, "lowQ_fit_min", diag["lowQ_fit_min"])
+    object.__setattr__(result, "lowQ_fit_max", diag["lowQ_fit_max"])
+    object.__setattr__(result, "lowQ_replace_max", diag["lowQ_replace_max"])
+    object.__setattr__(result, "lowQ_relative_rmse", diag["lowQ_relative_rmse"])
+    object.__setattr__(result, "use_asymptotic", bool(use_asymptotic))
+    object.__setattr__(result, "tail_start_fraction", float(tail_start_fraction))
+    object.__setattr__(result, "use_qmc", bool(use_qmc))
+    object.__setattr__(result, "uniform_meta", meta)
+    return result
+
+
 def _get_line_result_value(line_result: object, names: Sequence[str]) -> object | None:
     for name in names:
         if isinstance(line_result, dict) and name in line_result:
@@ -2399,6 +2638,18 @@ def _get_line_result_value(line_result: object, names: Sequence[str]) -> object 
         if hasattr(line_result, name):
             return getattr(line_result, name)
     return None
+
+
+def _optional_float(value: object | None) -> float | None:
+    """Return a finite scalar float, or ``None`` when metadata is absent."""
+
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=float)
+    if arr.size != 1:
+        return None
+    scalar = float(arr.reshape(-1)[0])
+    return scalar if np.isfinite(scalar) else None
 
 
 def _coerce_line_scattering_spectrum(line_result: object) -> LineScatteringSpectrum:
@@ -2495,8 +2746,10 @@ def smoothing_operator_A(
     refine_grid: bool = True,
     points_per_kappa: float = 5.0,
     max_refined_points: int = 50_000,
+    lowq_I0: float | None = None,
+    lowq_I2: float | None = None,
 ) -> tuple[np.ndarray, float]:
-    """Evaluate A_kappa[I_L](Q) using the finite grid plus analytic line tail."""
+    """Evaluate A_kappa[I_L](Q) using finite data plus low/high-Q extrapolation."""
 
     Q = np.asarray(Q, dtype=float)
     q_grid, I_L = _validate_q_grid(q_grid, I_L)
@@ -2513,6 +2766,19 @@ def smoothing_operator_A(
     q_finite = q_grid[finite]
     i_finite = I_L[finite]
     q_cut = float(q_finite[-1])
+
+    if lowq_I0 is not None and lowq_I2 is not None and q_finite[0] > 0.0:
+        lowq_I0 = float(lowq_I0)
+        lowq_I2 = float(lowq_I2)
+        if np.isfinite(lowq_I0) and np.isfinite(lowq_I2):
+            q0 = float(q_finite[0])
+            target_step = kappa_H / max(float(points_per_kappa), 1.0) if kappa_H > 0.0 else q0
+            n_low = max(8, int(np.ceil(q0 / max(target_step, np.finfo(float).tiny))) + 1)
+            q_low = np.linspace(0.0, q0, n_low, endpoint=False)
+            i_low = lowq_I0 + lowq_I2 * q_low * q_low
+            q_finite = np.concatenate([q_low, q_finite])
+            i_finite = np.concatenate([i_low, i_finite])
+
     if refine_grid and kappa_H > 0.0 and q_finite.size >= 2:
         target_step = kappa_H / max(float(points_per_kappa), 1.0)
         current_step = float(np.max(np.diff(q_finite)))
@@ -2593,6 +2859,8 @@ def heterogeneous_line_scattering(
 
     spectrum = _coerce_line_scattering_spectrum(line_result)
     Q, I_L = _validate_q_grid(spectrum.Q_grid, spectrum.I_L)
+    lowq_I0 = _optional_float(_get_line_result_value(line_result, ("lowQ_I0", "lowq_I0", "I0")))
+    lowq_I2 = _optional_float(_get_line_result_value(line_result, ("lowQ_I2", "lowq_I2", "I2")))
     params = mask_occupancy_parameters(float(k_H), float(b))
     p_H = float(params["p_H"])
     sigma2 = float(params["sigma_H_squared"])
@@ -2614,7 +2882,16 @@ def heterogeneous_line_scattering(
         q_cut = float(Q[-1])
     else:
         # I_h^smooth = p_H^2 I_L + sigma_H^2 A_kappa[I_L] + rho0^2 sigma_H^2 K_H.
-        A_kappa, q_cut = smoothing_operator_A(Q, Q, I_L, kappa, spectrum.rho0, q_max=q_max)
+        A_kappa, q_cut = smoothing_operator_A(
+            Q,
+            Q,
+            I_L,
+            kappa,
+            spectrum.rho0,
+            q_max=q_max,
+            lowq_I0=lowq_I0,
+            lowq_I2=lowq_I2,
+        )
         uniform_component = p_H * p_H * I_L
         smoothed_component = sigma2 * A_kappa
         mask_component = spectrum.rho0**2 * sigma2 * smooth_mask_kernel(Q, kappa)

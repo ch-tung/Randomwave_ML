@@ -176,6 +176,43 @@ def check_tail_correction_convergence() -> dict[str, float]:
     }
 
 
+def check_lowq_extrapolated_convolution() -> dict[str, float]:
+    rho0 = 0.37
+    i0 = 1.2
+    i2 = 0.35
+    kappa = 0.05
+    q_eval = np.geomspace(0.01, 0.18, 36)
+    q_dense = np.linspace(0.0, 50.0, 25_001)
+    i_dense = i0 + i2 * q_dense * q_dense
+    q_sparse = np.linspace(0.2, 50.0, 4000)
+    i_sparse = i0 + i2 * q_sparse * q_sparse
+
+    reference, _ = rw.smoothing_operator_A(q_eval, q_dense, i_dense, kappa, rho0, q_max=50.0)
+    extrapolated, _ = rw.smoothing_operator_A(
+        q_eval,
+        q_sparse,
+        i_sparse,
+        kappa,
+        rho0,
+        q_max=50.0,
+        lowq_I0=i0,
+        lowq_I2=i2,
+    )
+    truncated, _ = rw.smoothing_operator_A(q_eval, q_sparse, i_sparse, kappa, rho0, q_max=50.0)
+
+    extrapolated_err = float(np.max(_relative_error(extrapolated, reference)))
+    truncated_err = float(np.max(_relative_error(truncated, reference)))
+    assert extrapolated_err < 3.0e-4, (
+        "Low-Q extrapolated convolution did not match the dense reference: "
+        f"relerr={extrapolated_err:.4g}"
+    )
+    assert extrapolated_err < 0.05 * truncated_err, (
+        "Low-Q extrapolation did not substantially reduce truncation error: "
+        f"extrapolated={extrapolated_err:.4g}, truncated={truncated_err:.4g}"
+    )
+    return {"extrapolated": extrapolated_err, "truncated": truncated_err}
+
+
 def check_high_q_coefficient() -> dict[str, float]:
     line = _make_powerlaw_line_result(q_min=1.0e-4, q_max=1.0e7, n=7000)
     result = rw.heterogeneous_line_scattering(line, k_H=0.2, b=-0.4, q_max=100.0, return_components=True)
@@ -241,6 +278,7 @@ def run_all_checks() -> dict[str, dict[str, float]]:
         "slow_mask_limit": check_slow_mask_limit(),
         "pure_line_asymptote_identity": check_pure_line_asymptote_identity(),
         "tail_correction_convergence": check_tail_correction_convergence(),
+        "lowq_extrapolated_convolution": check_lowq_extrapolated_convolution(),
         "high_q_coefficient": check_high_q_coefficient(),
         "approximation_levels": check_approximation_levels(),
         "uniform_line_unchanged": check_uniform_line_unchanged(),

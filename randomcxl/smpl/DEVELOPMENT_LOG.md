@@ -567,3 +567,17 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
 - Exposed the mixed nonuniform real-space grid settings explicitly in the
   notebook parameter block: `r_grid_mode`, `r_min_factor`, `r_split_factor`,
   `r_max_factor`, `Nr`, and `Nr_small`.
+
+## 2026-06-26 Low-Q Extrapolation In Heterogeneous Convolution
+
+- Extended `smoothing_operator_A(...)` with optional `lowq_I0` and `lowq_I2`
+  inputs. When available, the convolution now fills the missing interval from
+  `Q=0` to the first tabulated uniform-line point with the fitted quadratic
+  form `I(Q)=I0+I2 Q^2`.
+- Updated `heterogeneous_line_scattering(...)` to automatically read
+  `lowQ_I0` and `lowQ_I2` metadata from a uniform-line result and pass those
+  coefficients into the smoothed-line convolution term.
+- Added a deterministic regression check showing that low-`Q` extrapolation
+  removes the abrupt small-`Q` truncation artifact in
+  `sigma_H^2 A_kappa[I_L]`, while preserving the existing kernel,
+  tail-correction, high-`Q`, and uniform-line tests.
