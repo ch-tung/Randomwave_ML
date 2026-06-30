@@ -3,11 +3,32 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 import rw_line_scattering as rls
+
+
+DEFAULT_K_DISTRIBUTION = rls.DEFAULT_HETERO_K_DISTRIBUTION
+DEFAULT_NUM_MODES_K = rls.DEFAULT_HETERO_NUM_MODES_K
+DEFAULT_K_SAMPLING = rls.DEFAULT_HETERO_K_SAMPLING
+DEFAULT_R_GRID_MODE = rls.DEFAULT_HETERO_R_GRID_MODE
+DEFAULT_R_MIN_FACTOR = rls.DEFAULT_HETERO_R_MIN_FACTOR
+DEFAULT_R_SPLIT_FACTOR = rls.DEFAULT_HETERO_R_SPLIT_FACTOR
+DEFAULT_R_MAX_FACTOR = rls.DEFAULT_HETERO_R_MAX_FACTOR
+DEFAULT_NR = rls.DEFAULT_HETERO_NR
+DEFAULT_NR_SMALL = rls.DEFAULT_HETERO_NR_SMALL
+DEFAULT_TAIL_START_FRACTION = rls.DEFAULT_HETERO_TAIL_START_FRACTION
+DEFAULT_N_SAMP = rls.DEFAULT_HETERO_N_SAMP
+DEFAULT_USE_QMC = rls.DEFAULT_HETERO_USE_QMC
+DEFAULT_JACOBIAN_METHOD = rls.DEFAULT_HETERO_JACOBIAN_METHOD
+DEFAULT_USE_ASYMPTOTIC = rls.DEFAULT_HETERO_USE_ASYMPTOTIC
+DEFAULT_LOWQ_FIT_BOUNDS_OVER_K_EFF = rls.DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF
+DEFAULT_LOWQ_REPLACE_MAX_OVER_K_EFF = rls.DEFAULT_HETERO_LOWQ_REPLACE_MAX_OVER_K_EFF
+DEFAULT_N_SAMP_ST = rls.DEFAULT_HETERO_N_SAMP_ST
+DEFAULT_HETERO_LINE_SCATTERING_SETTINGS = rls.DEFAULT_HETERO_LINE_SCATTERING_SETTINGS
 
 
 def _as_float_tuple(values: float | tuple[float, ...] | list[float] | np.ndarray) -> tuple[float, ...]:
@@ -31,170 +52,91 @@ def _mean_k_from_line_result(line_result: rls.LineScatteringSpectrum) -> float:
 def make_demo_k_spectrum(
     *,
     k0_nominal: float,
-    k_distribution: str,
-    num_modes_k: int,
+    k_distribution: str = DEFAULT_K_DISTRIBUTION,
     r_sigma_k: float,
+    k_distribution_params: Mapping[str, float] | None = None,
     random_seed: int,
-    k_sampling: str,
+    num_modes_k: int = DEFAULT_NUM_MODES_K,
+    k_sampling: str = DEFAULT_K_SAMPLING,
 ) -> tuple[np.ndarray, np.ndarray | None, dict[str, float | str]]:
     """Construct the radial line-wave spectrum used by the hetero demo."""
 
-    if k_sampling == "quadrature":
-        k_radii, k_weights = rls.make_radial_k_quadrature(
-            int(num_modes_k),
-            k_distribution,  # type: ignore[arg-type]
-            k0=float(k0_nominal),
-            sigma_k=float(r_sigma_k) * float(k0_nominal),
-        )
-    elif k_sampling in {"qmc", "random"}:
-        k_rng = np.random.default_rng(int(random_seed))
-        k_sets = rls.make_field_k_sets(
-            int(num_modes_k),
-            k_distribution,  # type: ignore[arg-type]
-            k_rng,
-            k0=float(k0_nominal),
-            r_sigma_k=float(r_sigma_k),
-            shared_k_vectors=True,
-            use_qmc_k=(k_sampling == "qmc"),
-            qmc_seed=int(random_seed),
-        )
-        k_radii = rls.k_radii_from_vectors(k_sets.psi1)
-        k_weights = None
-    else:
-        raise ValueError("k_sampling must be 'qmc', 'random', or 'quadrature'.")
-
-    a = rls.gradient_variance_from_k_radii(k_radii, k_weights=k_weights)
-    rho0 = a / np.pi
-    mu2 = 3.0 * a
-    k_eff = float(np.sqrt(mu2))
-    k_mean = float(np.mean(k_radii) if k_weights is None else np.dot(k_weights, k_radii))
-    k_std = float(
-        np.std(k_radii)
-        if k_weights is None
-        else np.sqrt(np.dot(k_weights, (k_radii - k_mean) ** 2))
+    return rls.make_radial_line_spectrum(
+        k0_nominal=k0_nominal,
+        k_distribution=k_distribution,  # type: ignore[arg-type]
+        num_modes_k=num_modes_k,
+        r_sigma_k=r_sigma_k,
+        k_distribution_params=k_distribution_params,
+        random_seed=random_seed,
+        k_sampling=k_sampling,  # type: ignore[arg-type]
     )
-    meta = {
-        "k0_nominal": float(k0_nominal),
-        "k_distribution": str(k_distribution),
-        "num_modes_k": int(num_modes_k),
-        "r_sigma_k": float(r_sigma_k),
-        "random_seed": int(random_seed),
-        "k_sampling": str(k_sampling),
-        "k_eff": k_eff,
-        "k_mean": k_mean,
-        "k_std": k_std,
-        "mu2": float(mu2),
-        "rho0": float(rho0),
-        "a": float(a),
-    }
-    return k_radii, k_weights, meta
 
 
 def compute_uniform_line_scattering(
     *,
     k0_nominal: float,
-    k_distribution: str,
-    num_modes_k: int,
+    k_distribution: str = DEFAULT_K_DISTRIBUTION,
     r_sigma_k: float,
+    k_distribution_params: Mapping[str, float] | None = None,
     random_seed: int,
-    k_sampling: str,
-    Nr: int,
-    NQ: int,
-    r_min_factor: float,
-    r_max_factor: float,
-    Q_min_factor: float,
-    Q_max_factor: float,
-    N_samp_U: int,
-    N_samp_st: int,
-    r_grid_mode: str = "mixed",
-    r_split_factor: float | None = None,
-    Nr_small: int | None = None,
-    jacobian_method: str = "direct_12d",
-    use_asymptotic: bool = False,
+    num_modes_k: int = DEFAULT_NUM_MODES_K,
+    k_sampling: str = DEFAULT_K_SAMPLING,
+    Nr: int = DEFAULT_NR,
+    NQ: int = 256,
+    r_min_factor: float = DEFAULT_R_MIN_FACTOR,
+    r_max_factor: float = DEFAULT_R_MAX_FACTOR,
+    Q_min_factor: float = 0.05,
+    Q_max_factor: float = 20.0,
+    N_samp_U: int = DEFAULT_N_SAMP,
+    N_samp_st: int = DEFAULT_N_SAMP_ST,
+    r_grid_mode: str = DEFAULT_R_GRID_MODE,
+    r_split_factor: float | None = DEFAULT_R_SPLIT_FACTOR,
+    Nr_small: int | None = DEFAULT_NR_SMALL,
+    jacobian_method: str = DEFAULT_JACOBIAN_METHOD,
+    use_asymptotic: bool = DEFAULT_USE_ASYMPTOTIC,
     lowq_fit_bounds: tuple[float | None, float | None] | None = None,
     lowq_replace_max: float | None = None,
     lowq_fit_bounds_over_k: tuple[float | None, float | None] | None = None,
     lowq_replace_max_over_k: float | None = None,
+    lowq_fit_bounds_over_k_eff: tuple[float | None, float | None] | None = DEFAULT_LOWQ_FIT_BOUNDS_OVER_K_EFF,
+    lowq_replace_max_over_k_eff: float | None = DEFAULT_LOWQ_REPLACE_MAX_OVER_K_EFF,
+    tail_start_fraction: float = DEFAULT_TAIL_START_FRACTION,
+    use_qmc: bool = DEFAULT_USE_QMC,
     progress: bool = True,
 ) -> rls.LineScatteringSpectrum:
     """Compute the uniform-line scattering curve inside the demo workflow."""
 
-    k_radii, k_weights, meta = make_demo_k_spectrum(
+    return rls.compute_uniform_line_scattering(
         k0_nominal=k0_nominal,
         k_distribution=k_distribution,
-        num_modes_k=num_modes_k,
         r_sigma_k=r_sigma_k,
+        k_distribution_params=k_distribution_params,
         random_seed=random_seed,
+        num_modes_k=num_modes_k,
         k_sampling=k_sampling,
-    )
-    k_eff = float(meta["k_eff"])
-    k_mean = float(meta["k_mean"])
-    rho0 = float(meta["rho0"])
-    mu2 = float(meta["mu2"])
-    if lowq_fit_bounds_over_k is not None:
-        lowq_fit_bounds = tuple(
-            None if value is None else float(value) * k_mean for value in lowq_fit_bounds_over_k
-        )  # type: ignore[assignment]
-    if lowq_replace_max_over_k is not None:
-        lowq_replace_max = float(lowq_replace_max_over_k) * k_mean
-    r_grid = rls.make_r_grid(
-        float(r_min_factor) / k_eff,
-        float(r_max_factor) / k_eff,
-        int(Nr),
-        mode=r_grid_mode,
-        r_split=None if r_split_factor is None else float(r_split_factor) / k_eff,
-        n_small=Nr_small,
-    )
-    q_grid = np.geomspace(float(Q_min_factor) * k_mean, float(Q_max_factor) * k_mean, int(NQ))
-
-    m_j, c_l = rls.compute_CL_general(
-        r_grid,
-        k_radii,
-        None,
-        k_weights=k_weights,
-        use_qmc=True,
-        random_seed=int(random_seed),
-        progress=progress,
+        Nr=Nr,
+        NQ=NQ,
+        r_min_factor=r_min_factor,
+        r_max_factor=r_max_factor,
+        Q_min_factor=Q_min_factor,
+        Q_max_factor=Q_max_factor,
+        N_samp_U=N_samp_U,
+        N_samp_st=N_samp_st,
+        r_grid_mode=r_grid_mode,
+        r_split_factor=r_split_factor,
+        Nr_small=Nr_small,
         jacobian_method=jacobian_method,  # type: ignore[arg-type]
-        N_samp_U=int(N_samp_U),
-        N_samp_st=int(N_samp_st),
-        st_sampling="quadrature",
-        n_jobs=1,
-    )
-    diag = rls.compute_coherent_transform_diagnostics(
-        r_grid,
-        c_l,
-        q_grid,
-        rho0,
-        r_taper_start=0.75 * float(r_grid[-1]),
         use_asymptotic=use_asymptotic,
         lowq_fit_bounds=lowq_fit_bounds,
         lowq_replace_max=lowq_replace_max,
+        lowq_fit_bounds_over_k=lowq_fit_bounds_over_k,
+        lowq_replace_max_over_k=lowq_replace_max_over_k,
+        lowq_fit_bounds_over_k_eff=lowq_fit_bounds_over_k_eff,
+        lowq_replace_max_over_k_eff=lowq_replace_max_over_k_eff,
+        tail_start_fraction=tail_start_fraction,
+        use_qmc=use_qmc,
+        progress=progress,
     )
-    result = rls.make_line_scattering_spectrum(
-        q_grid,
-        np.asarray(diag["I_coherent_windowed"], dtype=float),
-        rho0,
-        mu2=mu2,
-        k_radii=k_radii,
-        k_weights=k_weights,
-    )
-    object.__setattr__(result, "r_grid", r_grid)
-    object.__setattr__(result, "M_J", m_j)
-    object.__setattr__(result, "C_L", c_l)
-    object.__setattr__(result, "I_L_original", diag["I_coherent_windowed_original"])
-    object.__setattr__(result, "I_L_lowQ_asymptotic", diag["I_lowQ_asymptotic"])
-    object.__setattr__(result, "lowQ_fit_mask", diag["lowQ_fit_mask"])
-    object.__setattr__(result, "lowQ_replaced_mask", diag["lowQ_replaced_mask"])
-    object.__setattr__(result, "lowQ_I0", diag["lowQ_I0"])
-    object.__setattr__(result, "lowQ_I2", diag["lowQ_I2"])
-    object.__setattr__(result, "lowQ_fit_min", diag["lowQ_fit_min"])
-    object.__setattr__(result, "lowQ_fit_max", diag["lowQ_fit_max"])
-    object.__setattr__(result, "lowQ_replace_max", diag["lowQ_replace_max"])
-    object.__setattr__(result, "lowQ_relative_rmse", diag["lowQ_relative_rmse"])
-    object.__setattr__(result, "use_asymptotic", bool(use_asymptotic))
-    object.__setattr__(result, "uniform_meta", meta)
-    return result
 
 
 def evaluate_heterogeneous_case(
@@ -315,6 +257,8 @@ def evaluate_heterogeneous_grid(
         "lowQ_replace_max": float(getattr(line_result, "lowQ_replace_max", np.nan)),
         "lowQ_relative_rmse": float(getattr(line_result, "lowQ_relative_rmse", np.nan)),
         "use_asymptotic": bool(getattr(line_result, "use_asymptotic", False)),
+        "tail_start_fraction": float(getattr(line_result, "tail_start_fraction", np.nan)),
+        "use_qmc": bool(getattr(line_result, "use_qmc", DEFAULT_USE_QMC)),
         "r_grid": np.asarray(getattr(line_result, "r_grid", np.array([], dtype=float)), dtype=float),
         "M_J": np.asarray(getattr(line_result, "M_J", np.array([], dtype=float)), dtype=float),
         "C_L": np.asarray(getattr(line_result, "C_L", np.array([], dtype=float)), dtype=float),
