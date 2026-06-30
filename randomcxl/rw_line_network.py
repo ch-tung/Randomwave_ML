@@ -103,6 +103,7 @@ SHOW_PHI3_ZERO_SURFACE = False
 # Rendering and output.
 WINDOW_SIZE = (1000, 1000)
 BACKGROUND_COLOR = "white"
+ANTIALIASING_MODE: str | None = "ssaa"
 CAMERA_ZOOM = 0.82
 CAMERA_AZIMUTH_DEGREES = 30.0
 CAMERA_POLAR_DEGREES = 60.0
@@ -121,6 +122,8 @@ S12_TUBE_COLOR = SLACK_RED
 S13_TUBE_COLOR = SLACK_GREEN
 S12_TUBE_OPACITY = 0.95
 S13_TUBE_OPACITY = 0.95
+SHOW_S12_LINES = True
+SHOW_S13_LINES = True
 LINE_DOMAIN_OPACITY = 0.62
 
 PHI1_SURFACE_COLOR = "gray"
@@ -2220,47 +2223,53 @@ def build_scene() -> tuple[pv.Plotter, dict[str, pv.PolyData]]:
 
     plotter = pv.Plotter(window_size=WINDOW_SIZE)
     plotter.set_background(BACKGROUND_COLOR)
+    if ANTIALIASING_MODE is not None:
+        plotter.enable_anti_aliasing(ANTIALIASING_MODE)
 
     if USE_VORTEX_TRACING:
         s12_display = s12_mesh.tube(radius=VORTEX_TUBE_RADIUS) if s12_mesh.n_points else s12_mesh
         s13_display = s13_mesh.tube(radius=VORTEX_TUBE_RADIUS) if s13_mesh.n_points else s13_mesh
-        add_line_domain_to_plotter(
-            plotter,
-            s12_display,
-            color=S12_TUBE_COLOR,
-            opacity=S12_TUBE_OPACITY,
-            name="S12",
-            show_edges=SHOW_TUBE_EDGES,
-            edge_color=TUBE_EDGE_COLOR,
-        )
-        add_line_domain_to_plotter(
-            plotter,
-            s13_display,
-            color=S13_TUBE_COLOR,
-            opacity=S13_TUBE_OPACITY,
-            name="S13",
-            show_edges=SHOW_TUBE_EDGES,
-            edge_color=TUBE_EDGE_COLOR,
-        )
+        if SHOW_S12_LINES:
+            add_line_domain_to_plotter(
+                plotter,
+                s12_display,
+                color=S12_TUBE_COLOR,
+                opacity=S12_TUBE_OPACITY,
+                name="S12",
+                show_edges=SHOW_TUBE_EDGES,
+                edge_color=TUBE_EDGE_COLOR,
+            )
+        if SHOW_S13_LINES:
+            add_line_domain_to_plotter(
+                plotter,
+                s13_display,
+                color=S13_TUBE_COLOR,
+                opacity=S13_TUBE_OPACITY,
+                name="S13",
+                show_edges=SHOW_TUBE_EDGES,
+                edge_color=TUBE_EDGE_COLOR,
+            )
     else:
-        add_line_domain_to_plotter(
-            plotter,
-            s12_mesh,
-            color=S12_TUBE_COLOR,
-            opacity=LINE_DOMAIN_OPACITY,
-            name="S12",
-            show_edges=SHOW_TUBE_EDGES,
-            edge_color=TUBE_EDGE_COLOR,
-        )
-        add_line_domain_to_plotter(
-            plotter,
-            s13_mesh,
-            color=S13_TUBE_COLOR,
-            opacity=LINE_DOMAIN_OPACITY,
-            name="S13",
-            show_edges=SHOW_TUBE_EDGES,
-            edge_color=TUBE_EDGE_COLOR,
-        )
+        if SHOW_S12_LINES:
+            add_line_domain_to_plotter(
+                plotter,
+                s12_mesh,
+                color=S12_TUBE_COLOR,
+                opacity=LINE_DOMAIN_OPACITY,
+                name="S12",
+                show_edges=SHOW_TUBE_EDGES,
+                edge_color=TUBE_EDGE_COLOR,
+            )
+        if SHOW_S13_LINES:
+            add_line_domain_to_plotter(
+                plotter,
+                s13_mesh,
+                color=S13_TUBE_COLOR,
+                opacity=LINE_DOMAIN_OPACITY,
+                name="S13",
+                show_edges=SHOW_TUBE_EDGES,
+                edge_color=TUBE_EDGE_COLOR,
+            )
 
     if SHOW_PHI1_ZERO_SURFACE:
         add_isosurface_to_plotter(
