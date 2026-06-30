@@ -17,8 +17,9 @@ import warnings
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 import matplotlib
 
@@ -27,6 +28,7 @@ if __name__ == "__main__":
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import simpson
+from scipy.optimize import least_squares
 from scipy.stats import gamma as gamma_dist
 from scipy.stats import norm, qmc
 
@@ -82,7 +84,13 @@ SMALL_X = 1.0e-4
 DEFAULT_RADIAL_CHUNK_SIZE = 256
 DEFAULT_CONDITIONAL_U_BATCH_SIZE = 64
 DEFAULT_CONDITIONAL_ST_BATCH_SIZE = 256
-KDistribution = Literal["single_shell", "gaussian_radial", "gamma_radial", "uniform_band"]
+KDistribution = Literal[
+    "single_shell",
+    "gaussian_radial",
+    "gamma_radial",
+    "max_entropy_radial",
+    "uniform_band",
+]
 JacobianMethod = Literal["direct_12d", "conditional_6d_2d"]
 SamplingMethod = Literal["qmc", "random"]
 STSamplingMethod = Literal["quadrature", "qmc"]
@@ -181,6 +189,102 @@ def _gamma_radii_from_unit(
     return gamma_dist.ppf(u, a=shape, scale=scale)
 
 
+@lru_cache(maxsize=256)
+def _maximum_entropy_standardized_quadrature(
+    r_sigma_k: float,
+    skewness: float,
+    support_sigma: float,
+    num_nodes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return max-entropy nodes for y=(k-mean)/sigma with three moments fixed."""
+
+    r_sigma_k = float(r_sigma_k)
+    skewness = float(skewness)
+    support_sigma = float(support_sigma)
+    num_nodes = int(num_nodes)
+    if r_sigma_k <= 0.0:
+        raise ValueError("r_sigma_k must be positive for max_entropy_radial.")
+    if support_sigma <= 0.0:
+        raise ValueError("support_sigma must be positive for max_entropy_radial.")
+    if num_nodes < 64:
+        raise ValueError("max_entropy_radial requires at least 64 quadrature nodes.")
+
+    lower = -1.0 / r_sigma_k
+    upper = support_sigma
+    edges = np.linspace(lower, upper, num_nodes + 1)
+    y = 0.5 * (edges[:-1] + edges[1:])
+    features = np.column_stack((y, y * y, y * y * y))
+    target = np.array([0.0, 1.0, skewness])
+
+    def moments_and_weights(coefficients: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        log_weights = features @ coefficients
+        log_weights -= np.max(log_weights)
+        weights = np.exp(log_weights)
+        weights /= np.sum(weights)
+        return weights @ features, weights
+
+    def residual(coefficients: np.ndarray) -> np.ndarray:
+        moments, _ = moments_and_weights(coefficients)
+        return moments - target
+
+    def jacobian(coefficients: np.ndarray) -> np.ndarray:
+        moments, weights = moments_and_weights(coefficients)
+        centered = features - moments
+        return (centered * weights[:, None]).T @ centered
+
+    solution = least_squares(
+        residual,
+        np.array([0.0, -0.5, 0.0]),
+        jac=jacobian,
+        max_nfev=200,
+        xtol=1.0e-12,
+        ftol=1.0e-12,
+        gtol=1.0e-12,
+    )
+    moments, weights = moments_and_weights(solution.x)
+    if not solution.success or np.max(np.abs(moments - target)) > 2.0e-6:
+        raise ValueError(
+            "Could not construct max_entropy_radial with "
+            f"r_sigma_k={r_sigma_k:g}, skewness={skewness:g}. "
+            "Try a less extreme skewness or a larger support_sigma."
+        )
+    return y, weights
+
+
+def _maximum_entropy_radii_and_weights(
+    *,
+    k0: float,
+    sigma_k: float,
+    skewness: float,
+    support_sigma: float,
+    num_nodes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    mean = float(k0)
+    sigma = float(sigma_k)
+    if mean <= 0.0:
+        raise ValueError("k0 must be positive for max_entropy_radial.")
+    if sigma <= 0.0:
+        raise ValueError("sigma_k must be positive for max_entropy_radial.")
+    r_sigma_k = sigma / mean
+    y, weights = _maximum_entropy_standardized_quadrature(
+        round(r_sigma_k, 12),
+        round(float(skewness), 12),
+        round(float(support_sigma), 12),
+        int(num_nodes),
+    )
+    return mean + sigma * y, weights.copy()
+
+
+def _distribution_param(
+    distribution_params: Mapping[str, float] | None,
+    name: str,
+    default: float,
+) -> float:
+    if distribution_params is None:
+        return float(default)
+    return float(distribution_params.get(name, default))
+
+
 def sample_k_vectors(
     count: int,
     distribution: KDistribution,
@@ -190,6 +294,7 @@ def sample_k_vectors(
     sigma_k: float | None = None,
     k_min: float | None = None,
     k_max: float | None = None,
+    distribution_params: Mapping[str, float] | None = None,
     use_qmc: bool = False,
     qmc_seed: int = DEFAULT_RANDOM_SEED,
 ) -> np.ndarray:
@@ -230,6 +335,25 @@ def sample_k_vectors(
             shape = (mean / sigma) ** 2
             scale = sigma * sigma / mean
             radii = rng.gamma(shape, scale, size=count)
+    elif distribution == "max_entropy_radial":
+        if sigma_k is None:
+            sigma_k = _distribution_param(distribution_params, "r_sigma_k", 0.15) * float(k0)
+        skewness = _distribution_param(distribution_params, "skewness", 0.0)
+        support_sigma = _distribution_param(distribution_params, "support_sigma", 8.0)
+        nodes, weights = _maximum_entropy_radii_and_weights(
+            k0=float(k0),
+            sigma_k=float(sigma_k),
+            skewness=skewness,
+            support_sigma=support_sigma,
+            num_nodes=4096,
+        )
+        u = (
+            _sobol_points(count, 3, qmc_seed)[:, 2]
+            if use_qmc
+            else rng.random(count)
+        )
+        cdf_midpoints = np.cumsum(weights) - 0.5 * weights
+        radii = np.interp(u, cdf_midpoints, nodes)
     elif distribution == "uniform_band":
         if k_min is None:
             k_min = 0.7 * float(k0)
@@ -255,6 +379,7 @@ def make_radial_k_quadrature(
     sigma_k: float | None = None,
     k_min: float | None = None,
     k_max: float | None = None,
+    distribution_params: Mapping[str, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return deterministic radial k nodes and probability weights."""
 
@@ -275,6 +400,16 @@ def make_radial_k_quadrature(
         if sigma_k is None:
             sigma_k = 0.15 * float(k0)
         return _gamma_radii_from_unit(u, float(k0), float(sigma_k)), weights
+    if distribution == "max_entropy_radial":
+        if sigma_k is None:
+            sigma_k = _distribution_param(distribution_params, "r_sigma_k", 0.15) * float(k0)
+        return _maximum_entropy_radii_and_weights(
+            k0=float(k0),
+            sigma_k=float(sigma_k),
+            skewness=_distribution_param(distribution_params, "skewness", 0.0),
+            support_sigma=_distribution_param(distribution_params, "support_sigma", 8.0),
+            num_nodes=max(num_nodes, 64),
+        )
     if distribution == "uniform_band":
         if k_min is None:
             k_min = 0.7 * float(k0)
@@ -295,6 +430,7 @@ def make_field_k_sets(
     r_sigma_k: float | Sequence[float] = 0.15,
     r_k_min: float | Sequence[float] = 0.7,
     r_k_max: float | Sequence[float] = 1.3,
+    distribution_params: Mapping[str, float] | None = None,
     shared_k_vectors: bool = False,
     use_qmc_k: bool = False,
     qmc_seed: int = DEFAULT_RANDOM_SEED,
@@ -326,6 +462,7 @@ def make_field_k_sets(
             sigma_k=sigma_values[0],
             k_min=k_min_values[0],
             k_max=k_max_values[0],
+            distribution_params=distribution_params,
             use_qmc=use_qmc_k,
             qmc_seed=qmc_seed,
         )
@@ -340,6 +477,7 @@ def make_field_k_sets(
             sigma_k=sigma_values[0],
             k_min=k_min_values[0],
             k_max=k_max_values[0],
+            distribution_params=distribution_params,
             use_qmc=use_qmc_k,
             qmc_seed=qmc_seed,
         ),
@@ -351,6 +489,7 @@ def make_field_k_sets(
             sigma_k=sigma_values[1],
             k_min=k_min_values[1],
             k_max=k_max_values[1],
+            distribution_params=distribution_params,
             use_qmc=use_qmc_k,
             qmc_seed=qmc_seed + 1,
         ),
@@ -2465,7 +2604,8 @@ def make_line_scattering_spectrum(
 def make_radial_line_spectrum(
     *,
     k0_nominal: float,
-    r_sigma_k: float,
+    r_sigma_k: float | None = None,
+    k_distribution_params: Mapping[str, float] | None = None,
     random_seed: int = DEFAULT_RANDOM_SEED,
     k_distribution: KDistribution = DEFAULT_HETERO_K_DISTRIBUTION,  # type: ignore[assignment]
     num_modes_k: int = DEFAULT_HETERO_NUM_MODES_K,
@@ -2473,12 +2613,19 @@ def make_radial_line_spectrum(
 ) -> tuple[np.ndarray, np.ndarray | None, dict[str, float | str]]:
     """Construct a radial line-wave spectrum and its basic moment metadata."""
 
+    distribution_params = dict(k_distribution_params or {})
+    if r_sigma_k is None:
+        r_sigma_k = float(distribution_params.get("r_sigma_k", 0.15))
+    else:
+        distribution_params.setdefault("r_sigma_k", float(r_sigma_k))
+    r_sigma_k = float(r_sigma_k)
     if k_sampling == "quadrature":
         k_radii, k_weights = make_radial_k_quadrature(
             int(num_modes_k),
             k_distribution,
             k0=float(k0_nominal),
             sigma_k=float(r_sigma_k) * float(k0_nominal),
+            distribution_params=distribution_params,
         )
     elif k_sampling in {"qmc", "random"}:
         k_rng = np.random.default_rng(int(random_seed))
@@ -2488,6 +2635,7 @@ def make_radial_line_spectrum(
             k_rng,
             k0=float(k0_nominal),
             r_sigma_k=float(r_sigma_k),
+            distribution_params=distribution_params,
             shared_k_vectors=True,
             use_qmc_k=(k_sampling == "qmc"),
             qmc_seed=int(random_seed),
@@ -2512,6 +2660,7 @@ def make_radial_line_spectrum(
         "k_distribution": str(k_distribution),
         "num_modes_k": int(num_modes_k),
         "r_sigma_k": float(r_sigma_k),
+        "k_skewness": float(distribution_params.get("skewness", np.nan)),
         "random_seed": int(random_seed),
         "k_sampling": str(k_sampling),
         "k_eff": k_eff,
@@ -2527,7 +2676,8 @@ def make_radial_line_spectrum(
 def compute_uniform_line_scattering(
     *,
     k0_nominal: float = DEFAULT_K0,
-    r_sigma_k: float,
+    r_sigma_k: float | None = None,
+    k_distribution_params: Mapping[str, float] | None = None,
     random_seed: int = DEFAULT_RANDOM_SEED,
     k_distribution: KDistribution = DEFAULT_HETERO_K_DISTRIBUTION,  # type: ignore[assignment]
     num_modes_k: int = DEFAULT_HETERO_NUM_MODES_K,
@@ -2567,6 +2717,7 @@ def compute_uniform_line_scattering(
         k_distribution=k_distribution,
         num_modes_k=num_modes_k,
         r_sigma_k=r_sigma_k,
+        k_distribution_params=k_distribution_params,
         random_seed=random_seed,
         k_sampling=k_sampling,
     )
@@ -3464,7 +3615,17 @@ def save_four_field_scan_outputs(result: FourFieldScanResult, output_dir: str | 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--k0", type=float, default=DEFAULT_K0)
-    parser.add_argument("--k-distribution", choices=["single_shell", "gaussian_radial", "gamma_radial", "uniform_band"], default="single_shell")
+    parser.add_argument(
+        "--k-distribution",
+        choices=[
+            "single_shell",
+            "gaussian_radial",
+            "gamma_radial",
+            "max_entropy_radial",
+            "uniform_band",
+        ],
+        default="single_shell",
+    )
     parser.add_argument("--num-modes", type=int, default=4096)
     parser.add_argument("--r-sigma-k", type=float, default=0.15)
     parser.add_argument("--r-k-min", type=float, default=0.7)

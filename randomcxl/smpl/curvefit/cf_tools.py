@@ -220,6 +220,25 @@ def stitch_profiles(
     )
 
 
+def subtract_constant_background(
+    profile: RadialProfile,
+    background: float,
+) -> RadialProfile:
+    """Return a profile with a fitted constant baseline removed."""
+
+    background = float(background)
+    if not np.isfinite(background):
+        raise ValueError("background must be finite.")
+    return RadialProfile(
+        label=f"{profile.label}_bg_subtracted",
+        q=profile.q.copy(),
+        intensity=profile.intensity - background,
+        error=profile.error.copy(),
+        count=profile.count.copy(),
+        scale=profile.scale,
+    )
+
+
 def profile_table(profile: RadialProfile) -> np.ndarray:
     """Return a simple machine-readable ``Q, I, err, count`` table."""
 
@@ -388,6 +407,7 @@ def fit_highq_line_anchor(
     q_bounds: tuple[float, float],
     *,
     background_max: float | None = None,
+    allow_signed_background: bool = False,
 ) -> AnchorFit:
     """Fit ``I(Q) ~= C/Q + B`` and report the apparent ``rho0=C/pi``."""
 
@@ -397,12 +417,22 @@ def fit_highq_line_anchor(
     err = profile.error[mask]
     if q.size < 3:
         raise ValueError("Need at least three positive points for the line anchor fit.")
-    coefficient, background, y_fit = _fit_positive_basis_with_bounded_background(
-        1.0 / q,
-        y,
-        err,
-        background_max=background_max,
-    )
+    if allow_signed_background:
+        coefficients, y_fit = _weighted_linear_fit(
+            np.column_stack((1.0 / q, np.ones_like(q))),
+            y,
+            err,
+        )
+        coefficient, background = map(float, coefficients)
+        if coefficient <= 0.0:
+            raise ValueError("Signed-background high-Q fit did not find a positive Q^-1 coefficient.")
+    else:
+        coefficient, background, y_fit = _fit_positive_basis_with_bounded_background(
+            1.0 / q,
+            y,
+            err,
+            background_max=background_max,
+        )
     return AnchorFit(
         name="highQ_line",
         parameters={
@@ -432,16 +462,54 @@ def evaluate_anchor_fit(fit: AnchorFit, q: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unknown anchor fit type: {fit.name}")
 
 
-def estimate_peak_position(profile: RadialProfile, q_bounds: tuple[float, float]) -> dict[str, float]:
-    """Return the highest positive-intensity point in the selected Q window."""
+def estimate_peak_position(
+    profile: RadialProfile,
+    q_bounds: tuple[float, float],
+    *,
+    local_points: int = 7,
+) -> dict[str, float]:
+    """Estimate a local smooth peak using a weighted quadratic in log-Q/log-I."""
 
     mask = _fit_mask(profile, q_bounds)
-    if np.count_nonzero(mask) == 0:
-        raise ValueError("No positive points available for peak-position estimate.")
-    idx_local = int(np.argmax(profile.intensity[mask]))
     q = profile.q[mask]
     y = profile.intensity[mask]
-    return {"q_peak": float(q[idx_local]), "i_peak": float(y[idx_local])}
+    err = profile.error[mask]
+    if q.size < 3:
+        raise ValueError("Need at least three positive points for the polynomial peak estimate.")
+
+    local_points = min(int(local_points), q.size)
+    if local_points < 3:
+        raise ValueError("local_points must be at least three.")
+    peak_index = int(np.argmax(y))
+    start = max(0, min(peak_index - local_points // 2, q.size - local_points))
+    local = slice(start, start + local_points)
+    q = q[local]
+    y = y[local]
+    err = err[local]
+
+    log_q = np.log(q)
+    log_y = np.log(y)
+    center = float(log_q[np.argmax(y)])
+    relative_error = np.maximum(err / y, np.finfo(float).eps)
+    coefficients = np.polyfit(
+        log_q - center,
+        log_y,
+        deg=2,
+        w=1.0 / relative_error,
+    )
+    curvature, slope, intercept = map(float, coefficients)
+    if curvature >= 0.0:
+        raise ValueError("Quadratic peak fit is not concave within the selected Q window.")
+
+    offset_peak = -slope / (2.0 * curvature)
+    log_q_peak = center + offset_peak
+    if not float(np.min(log_q)) <= log_q_peak <= float(np.max(log_q)):
+        raise ValueError("Quadratic peak lies outside the selected Q window.")
+    log_i_peak = np.polyval(coefficients, offset_peak)
+    return {
+        "q_peak": float(np.exp(log_q_peak)),
+        "i_peak": float(np.exp(log_i_peak)),
+    }
 
 
 def _normal_sf(x: float) -> float:
@@ -467,11 +535,13 @@ def initial_heterogeneous_guess_from_anchors(
     highq_coefficient: float,
     b0: float = -1.0,
     r_sigma_k0: float = 0.2,
+    distribution_parameter_set: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, float]:
     """Build a physically coupled first guess from the anchor fits."""
 
     mean_k = float(q_peak)
-    r_sigma_k = float(r_sigma_k0)
+    parameter_set = dict(distribution_parameter_set or {})
+    r_sigma_k = float(parameter_set.get("r_sigma_k", {}).get("initial", r_sigma_k0))
     b = float(b0)
     factor = _kappa_over_kh_from_b(b)
     k_h_over_k = float(lowq_kappa) / max(mean_k * factor, np.finfo(float).tiny)
@@ -480,12 +550,27 @@ def initial_heterogeneous_guess_from_anchors(
     mu2 = mean_k * mean_k * (1.0 + r_sigma_k * r_sigma_k)
     rho0 = mu2 / (3.0 * np.pi)
     scale = float(highq_coefficient) / max(np.pi * p_h * rho0, np.finfo(float).tiny)
-    return {
+    initial = {
         "scale": max(scale, np.finfo(float).tiny),
         "mean_k": mean_k,
         "r_sigma_k": r_sigma_k,
         "k_H_over_k": k_h_over_k,
         "b": b,
+    }
+    for name, specification in parameter_set.items():
+        initial[name] = float(specification["initial"])
+    return initial
+
+
+def _distribution_parameter_values(
+    parameters: Mapping[str, float],
+    distribution_parameter_set: Mapping[str, Mapping[str, object]] | None,
+) -> dict[str, float]:
+    if distribution_parameter_set is None:
+        return {"r_sigma_k": float(parameters["r_sigma_k"])}
+    return {
+        str(name): float(parameters[name])
+        for name in distribution_parameter_set
     }
 
 
@@ -511,6 +596,7 @@ def evaluate_heterogeneous_line_guess(
     model_settings: Mapping[str, float | int | str | bool | None] | None = None,
     log_error_floor: float = 0.04,
     regression_loss: str | None = None,
+    distribution_parameter_set: Mapping[str, Mapping[str, object]] | None = None,
 ) -> HeterogeneousFitResult:
     """Evaluate one heterogeneous-line trial and solve only the scale factor."""
 
@@ -534,7 +620,11 @@ def evaluate_heterogeneous_line_guess(
         raise ValueError("Need at least eight positive observation points for model evaluation.")
 
     mean_k = float(parameters["mean_k"])
-    r_sigma_k = float(parameters["r_sigma_k"])
+    k_distribution_params = _distribution_parameter_values(
+        parameters,
+        distribution_parameter_set,
+    )
+    r_sigma_k = float(k_distribution_params["r_sigma_k"])
     k_h_over_k = float(parameters["k_H_over_k"])
     b = float(parameters["b"])
     q_min_factor = max(0.5 * q_min / mean_k, 1.0e-5)
@@ -542,6 +632,7 @@ def evaluate_heterogeneous_line_guess(
     line_kwargs = {
         "k0_nominal": mean_k,
         "r_sigma_k": r_sigma_k,
+        "k_distribution_params": k_distribution_params,
         "Q_min_factor": q_min_factor,
         "Q_max_factor": q_max_factor,
         "NQ": int(model_settings.get("NQ", 160)),
@@ -601,9 +692,13 @@ def evaluate_heterogeneous_line_guess(
         "rho0": float(hetero.rho0),
         "highq_coefficient": scale * np.pi * float(hetero.p_H) * float(hetero.rho0),
     }
+    params.update(k_distribution_params)
     return HeterogeneousFitResult(
         parameters=params,
-        free_parameters=np.asarray([mean_k, r_sigma_k, k_h_over_k, b], dtype=float),
+        free_parameters=np.asarray(
+            [mean_k, *k_distribution_params.values(), k_h_over_k, b],
+            dtype=float,
+        ),
         residual=residual,
         q=q_obs,
         intensity=i_obs,
@@ -630,13 +725,14 @@ def fit_heterogeneous_line_least_squares(
     anchor_weight: float = 2.0,
     log_error_floor: float = 0.03,
     regression_loss: str | None = None,
+    distribution_parameter_set: Mapping[str, Mapping[str, object]] | None = None,
     verbose: int = 0,
 ) -> HeterogeneousFitResult:
     """Constrained first-pass fit of the smooth heterogeneous-line model.
 
-    The nonlinear search uses four active parameters: ``mean_k``,
-    ``r_sigma_k``, ``k_H_over_k``, and ``b``. The overall scale is solved at
-    each trial by weighted log-amplitude matching, then high- and low-Q anchor
+    The nonlinear search uses ``mean_k``, ``k_H_over_k``, ``b``, and every
+    entry in ``distribution_parameter_set``. The overall scale is solved at
+    each trial by weighted amplitude matching, then high- and low-Q anchor
     residuals are added as soft constraints. Set ``regression_loss="relative"``
     to fit exact relative residuals instead of log residuals.
     """
@@ -661,21 +757,38 @@ def fit_heterogeneous_line_least_squares(
     if q_obs.size < 8:
         raise ValueError("Need at least eight positive observation points for constrained fitting.")
 
-    names = ("mean_k", "r_sigma_k", "k_H_over_k", "b")
+    parameter_set = dict(distribution_parameter_set or {})
+    distribution_names = tuple(parameter_set) if parameter_set else ("r_sigma_k",)
+    if "r_sigma_k" not in distribution_names:
+        raise ValueError("distribution_parameter_set must include 'r_sigma_k'.")
+    names = ("mean_k", *distribution_names, "k_H_over_k", "b")
     default_bounds = {
         "mean_k": (0.03, 0.3),
         "r_sigma_k": (0.03, 0.8),
         "k_H_over_k": (0.005, 0.5),
         "b": (-3.0, 1.5),
     }
+    for name, specification in parameter_set.items():
+        parameter_bounds = specification.get("bounds")
+        if parameter_bounds is None or len(parameter_bounds) != 2:
+            raise ValueError(f"Distribution parameter {name!r} needs a two-value 'bounds'.")
+        default_bounds[name] = tuple(map(float, parameter_bounds))
     lower = np.array([bounds.get(name, default_bounds[name])[0] for name in names], dtype=float)
     upper = np.array([bounds.get(name, default_bounds[name])[1] for name in names], dtype=float)
     x0 = np.array([float(initial[name]) for name in names], dtype=float)
     x0 = np.minimum(np.maximum(x0, lower + 1.0e-12), upper - 1.0e-12)
-    cache: dict[tuple[float, float, float, float], tuple[np.ndarray, object, object]] = {}
+    cache: dict[tuple[float, ...], tuple[np.ndarray, object, object]] = {}
 
     def evaluate_raw(params: np.ndarray) -> tuple[np.ndarray, object, object]:
-        mean_k, r_sigma_k, k_h_over_k, b = map(float, params)
+        values = dict(zip(names, map(float, params)))
+        mean_k = values["mean_k"]
+        r_sigma_k = values["r_sigma_k"]
+        k_h_over_k = values["k_H_over_k"]
+        b = values["b"]
+        k_distribution_params = {
+            name: values[name]
+            for name in distribution_names
+        }
         key = tuple(np.round(params, 10))
         if key in cache:
             return cache[key]
@@ -684,6 +797,7 @@ def fit_heterogeneous_line_least_squares(
         line_kwargs = {
             "k0_nominal": mean_k,
             "r_sigma_k": r_sigma_k,
+            "k_distribution_params": k_distribution_params,
             "Q_min_factor": q_min_factor,
             "Q_max_factor": q_max_factor,
             "NQ": int(model_settings.get("NQ", 160)),
@@ -760,7 +874,11 @@ def fit_heterogeneous_line_least_squares(
     )
     scale, model, residual = scaled_model_and_residual(opt.x)
     raw, line, hetero = evaluate_raw(opt.x)
-    mean_k, r_sigma_k, k_h_over_k, b = map(float, opt.x)
+    fitted = dict(zip(names, map(float, opt.x)))
+    mean_k = fitted["mean_k"]
+    r_sigma_k = fitted["r_sigma_k"]
+    k_h_over_k = fitted["k_H_over_k"]
+    b = fitted["b"]
     params = {
         "scale": scale,
         "mean_k": mean_k,
@@ -775,6 +893,7 @@ def fit_heterogeneous_line_least_squares(
         "rho0": float(hetero.rho0),
         "highq_coefficient": scale * np.pi * float(hetero.p_H) * float(hetero.rho0),
     }
+    params.update({name: fitted[name] for name in distribution_names})
     return HeterogeneousFitResult(
         parameters=params,
         free_parameters=opt.x,
@@ -807,6 +926,7 @@ class HeterogeneousPreview:
     k_line: float
     k_distribution: str
     r_sigma_k: float
+    k_distribution_params: dict[str, float]
     k_H: float
     lateral_size: float
     thickness: float
@@ -833,6 +953,7 @@ def sample_preview_k_vectors(
     *,
     k_distribution: str = "single_shell",
     r_sigma_k: float = 0.0,
+    k_distribution_params: Mapping[str, float] | None = None,
     random_seed: int = 12345,
 ) -> np.ndarray:
     if k_distribution == "single_shell":
@@ -844,6 +965,7 @@ def sample_preview_k_vectors(
         rng,
         k0=float(k0),
         sigma_k=float(r_sigma_k) * float(k0),
+        distribution_params=k_distribution_params,
         use_qmc=False,
         qmc_seed=int(random_seed),
     )
@@ -1095,6 +1217,7 @@ def render_fit_heterogeneous_preview(
     visual_k_line: float = 10.0,
     line_k_distribution: str = "single_shell",
     line_r_sigma_k: float | None = None,
+    line_k_distribution_params: Mapping[str, float] | None = None,
     random_seed: int = 12345,
     num_line_modes: int = 128,
     nx: int = 160,
@@ -1136,6 +1259,8 @@ def render_fit_heterogeneous_preview(
         if line_r_sigma_k is None
         else float(line_r_sigma_k)
     )
+    k_distribution_params = dict(line_k_distribution_params or {})
+    k_distribution_params.setdefault("r_sigma_k", r_sigma_k)
     k_H = max(k_h_over_k * k_line, np.finfo(float).eps)
     xi_dab = 1.0 / k_H
     lateral_size = float(lateral_size_over_mask_length) / k_H
@@ -1150,6 +1275,7 @@ def render_fit_heterogeneous_preview(
         rng,
         k_distribution=str(line_k_distribution),
         r_sigma_k=r_sigma_k,
+        k_distribution_params=k_distribution_params,
         random_seed=random_seed,
     )
     phi_real = random_wave_field(X, Y, Z, k_vectors, rng)
@@ -1282,6 +1408,7 @@ def render_fit_heterogeneous_preview(
         k_line=k_line,
         k_distribution=str(line_k_distribution),
         r_sigma_k=r_sigma_k,
+        k_distribution_params=k_distribution_params,
         k_H=k_H,
         lateral_size=lateral_size,
         thickness=thickness,

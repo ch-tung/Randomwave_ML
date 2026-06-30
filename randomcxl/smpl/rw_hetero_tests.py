@@ -270,6 +270,32 @@ def check_uniform_line_unchanged() -> dict[str, float]:
     return {"rho0": rho0, "pi_rho0": expected_coeff}
 
 
+def check_max_entropy_radial_moments() -> dict[str, float]:
+    target_mean = 1.0
+    target_std = 0.28
+    target_skewness = 0.0
+    radii, weights = rw.make_radial_k_quadrature(
+        512,
+        "max_entropy_radial",
+        k0=target_mean,
+        sigma_k=target_std,
+        distribution_params={
+            "r_sigma_k": target_std / target_mean,
+            "skewness": target_skewness,
+            "support_sigma": 8.0,
+        },
+    )
+    mean = float(np.dot(weights, radii))
+    centered = radii - mean
+    std = float(np.sqrt(np.dot(weights, centered * centered)))
+    skewness = float(np.dot(weights, centered**3) / std**3)
+    assert abs(mean - target_mean) < 1.0e-10
+    assert abs(std - target_std) < 1.0e-10
+    assert abs(skewness - target_skewness) < 1.0e-8
+    assert np.all(radii > 0.0)
+    return {"mean": mean, "std": std, "skewness": skewness}
+
+
 def run_all_checks() -> dict[str, dict[str, float]]:
     results = {
         "kernel_normalization": check_kernel_normalization(),
@@ -282,6 +308,7 @@ def run_all_checks() -> dict[str, dict[str, float]]:
         "high_q_coefficient": check_high_q_coefficient(),
         "approximation_levels": check_approximation_levels(),
         "uniform_line_unchanged": check_uniform_line_unchanged(),
+        "max_entropy_radial_moments": check_max_entropy_radial_moments(),
     }
     return results
 
