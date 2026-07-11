@@ -1,0 +1,7 @@
+name,value_1,value_2,background,relative_rmse
+subtracted_background,-0.01826835255509591,nan,nan,nan
+characteristic_q,0.05,nan,nan,nan
+lowQ_DAB_kappa_position,0.006,1.0,1.0,nan
+lowQ_DAB,0.006,1.5159059181847977e-08,0.0,0.5966122180616041
+lowQ_Qminus4,8.622333000274814e-09,nan,0.0,0.6642325327071713
+highQ_line,0.009335618981773803,0.002971619815543655,0.0,0.05408214750191011

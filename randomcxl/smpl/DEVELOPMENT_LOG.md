@@ -581,3 +581,37 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
   removes the abrupt small-`Q` truncation artifact in
   `sigma_H^2 A_kappa[I_L]`, while preserving the existing kernel,
   tail-correction, high-`Q`, and uniform-line tests.
+
+## 2026-07-10 Pecora Digitized-Curve Fitting And Comparison
+
+- Added a Pecora-specific curvefit workflow under `curvefit/` for the five
+  digitized Borsali/Nguyen/Pecora 1998 salt conditions. `cf_pecora.ipynb` fits
+  one selected series at a time and writes the corrected observation, anchor
+  diagnostics, fitted parameters, fitted curve, and figures to
+  `curvefit/output/pecora`.
+- Replaced the low-`Q` DAB anchor in `cf_pecora.ipynb` with a notebook-local
+  controlled anchor:
+
+  ```python
+  LOWQ_DAB_KAPPA_POSITION
+  LOWQ_DAB_KAPPA_FACTOR_BOUNDS
+  LOWQ_DAB_N_KAPPA
+  LOWQ_INITIAL_KAPPA_SCALE
+  LOWQ_ANCHOR_WEIGHT
+  ```
+
+  `LOWQ_DAB_KAPPA_POSITION` directly moves the low-`Q` asymptotic crossover.
+  With `LOWQ_DAB_KAPPA_FACTOR_BOUNDS = (1.0, 1.0)`, the DAB anchor uses
+  exactly that chosen `kappa`; wider bounds allow a local search around the
+  selected position. The heterogeneous-line initial guess now uses this
+  controlled low-`Q` `kappa` directly, and the nonlinear fit uses
+  `LOWQ_ANCHOR_WEIGHT` for the soft low-`Q` constraint.
+- Added `cf_compare_pecora.ipynb`, following the YYW comparison notebook
+  pattern but without 3D rendering. It loads all five Pecora fitted outputs,
+  plots the background-corrected observations and fitted curves together,
+  summarizes the floating and derived fit parameters, and overlays all fitted
+  curves on the original Pecora 1998 figure.
+- The Pecora figure overlay uses the same linear plot-frame calibration as
+  `curvefit/data/pecora/digitize_pecora.py`, and adds the subtracted constant
+  background back to each fitted curve so it sits in the printed figure's
+  original `(q, I(q))` coordinate system.
