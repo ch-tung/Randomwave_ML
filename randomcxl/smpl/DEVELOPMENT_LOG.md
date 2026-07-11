@@ -618,6 +618,9 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
 
 ## 2026-07-11 General-Line Low-Q And Tangent-Correlation Methods
 
+- Added `rw_line_tcorr.ipynb` as the reference workflow for computing and
+  plotting the signed ordered-field and line-density-weighted nematic tangent
+  correlations, with its numerical arrays saved under `rw_line_tcorr_output`.
 - Updated `rw_line_general.ipynb` with explicit controls for fitting and
   stitching the quadratic low-`Q` asymptotic form into the finite-window
   coherent transform. The notebook now retains the original and stitched
