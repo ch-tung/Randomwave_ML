@@ -3183,6 +3183,161 @@ def bc_from_stats(r: float, a: float, g: float, gp: float, gpp: float) -> tuple[
     return a, g, b, c
 
 
+def signed_tangent_moment_from_stats(
+    r: np.ndarray | float,
+    g: np.ndarray | float,
+    gp: np.ndarray | float,
+    gpp: np.ndarray | float,
+) -> np.ndarray:
+    """Return the conditional signed cross-product moment ``M_T(r)``.
+
+    The ordered fields orient the zero line by ``grad(psi1) x grad(psi2)``.
+    Conditioned on zeros at both positions, the transverse and longitudinal
+    cross-position gradient covariances are
+
+    ``b = -g'/r`` and ``c_z = -g'' - g (g')^2 / (1-g^2)``.
+
+    Wick contraction then gives ``M_T = 2 b^2 + 4 b c_z``.  Inputs broadcast
+    following NumPy rules; all separations must be strictly positive.
+    """
+
+    r_arr, g_arr, gp_arr, gpp_arr = np.broadcast_arrays(
+        np.asarray(r, dtype=float),
+        np.asarray(g, dtype=float),
+        np.asarray(gp, dtype=float),
+        np.asarray(gpp, dtype=float),
+    )
+    if np.any(r_arr <= 0.0):
+        raise ValueError("r must be strictly positive.")
+    denom = np.maximum(1.0 - g_arr * g_arr, np.finfo(float).tiny)
+    b = -gp_arr / r_arr
+    c_z = -gpp_arr - g_arr * gp_arr * gp_arr / denom
+    return 2.0 * b * b + 4.0 * b * c_z
+
+
+def signed_tangent_correlation_from_stats(
+    r: np.ndarray | float,
+    g: np.ndarray | float,
+    gp: np.ndarray | float,
+    gpp: np.ndarray | float,
+    M_J: np.ndarray | float,
+) -> np.ndarray:
+    """Return the exact field-oriented tangent correlation ``K_T^raw``.
+
+    This evaluates Eq. ``K_T^raw = M_T/M_J``.  ``M_J`` is the conditional
+    unsigned Jacobian moment used in the line-density correlation.  The result
+    is the raw ordered-field correlation, not the polarity-averaged or traced
+    same-component correlation.
+    """
+
+    m_t = signed_tangent_moment_from_stats(r, g, gp, gpp)
+    m_j = np.asarray(M_J, dtype=float)
+    return np.divide(m_t, m_j, out=np.full(np.broadcast_shapes(m_t.shape, m_j.shape), np.nan), where=m_j != 0.0)
+
+
+def compute_signed_tangent_correlation(
+    r_grid: np.ndarray,
+    k_radii: np.ndarray,
+    M_J: np.ndarray,
+    *,
+    k_weights: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Compute ``g``, conditional covariance terms, ``M_T``, and ``K_T^raw``.
+
+    The radial covariance and its first two derivatives are evaluated from the
+    same sampled radial spectrum used by :func:`compute_CL_general`.
+    """
+
+    r_grid = np.asarray(r_grid, dtype=float)
+    M_J = np.asarray(M_J, dtype=float)
+    if r_grid.ndim != 1 or M_J.shape != r_grid.shape:
+        raise ValueError("r_grid and M_J must be one-dimensional arrays with identical shape.")
+    g, gp, gpp = radial_covariance_numeric(r_grid, k_radii, k_weights=k_weights)
+    denom = np.maximum(1.0 - g * g, np.finfo(float).tiny)
+    b = -gp / r_grid
+    c_z = -gpp - g * gp * gp / denom
+    M_T = 2.0 * b * b + 4.0 * b * c_z
+    K_T_raw = np.divide(M_T, M_J, out=np.full_like(M_T, np.nan), where=M_J != 0.0)
+    return {"g": g, "gp": gp, "gpp": gpp, "b": b, "c_z": c_z, "M_T": M_T, "K_T_raw": K_T_raw}
+
+
+def estimate_nematic_tangent_moments_for_r_general(
+    r: float,
+    k_radii: np.ndarray,
+    z_u: np.ndarray,
+    z_v: np.ndarray,
+    *,
+    k_weights: np.ndarray | None = None,
+    jitter_scale: float = 1.0e-12,
+) -> tuple[float, float, float]:
+    """Estimate ``M_J``, ``M_2``, and ``K_2`` from common conditional samples.
+
+    Each sample is weighted by ``w=|omega_0||omega_r|`` as required by the
+    Kac--Rice line-density measure.  Thus ``K_2=sum(w P_2(mu))/sum(w)``; it is
+    not the unweighted orientation average ``mean(P_2(mu))``.
+    """
+
+    if r <= 0.0:
+        raise ValueError("r must be strictly positive.")
+    z_u = np.asarray(z_u, dtype=float)
+    z_v = np.asarray(z_v, dtype=float)
+    if z_u.ndim != 2 or z_u.shape[1] != 6 or z_v.shape != z_u.shape:
+        raise ValueError("z_u and z_v must have identical shape (n_samp, 6).")
+    sigma = conditional_covariance_from_radial_spectrum(r, k_radii, k_weights=k_weights)
+    a = gradient_variance_from_k_radii(k_radii, k_weights=k_weights)
+    factor = covariance_factor(sigma, jitter_scale * a)
+    u = z_u @ factor.T
+    v = z_v @ factor.T
+    omega_0 = np.cross(u[:, :3], v[:, :3])
+    omega_r = np.cross(u[:, 3:], v[:, 3:])
+    norm_0 = np.linalg.norm(omega_0, axis=1)
+    norm_r = np.linalg.norm(omega_r, axis=1)
+    weight = norm_0 * norm_r
+    dot = np.einsum("ij,ij->i", omega_0, omega_r)
+    mu = np.divide(dot, weight, out=np.zeros_like(dot), where=weight > 0.0)
+    mu = np.clip(mu, -1.0, 1.0)
+    p2 = 0.5 * (3.0 * mu * mu - 1.0)
+    m_j = float(np.mean(weight))
+    m_2 = float(np.mean(weight * p2))
+    k_2 = m_2 / m_j if m_j != 0.0 else np.nan
+    return m_j, m_2, k_2
+
+
+def compute_nematic_tangent_correlation(
+    r_grid: np.ndarray,
+    k_radii: np.ndarray,
+    n_samp: int = DEFAULT_N_SAMP,
+    *,
+    k_weights: np.ndarray | None = None,
+    use_qmc: bool = True,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    progress: bool = True,
+) -> dict[str, np.ndarray]:
+    """Compute the line-density-weighted nematic correlation ``K_2(r)``.
+
+    Common 12D Sobol (or pseudorandom) normal points are reused at every
+    separation and split between the two independent fields, matching the
+    direct-12D estimator in :func:`compute_CL_general`.
+    """
+
+    r_grid = np.asarray(r_grid, dtype=float)
+    if r_grid.ndim != 1 or np.any(r_grid <= 0.0):
+        raise ValueError("r_grid must be a one-dimensional array of positive separations.")
+    z_u, z_v = standard_normal_samples(int(n_samp), use_qmc=use_qmc, random_seed=int(random_seed))
+    m_j = np.empty_like(r_grid)
+    m_2 = np.empty_like(r_grid)
+    k_2 = np.empty_like(r_grid)
+    t0 = time.perf_counter()
+    report_every = max(1, len(r_grid) // 20)
+    for idx, r in enumerate(r_grid):
+        m_j[idx], m_2[idx], k_2[idx] = estimate_nematic_tangent_moments_for_r_general(
+            float(r), k_radii, z_u, z_v, k_weights=k_weights
+        )
+        if progress and ((idx + 1) % report_every == 0 or idx + 1 == len(r_grid)):
+            print(f"K_2 direct_12d: {idx + 1}/{len(r_grid)} r values ({time.perf_counter() - t0:.1f}s)")
+    return {"M_J": m_j, "M_2": m_2, "K_2": k_2}
+
+
 def self_conditional_covariance_from_stats(r: float, a: float, g: float, gp: float, gpp: float) -> np.ndarray:
     """6x6 gradient covariance for one field conditioned on psi(0)=psi(r)=0."""
 

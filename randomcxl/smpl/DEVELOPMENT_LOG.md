@@ -615,3 +615,18 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
   `curvefit/data/pecora/digitize_pecora.py`, and adds the subtracted constant
   background back to each fitted curve so it sits in the printed figure's
   original `(q, I(q))` coordinate system.
+
+## 2026-07-11 General-Line Low-Q And Tangent-Correlation Methods
+
+- Updated `rw_line_general.ipynb` with explicit controls for fitting and
+  stitching the quadratic low-`Q` asymptotic form into the finite-window
+  coherent transform. The notebook now retains the original and stitched
+  transforms, the asymptotic curve, fit/replacement masks, fitted coefficients,
+  and relative fit error in its saved output.
+- Added exact ordered-field signed tangent-moment helpers to
+  `rw_line_scattering.py`. They evaluate the conditional Wick contraction
+  `M_T = 2 b^2 + 4 b c_z` and the raw signed correlation `K_T^raw = M_T/M_J`
+  from the radial covariance and its derivatives.
+- Added a direct conditional-sampling estimator for the line-density-weighted
+  nematic moment. It reuses common Sobol or pseudorandom normal samples over
+  separation and returns `M_J`, `M_2`, and `K_2 = M_2/M_J`.
