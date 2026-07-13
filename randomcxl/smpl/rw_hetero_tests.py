@@ -296,6 +296,42 @@ def check_max_entropy_radial_moments() -> dict[str, float]:
     return {"mean": mean, "std": std, "skewness": skewness}
 
 
+def check_nematic_sampled_infinite_baseline() -> dict[str, float]:
+    n_samp = 2**10
+    random_seed = 12345
+    k_radii = np.array([0.9, 1.0, 1.1])
+    result = rw.compute_nematic_tangent_correlation(
+        np.array([1.0, 50.0]),
+        k_radii,
+        n_samp,
+        use_qmc=True,
+        random_seed=random_seed,
+        progress=False,
+    )
+    z_u, z_v = rw.standard_normal_samples(
+        n_samp,
+        use_qmc=True,
+        random_seed=random_seed,
+    )
+    omega_0 = np.cross(z_u[:, :3], z_v[:, :3])
+    omega_r = np.cross(z_u[:, 3:], z_v[:, 3:])
+    weight = np.linalg.norm(omega_0, axis=1) * np.linalg.norm(omega_r, axis=1)
+    mu = np.divide(
+        np.einsum("ij,ij->i", omega_0, omega_r),
+        weight,
+        out=np.zeros_like(weight),
+        where=weight > 0.0,
+    )
+    p2 = 0.5 * (3.0 * np.clip(mu, -1.0, 1.0) ** 2 - 1.0)
+    expected = float(np.sum(weight * p2) / np.sum(weight))
+    assert result["K_2_sampled"] is result["K_2"]
+    assert abs(float(result["K_2_inf_sampled"]) - expected) < 1.0e-15
+    return {
+        "K_2_inf_sampled": float(result["K_2_inf_sampled"]),
+        "K_2_large_r": float(result["K_2"][-1]),
+    }
+
+
 def run_all_checks() -> dict[str, dict[str, float]]:
     results = {
         "kernel_normalization": check_kernel_normalization(),
@@ -309,6 +345,7 @@ def run_all_checks() -> dict[str, dict[str, float]]:
         "approximation_levels": check_approximation_levels(),
         "uniform_line_unchanged": check_uniform_line_unchanged(),
         "max_entropy_radial_moments": check_max_entropy_radial_moments(),
+        "nematic_sampled_infinite_baseline": check_nematic_sampled_infinite_baseline(),
     }
     return results
 

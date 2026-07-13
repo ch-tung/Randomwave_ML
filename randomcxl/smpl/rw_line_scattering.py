@@ -3288,6 +3288,19 @@ def estimate_nematic_tangent_moments_for_r_general(
     factor = covariance_factor(sigma, jitter_scale * a)
     u = z_u @ factor.T
     v = z_v @ factor.T
+    return _nematic_tangent_moments_from_gradient_samples(u, v)
+
+
+def _nematic_tangent_moments_from_gradient_samples(
+    u: np.ndarray,
+    v: np.ndarray,
+) -> tuple[float, float, float]:
+    """Return ``M_J``, ``M_2``, and ``K_2`` from paired gradient samples."""
+
+    u = np.asarray(u, dtype=float)
+    v = np.asarray(v, dtype=float)
+    if u.ndim != 2 or u.shape[1] != 6 or v.shape != u.shape:
+        raise ValueError("u and v must have identical shape (n_samp, 6).")
     omega_0 = np.cross(u[:, :3], v[:, :3])
     omega_r = np.cross(u[:, 3:], v[:, 3:])
     norm_0 = np.linalg.norm(omega_0, axis=1)
@@ -3312,18 +3325,25 @@ def compute_nematic_tangent_correlation(
     use_qmc: bool = True,
     random_seed: int = DEFAULT_RANDOM_SEED,
     progress: bool = True,
-) -> dict[str, np.ndarray]:
+) -> dict[str, np.ndarray | float]:
     """Compute the line-density-weighted nematic correlation ``K_2(r)``.
 
     Common 12D Sobol (or pseudorandom) normal points are reused at every
     separation and split between the two independent fields, matching the
     direct-12D estimator in :func:`compute_CL_general`.
+
+    ``K_2_inf_sampled`` is the finite-sample infinite-separation baseline
+    evaluated from the same standardized 12D points.  Its exact ensemble
+    value is zero, but a finite deterministic or pseudorandom sample generally
+    leaves a small residual.  ``K_2_sampled`` is an explicit alias of ``K_2``
+    for symmetry with that diagnostic key.
     """
 
     r_grid = np.asarray(r_grid, dtype=float)
     if r_grid.ndim != 1 or np.any(r_grid <= 0.0):
         raise ValueError("r_grid must be a one-dimensional array of positive separations.")
     z_u, z_v = standard_normal_samples(int(n_samp), use_qmc=use_qmc, random_seed=int(random_seed))
+    _, _, k_2_inf_sampled = _nematic_tangent_moments_from_gradient_samples(z_u, z_v)
     m_j = np.empty_like(r_grid)
     m_2 = np.empty_like(r_grid)
     k_2 = np.empty_like(r_grid)
@@ -3335,7 +3355,13 @@ def compute_nematic_tangent_correlation(
         )
         if progress and ((idx + 1) % report_every == 0 or idx + 1 == len(r_grid)):
             print(f"K_2 direct_12d: {idx + 1}/{len(r_grid)} r values ({time.perf_counter() - t0:.1f}s)")
-    return {"M_J": m_j, "M_2": m_2, "K_2": k_2}
+    return {
+        "M_J": m_j,
+        "M_2": m_2,
+        "K_2": k_2,
+        "K_2_sampled": k_2,
+        "K_2_inf_sampled": float(k_2_inf_sampled),
+    }
 
 
 def self_conditional_covariance_from_stats(r: float, a: float, g: float, gp: float, gpp: float) -> np.ndarray:

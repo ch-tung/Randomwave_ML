@@ -616,6 +616,29 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
   background back to each fitted curve so it sits in the printed figure's
   original `(q, I(q))` coordinate system.
 
+## 2026-07-13 Sampled Nematic Infinite-Separation Baseline
+
+- Extended `compute_nematic_tangent_correlation(...)` to return
+  `K_2_sampled` and `K_2_inf_sampled` in addition to the backward-compatible
+  `K_2` key.
+- `K_2_inf_sampled` is evaluated from the same standardized 12D Sobol or
+  pseudorandom gradient samples used at every separation. It exposes the
+  finite-sample residual around the exact isotropic limit `K_2(infinity)=0`
+  without imposing a numerical lower bound or altering the sampled curve.
+
+## 2026-07-13 Pecora Real-Space And Orientation Comparisons
+
+- Extended `curvefit/cf_compare_pecora.ipynb` with matched heterogeneous and
+  unmasked 3D slices for all five salt conditions. The 1 M fit defines a
+  common physical box, while a fixed visual tube radius avoids assigning an
+  unsupported physical cross-section without Pecora composition/SLD inputs.
+- Added two-panel comparison of the exact signed ordered-field correlation
+  `K_T^raw` and the line-density-weighted nematic correlation `K_2`, using
+  each condition's fitted maximum-entropy radial spectrum and a common
+  dimensionless separation axis `r*k_eff`.
+- Saved the renderings, orientation plot, and per-condition orientation data
+  under `curvefit/output/pecora`.
+
 ## 2026-07-11 General-Line Low-Q And Tangent-Correlation Methods
 
 - Added `rw_line_tcorr.ipynb` as the reference workflow for computing and
