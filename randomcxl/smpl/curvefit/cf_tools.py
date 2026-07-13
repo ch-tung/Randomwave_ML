@@ -588,6 +588,81 @@ def _import_line_scattering():
         return rls
 
 
+def compute_fit_orientation_correlations(
+    fit_parameters: Mapping[str, float],
+    *,
+    x_grid: np.ndarray,
+    num_k_modes: int = 2**13,
+    n_samp: int = 2**14,
+    random_seed: int = 12345,
+    progress: bool = False,
+) -> dict[str, np.ndarray | float]:
+    """Compute signed and nematic orientation correlations for one saved fit.
+
+    The fit is interpreted using the maximum-entropy radial spectrum employed
+    by the heterogeneous curve-fit notebooks.  ``x_grid`` is the common
+    dimensionless separation ``r*k_eff``.  The nematic calculation supplies
+    the conditional Jacobian moment used to normalize the exact signed
+    correlation, avoiding a duplicate direct-12D calculation.
+    """
+
+    x_grid = np.asarray(x_grid, dtype=float)
+    if x_grid.ndim != 1 or x_grid.size == 0 or np.any(x_grid <= 0.0):
+        raise ValueError("x_grid must be a nonempty one-dimensional array of positive values.")
+    num_k_modes = int(num_k_modes)
+    n_samp = int(n_samp)
+    if num_k_modes <= 0 or n_samp <= 0:
+        raise ValueError("num_k_modes and n_samp must be positive.")
+
+    rls = _import_line_scattering()
+    mean_k = float(fit_parameters["mean_k"])
+    r_sigma_k = float(fit_parameters["r_sigma_k"])
+    skewness = float(fit_parameters["skewness"])
+    k_rng = np.random.default_rng(int(random_seed))
+    k_sets = rls.make_field_k_sets(
+        num_k_modes,
+        "max_entropy_radial",
+        k_rng,
+        k0=mean_k,
+        r_sigma_k=r_sigma_k,
+        distribution_params={"skewness": skewness},
+        shared_k_vectors=True,
+        use_qmc_k=True,
+        qmc_seed=int(random_seed),
+    )
+    k_radii = rls.k_radii_from_vectors(k_sets.psi1)
+    k_eff = float(
+        np.sqrt(3.0 * rls.gradient_variance_from_k_radii(k_radii))
+    )
+    r_grid = x_grid / k_eff
+
+    nematic = rls.compute_nematic_tangent_correlation(
+        r_grid,
+        k_radii,
+        n_samp,
+        use_qmc=True,
+        random_seed=int(random_seed),
+        progress=bool(progress),
+    )
+    signed = rls.compute_signed_tangent_correlation(
+        r_grid,
+        k_radii,
+        nematic["M_J"],
+    )
+    return {
+        "r_grid": r_grid,
+        "r_k_eff": x_grid.copy(),
+        "k_eff": k_eff,
+        "M_J": nematic["M_J"],
+        "M_T": signed["M_T"],
+        "M_2": nematic["M_2"],
+        "K_T_raw": signed["K_T_raw"],
+        "K_2": nematic["K_2"],
+        "K_2_sampled": nematic["K_2_sampled"],
+        "K_2_inf_sampled": float(nematic["K_2_inf_sampled"]),
+    }
+
+
 def evaluate_heterogeneous_line_guess(
     observation: RadialProfile,
     *,

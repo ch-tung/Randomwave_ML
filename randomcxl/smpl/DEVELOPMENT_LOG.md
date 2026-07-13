@@ -656,3 +656,15 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
 - Added a direct conditional-sampling estimator for the line-density-weighted
   nematic moment. It reuses common Sobol or pseudorandom normal samples over
   separation and returns `M_J`, `M_2`, and `K_2 = M_2/M_J`.
+
+## 2026-07-13 Shared Fit-Orientation Comparison Workflow
+
+- Added `compute_fit_orientation_correlations(...)` to `curvefit/cf_tools.py`
+  to centralize construction of the fitted maximum-entropy spectrum and the
+  signed and nematic real-space orientation correlations derived from it.
+- Refactored `curvefit/cf_compare_pecora.ipynb` to use the shared helper while
+  preserving its edited two-panel plotting choices.
+- Added matching calculation and plotting cells to
+  `curvefit/cf_compare_yyw.ipynb` for the 55A, 55B, and 55C fits. The cells
+  save per-sample arrays and a combined two-panel figure under
+  `curvefit/output/yyw`.
