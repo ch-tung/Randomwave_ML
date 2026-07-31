@@ -582,39 +582,203 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
   `sigma_H^2 A_kappa[I_L]`, while preserving the existing kernel,
   tail-correction, high-`Q`, and uniform-line tests.
 
-## 2026-07-10 Pecora Digitized-Curve Fitting And Comparison
+## 2026-07-01 55B/55C Density, Absolute Scale, and SLD Analysis
 
-- Added a Pecora-specific curvefit workflow under `curvefit/` for the five
-  digitized Borsali/Nguyen/Pecora 1998 salt conditions. `cf_pecora.ipynb` fits
-  one selected series at a time and writes the corrected observation, anchor
-  diagnostics, fitted parameters, fitted curve, and figures to
-  `curvefit/output/pecora`.
-- Replaced the low-`Q` DAB anchor in `cf_pecora.ipynb` with a notebook-local
-  controlled anchor:
+Extended `curvefit/cf_compare_55B_55C.ipynb` with a physical interpretation of
+the fitted 55B and 55C line models. The notebook now compares the fitted line
+density and absolute scattering scale with the nominal PSSNa concentrations
+of 1.5 wt% for 55B and 4.5 wt% for 55C.
 
-  ```python
-  LOWQ_DAB_KAPPA_POSITION
-  LOWQ_DAB_KAPPA_FACTOR_BOUNDS
-  LOWQ_DAB_N_KAPPA
-  LOWQ_INITIAL_KAPPA_SCALE
-  LOWQ_ANCHOR_WEIGHT
-  ```
+### Line-Length Density and Polymer Content
 
-  `LOWQ_DAB_KAPPA_POSITION` directly moves the low-`Q` asymptotic crossover.
-  With `LOWQ_DAB_KAPPA_FACTOR_BOUNDS = (1.0, 1.0)`, the DAB anchor uses
-  exactly that chosen `kappa`; wider bounds allow a local search around the
-  selected position. The heterogeneous-line initial guess now uses this
-  controlled low-`Q` `kappa` directly, and the nonlinear fit uses
-  `LOWQ_ANCHOR_WEIGHT` for the soft low-`Q` constraint.
-- Added `cf_compare_pecora.ipynb`, following the YYW comparison notebook
-  pattern but without 3D rendering. It loads all five Pecora fitted outputs,
-  plots the background-corrected observations and fitted curves together,
-  summarizes the floating and derived fit parameters, and overlays all fitted
-  curves on the original Pecora 1998 figure.
-- The Pecora figure overlay uses the same linear plot-frame calibration as
-  `curvefit/data/pecora/digitize_pecora.py`, and adds the subtracted constant
-  background back to each fitted curve so it sits in the printed figure's
-  original `(q, I(q))` coordinate system.
+The fitted random-wave parameter
+
+```text
+rho0 = <k^2>/(3*pi)
+```
+
+is the unmasked geometrical line length per unit volume. The heterogeneous
+mask retains the fraction `p_H`, so the retained density is `p_H*rho0`.
+For `Q` in inverse angstroms,
+
+```text
+1 A^-2 = 100 nm/nm^3
+```
+
+and the fitted results are:
+
+- 55B: `0.0125091 nm/nm^3` unmasked and `0.00984155 nm/nm^3` retained.
+- 55C: `0.0336456 nm/nm^3` unmasked and `0.0320908 nm/nm^3` retained.
+
+The mass conversion assumes a PSSNa repeat molar mass of `206.19 g/mol` and
+an all-trans contour increment of `0.25 nm/repeat`. It gives apparent polymer
+contents of:
+
+- 55B: `1.234 wt%` from the unmasked density and `0.974 wt%` from the
+  retained density.
+- 55C: `3.252 wt%` from the unmasked density and `3.106 wt%` from the
+  retained density.
+
+Inverting the independently known 1.5/4.5 wt% compositions gives the amount
+of chemical contour represented by one unit of fitted smooth-line length.
+For the unmasked density, the true-contour/fitted-line factors are `1.219`
+for 55B and `1.402` for 55C, corresponding to effective repeat advances of
+`0.205 nm` and `0.178 nm`. The analogous retained-line factors are `1.549`
+and `1.470`, with advances of `0.161 nm` and `0.170 nm`.
+
+These factors measure unresolved local tortuosity or coarse-graining; they are
+not Kuhn lengths. The all-trans sp3 geometry gives about `0.25 nm` per vinyl
+repeat, about `4 repeats/nm`, or about `8 backbone carbons/nm`. The inferred
+values of roughly `9.75-12.39 backbone carbons/nm` indicate additional contour
+per fitted line length, but a Kuhn length requires a tangent-correlation
+measurement or a long-chain relation such as `b_K ~= 6 R_g^2/L`.
+
+### Coherent Contrast and Effective Cross-Section
+
+Bound coherent scattering lengths were assembled for hydrogenated PSSNa
+`C8H7NaO3S` and glycerol-d8 `C3D8O3`. The working material values are:
+
+```text
+PSSNa dry SLD       = 2.248e-6 A^-2
+glycerol-d8 SLD     = 7.47928e-6 A^-2
+Delta rho           = -5.23128e-6 A^-2
+PSSNa dry density   = 1.51272 g/cm^3
+glycerol-d8 density = 1.371 g/cm^3
+```
+
+For a thin line, the excess coherent scattering length per unit contour is
+
+```text
+beta_L = integral_cross_section Delta_rho(r_perp) dA
+       ~= Delta_rho * A_eff
+```
+
+and, with the measured intensity in `cm^-1` and `Q` in `A^-1`, the fitted
+dimensionless multiplier obeys
+
+```text
+scale = 1e8 * (Delta_rho * A_eff)^2.
+```
+
+Thus `A_eff` is derived after the fit from the absolute intensity multiplier;
+it is not an independently fitted geometric radius. The fitted values are:
+
+- 55B: `A_eff = 1.15912 nm^2`, equivalent circular radius `0.6074 nm`.
+- 55C: `A_eff = 1.07189 nm^2`, equivalent circular radius `0.5841 nm`.
+
+The random-wave line density and correlations determine the shape and
+geometrical amplitude of `I_L(Q)`, while `scale` supplies the squared coherent
+cross-section per unit length. They are separate model parameters, although
+absolute data constrain their product; for example, the local-line high-`Q`
+amplitude is proportional to `scale*p_H*rho0`.
+
+The uniform solvent SLD contributes only to the forward-scattering component.
+The model removes the large-distance `rho0^2` plateau before the finite-`Q`
+transform, so the fitted signal represents excess SLD fluctuations relative
+to the background. Hydration, dissociated-counterion partitioning, a diffuse
+radial SLD profile, and residual incoherent background are not separately
+resolved and are therefore folded into `A_eff` and the fitted background.
+
+### Nominal-Composition SLD Distribution
+
+Assuming additive component volumes, the polymer volume fraction is calculated
+from the nominal mass fraction `w` as
+
+```text
+phi_p = (w/rho_p) / ((w/rho_p) + ((1-w)/rho_s)).
+```
+
+The simplest molecular-resolution, two-component SLD distribution is then
+
+```text
+P(rho) = (1-phi_p) delta(rho-rho_s) + phi_p delta(rho-rho_p),
+mean(rho) = (1-phi_p) rho_s + phi_p rho_p,
+variance(rho) = phi_p (1-phi_p) (rho_p-rho_s)^2.
+```
+
+This nominal composition determines only the one-point distribution. Its
+spatial covariance, and hence the `Q` dependence, is supplied by the fitted
+random-wave line and mask model.
+
+The resulting estimates are:
+
+- 55B: `phi_p = 0.0136139`, mean SLD `7.40806e-6 A^-2`, and RMS local
+  fluctuation `6.06209e-7 A^-2`.
+- 55C: `phi_p = 0.0409569`, mean SLD `7.26502e-6 A^-2`, and RMS local
+  fluctuation `1.03679e-6 A^-2`.
+
+Using the unmasked density, which represents the total polymer before the
+heterogeneous visibility mask:
+
+- 55B nominal composition implies `A = 1.08832 nm^2` and
+  `scale = 32.4136`. The fitted area is 6.5% higher and the fitted scale is
+  13.4% higher, so the density and absolute intensity are reasonably
+  consistent.
+- 55C nominal composition implies `A = 1.21731 nm^2` and
+  `scale = 40.5523`. The fitted area is 11.9% lower and the fitted scale is
+  22.5% lower. The constraints agree in order of magnitude, but exact
+  consistency is not reached.
+
+Because the intensity depends on `(Delta_rho*A)^2`, a modest error in area or
+effective contrast produces about twice that relative error in scale. The
+remaining 55C discrepancy may reflect hydration or counterion effects,
+concentration and absolute-calibration uncertainty, a diffuse cross-sectional
+SLD distribution, or covariance between fitted line density and intensity
+scale. The two-delta distribution is therefore a dry-polymer/solvent limiting
+model rather than a resolved radial SLD profile.
+
+## Pecora Digitized-Curve Fitting and Comparison
+
+Added a Pecora-specific curvefit workflow under `curvefit/` for the five
+digitized Borsali/Nguyen/Pecora 1998 salt conditions. `cf_pecora.ipynb` now
+fits one selected series at a time and writes the corrected observation,
+anchor diagnostics, fitted parameters, fitted curve, and figures to
+`curvefit/output/pecora`.
+
+The low-`Q` DAB anchor was changed from a fully automatic global grid search to
+a notebook-local controlled anchor:
+
+```python
+LOWQ_DAB_KAPPA_POSITION
+LOWQ_DAB_KAPPA_FACTOR_BOUNDS
+LOWQ_DAB_N_KAPPA
+LOWQ_INITIAL_KAPPA_SCALE
+LOWQ_ANCHOR_WEIGHT
+```
+
+`LOWQ_DAB_KAPPA_POSITION` directly moves the low-`Q` asymptotic crossover. With
+`LOWQ_DAB_KAPPA_FACTOR_BOUNDS = (1.0, 1.0)`, the DAB anchor uses exactly that
+chosen `kappa`; wider bounds allow a local search around the selected
+position. The heterogeneous-line initial guess now uses this controlled
+low-`Q` `kappa` directly, and the nonlinear fit uses `LOWQ_ANCHOR_WEIGHT` for
+the soft low-`Q` constraint.
+
+Added `cf_compare_pecora.ipynb`, following the YYW comparison notebook pattern
+but without 3D rendering. It loads all five Pecora fitted outputs, plots the
+background-corrected observations and fitted curves together, summarizes the
+floating and derived fit parameters, and overlays all fitted curves on the
+original Pecora 1998 figure. The overlay uses the same linear plot-frame
+calibration as `curvefit/data/pecora/digitize_pecora.py`, and adds the
+subtracted constant background back to each fitted curve so it sits in the
+printed figure's original `(q, I(q))` coordinate system.
+
+## 2026-07-11 General-Line Low-Q And Tangent-Correlation Methods
+
+- Added `rw_line_tcorr.ipynb` as the reference workflow for computing and
+  plotting the signed ordered-field and line-density-weighted nematic tangent
+  correlations, with its numerical arrays saved under `rw_line_tcorr_output`.
+- Updated `rw_line_general.ipynb` with explicit controls for fitting and
+  stitching the quadratic low-`Q` asymptotic form into the finite-window
+  coherent transform. The notebook now retains the original and stitched
+  transforms, the asymptotic curve, fit/replacement masks, fitted coefficients,
+  and relative fit error in its saved output.
+- Added exact ordered-field signed tangent-moment helpers to
+  `rw_line_scattering.py`. They evaluate the conditional Wick contraction
+  `M_T = 2 b^2 + 4 b c_z` and the raw signed correlation `K_T^raw = M_T/M_J`
+  from the radial covariance and its derivatives.
+- Added a direct conditional-sampling estimator for the line-density-weighted
+  nematic moment. It reuses common Sobol or pseudorandom normal samples over
+  separation and returns `M_J`, `M_2`, and `K_2 = M_2/M_J`.
 
 ## 2026-07-13 Sampled Nematic Infinite-Separation Baseline
 
@@ -639,24 +803,6 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
 - Saved the renderings, orientation plot, and per-condition orientation data
   under `curvefit/output/pecora`.
 
-## 2026-07-11 General-Line Low-Q And Tangent-Correlation Methods
-
-- Added `rw_line_tcorr.ipynb` as the reference workflow for computing and
-  plotting the signed ordered-field and line-density-weighted nematic tangent
-  correlations, with its numerical arrays saved under `rw_line_tcorr_output`.
-- Updated `rw_line_general.ipynb` with explicit controls for fitting and
-  stitching the quadratic low-`Q` asymptotic form into the finite-window
-  coherent transform. The notebook now retains the original and stitched
-  transforms, the asymptotic curve, fit/replacement masks, fitted coefficients,
-  and relative fit error in its saved output.
-- Added exact ordered-field signed tangent-moment helpers to
-  `rw_line_scattering.py`. They evaluate the conditional Wick contraction
-  `M_T = 2 b^2 + 4 b c_z` and the raw signed correlation `K_T^raw = M_T/M_J`
-  from the radial covariance and its derivatives.
-- Added a direct conditional-sampling estimator for the line-density-weighted
-  nematic moment. It reuses common Sobol or pseudorandom normal samples over
-  separation and returns `M_J`, `M_2`, and `K_2 = M_2/M_J`.
-
 ## 2026-07-13 Shared Fit-Orientation Comparison Workflow
 
 - Added `compute_fit_orientation_correlations(...)` to `curvefit/cf_tools.py`
@@ -668,3 +814,191 @@ correlation `C_L-rho0^2` against the high-sample direct reference. The final
   `curvefit/cf_compare_yyw.ipynb` for the 55A, 55B, and 55C fits. The cells
   save per-sample arrays and a combined two-panel figure under
   `curvefit/output/yyw`.
+
+## 2026-07-14 YYW PB-Series Fitting Notebook
+
+- Added `curvefit/cf_yyw_pb.ipynb` for the five PB profiles (`12I` through
+  `12V`) under `curvefit/data/yyw/PB_data/PB`.
+- The notebook uses one `SERIES_KEY` selector, preserves the supplied
+  intensity errors and `dQ`, constructs per-curve DAB and high-`Q` anchors,
+  and derives dataset-specific heterogeneous-line initial guesses and bounds.
+- Nonlinear optimization is guarded by `RUN_FIT = False`, allowing the anchor
+  and initial-model diagnostics to be inspected before each fit is launched.
+
+## 2026-07-15 Fixed Nonlinear Parameters In Curve Fits
+
+- Added a `fixed_parameters` option to
+  `curvefit/cf_tools.py::fit_heterogeneous_line_least_squares(...)`. Fixed
+  parameters are validated against the active bounds, excluded from the
+  `least_squares` vector, and still reported in the final fitted parameter
+  dictionary.
+- Exposed this in `curvefit/cf_yyw_pb.ipynb` through a `FIXED_PARAMETERS`
+  dictionary near the initial guesses and bounds, with commented examples for
+  freezing `skewness`, `b`, or `k_H_over_k`.
+
+## 2026-07-30 Ca-Series Reference-Feature Fitting
+
+- Added `curvefit/cf_ca.ipynb` for the GRASP `Q, I, error, dQ` profiles under
+  `curvefit/data/Ca`. The notebook discovers the series from filenames, parses
+  the Ca concentration in millimolar, and assigns the `D2O` file to `0 mM`.
+- The salt-free fit is the reference for the line-feature wavelength. After
+  the D2O parameters are saved, salt-containing fits load and fix `mean_k` to
+  that reference by default, with a direct override available.
+- No low-Q DAB or Porod anchor is used. The default first trial fixes a very
+  small `k_H_over_k` and a low threshold `b`, producing occupation close to
+  one. A notebook switch selects a true line-only calculation instead.
+- Extended the shared curve-fit evaluation and least-squares helpers with a
+  `model_mode="line_only"` option that bypasses the heterogeneous mask and
+  removes `k_H_over_k` and `b` from the nonlinear parameter vector.
+- Centralized each fit parameter's initial value, bounds, and fixed/free state
+  into one notebook table; fitting remains disabled until the D2O initial
+  model has been tuned manually.
+- Added `desmear_resolution_maximum_entropy(...)` to `curvefit/cf_tools.py`.
+  It constructs a row-normalized Gaussian resolution operator from the
+  pointwise `dQ` values and recovers a positive unsmeared curve by weighted
+  maximum-entropy inversion. The implementation applies the convolution and
+  entropy principles of Huang et al., J. Appl. Cryst. 58 (2025) 1355-1359,
+  globally so the broad CA profiles do not have to be separated into isolated
+  peaks.
+- After inspection showed that direct desmearing was not sufficiently well
+  behaved for the CA profiles, restored the measured intensity as the fitting
+  observation. Added a reusable Gaussian resolution-matrix constructor and
+  optional `resolution_sigma` inputs to the shared initial-model and
+  least-squares helpers. Trial curves are now resolution smeared before their
+  scale and regression loss are evaluated.
+- Updated `curvefit/cf_ca.ipynb` to pass its fourth-column `dQ` values into the
+  forward model. The centralized starting values now use `r_sigma_k = 0.2` to
+  retain a visible line-spectrum peak and fixed `b = -2` for mask stability.
+- Diagnosed the flattened high-Q initial curve by comparing identical
+  unsmeared and smeared trials. The line-only model retained slopes of
+  approximately `-1.00` unsmeared and `-0.98` smeared. Correcting the intended
+  threshold to `b = -2` gives `p_H = 0.97725`, although the heterogeneous mask
+  contribution still flattens the trial when `k_H_over_k = 5e-5`.
+- Made `line_only` the recommended CA default while preserving the
+  heterogeneous option. The initial-model plot now overlays unsmeared and
+  resolution-smeared predictions and reports both fitted high-Q log-log
+  slopes, making resolution effects directly auditable.
+- Added `skew_normal_radial` as an alternative radial wave-number
+  distribution. It uses independently controlled mean, standard deviation,
+  and standardized skewness, applies a positivity truncation at `k = 0`, and
+  supports both sampled and deterministic-quadrature spectrum construction.
+- Added a CA notebook `K_DISTRIBUTION` selector between
+  `skew_normal_radial` and `max_entropy_radial`, with skewness free by default
+  over `(-0.9, 0.9)`. Distribution-specific filenames keep the two fit trials
+  separate.
+- The first D2O skew-normal trial converged to `mean_k = 0.0515459 A^-1`,
+  `r_sigma_k = 0.174617`, and `skewness = 0.286953`, reducing the cost from
+  about `60.15` for the saved maximum-entropy solution to `56.50`.
+- Added `radial_k_distribution_density(...)` to `curvefit/cf_tools.py` and a
+  third panel to both CA initial-model and fitted-result figures. The panel
+  displays the selected fitted radial probability density over exactly
+  `0 <= k <= 2*mean_k`, with the mean marked by a vertical dotted line.
+- Added the normalized positive `bimodal_gaussian_radial` spectrum. Its free
+  parameters are overall center of mass, center separation divided by that
+  mean, major-component width divided by the mean, minor/major width ratio,
+  and minor/major weight ratio. Both components are truncated at `k = 0`, and
+  a shared location shift preserves the requested overall center of mass after
+  truncation.
+- The first D2O bimodal fit converged with cost `58.9232`, between the saved
+  maximum-entropy (`60.15`) and skew-normal (`56.50`) trials. It found centers
+  `0.0473924` and `0.0581520 A^-1`, widths `0.0075351` and
+  `0.0057448 A^-1`, and normalized weights `0.63753` and `0.36247`. The two
+  fitted components overlap enough that their summed density is not visibly
+  double-peaked.
+- Added optional positive pointwise `regression_weights` to the shared initial
+  evaluator and nonlinear fitter. The CA notebook uses one editable multiplier
+  to emphasize `0.10 <= Q <= 0.20 A^-1` while retaining the full fitting range,
+  resolution smearing, and high-Q coefficient anchor.
+- Guided the bimodal D2O trial toward a left major and right minor component
+  using narrower physical bounds and an 8x feature-region regression weight.
+  The unweighted RMS relative mismatch over the emphasized interval decreased
+  from `0.05362` to `0.03301`; the fitted centers are `0.0485392` and
+  `0.0670343 A^-1`, widths are `0.0055016` and `0.0047888 A^-1`, and normalized
+  weights are `0.74602` and `0.25398`. Guided outputs use a separate filename
+  tag so the original unconstrained bimodal trial is preserved.
+- Added `spline_maxent_radial`, a compact-support positive radial spectrum with
+  an exact prescribed mean. It combines a Gaussian width reference, a fixed
+  `k**low_k_power` envelope, three natural-cubic-spline ordinates, and an
+  internally solved exponential tilt. Sampling, deterministic quadrature, and
+  plotting-density evaluation all use the same normalized construction.
+- Added optional Gaussian parameter penalties to the shared nonlinear fitter
+  and used them in the new `curvefit/cf_ca_spline.ipynb`. Its credibility-first
+  D2O baseline uses the unweighted full-Q likelihood, `low_k_power=2`, support
+  `[0.15, 2.5]*mean_k`, and weak zero-centered penalties on three spline
+  coefficients. It converged at cost `57.1473`, with `mean_k=0.051425 A^-1`,
+  relative standard deviation `0.17366`, and skewness `0.0553`. Only `0.112%`
+  of the fitted probability lies below `0.5*mean_k`.
+- A separate shoulder-seeded full-Q start returned essentially the same
+  scattering residual and a smooth distribution. This indicates that a
+  visibly separated second feature is not independently selected by the
+  current full-Q objective; the stronger bimodality seen previously depends on
+  explicit weighting of `0.10 <= Q <= 0.20 A^-1`.
+
+## 2026-07-31 Affine-Anisotropy Effects and Gaussian Fits
+
+- Added `rw_line_aniso.ipynb` as a self-contained study of an affinely
+  transformed isotropic random-line spectrum. The notebook accepts a radial
+  `k` distribution directly (default `gaussian_radial`) rather than loading a
+  previously saved spectrum.
+- For a real-space deformation `r' = F r`, implemented the scalar-spectrum
+  mapping
+
+  ```text
+  I_F(Q n) = A_F I_0(Q sqrt(n^T F F^T n))
+  ```
+
+  and its powder average over direction `n`. The general tensor calculation
+  uses angular quadrature; an incompressible uniaxial stretch
+  `diag(lambda^(-1/2), lambda^(-1/2), lambda)` reduces exactly to a stable
+  one-dimensional Gauss-Legendre integral.
+- Derived and numerically tested a centered log-stretch expansion. With
+  `delta(n) = log(sqrt(n^T F F^T n))`, expansion about
+  `delta_0 = <delta>` gives
+
+  ```text
+  I_powder(Q) = A_F sum_m M_m D^m I_0(Q exp(delta_0)) / m!
+  D = d/d(log Q),  M_m = <(delta-delta_0)^m>
+  ```
+
+  where `M_1 = 0`, so the leading anisotropic shape correction is second
+  order. The notebook compares successive truncation orders with numerical
+  powder averaging and includes a second panel showing relative loss. It uses
+  the mixed real-space grid `r_min=1e-3/k_eff`, `r_max=250/k_eff`,
+  `r_split=5/k_eff`, `Nr=3000`, and `Nr_small=600`.
+- Added reusable numerical helpers to `curvefit/cf_tools.py`:
+  `uniaxial_affine_powder_average(...)` and
+  `uniaxial_affine_highq_factor(...)`. Extended the shared initial-model and
+  least-squares routines with optional `affine_stretch=True`, a fitted
+  `stretch_ratio`, stretched-Q support, numerical powder averaging, and the
+  corresponding high-Q coefficient correction. The default isotropic paths
+  remain unchanged.
+- Generalized `compute_fit_orientation_correlations(...)` to accept the fitted
+  radial `k_distribution` and its parameters. This allows the comparison
+  workflow to use the Gaussian spectrum directly instead of implicitly
+  assuming the older maximum-entropy/skewed spectrum.
+- Added `curvefit/cf_ca_aniso.ipynb` for the salt-free Ca/D2O dataset. It uses
+  one positive radial Gaussian, pointwise resolution smearing, and a slight
+  incompressible uniaxial stretch. The centralized initial values are
+  `r_sigma_k=0.17` and `stretch_ratio=1.2`; `RUN_FIT=False` is retained so the
+  initial model can be inspected before fitting. No guide-Q fitting region or
+  skew/multigaussian distribution is used.
+- Added `curvefit/cf_yyw_aniso.ipynb` to batch-fit 55A, 55B, and 55C. Earlier
+  fitted physical parameters seed each curve, while the old skewed spectrum is
+  replaced by `gaussian_radial` and `stretch_ratio` is added as a nonlinear
+  parameter. The production fit uses numerical powder averaging rather than
+  the derivative series.
+- Refit 55A with the requested `r_sigma_k <= 0.25` constraint. The saved result
+  is `mean_k=0.01891675 A^-1`, `r_sigma_k=0.2078183`,
+  `stretch_ratio=1.193519`, `k_H/k=0.0591402`, and `b=0.108607`. The fitted
+  stretch ratios for 55B and 55C are `1.276470` and `1.266947`, respectively.
+- Updated `curvefit/cf_compare_yyw.ipynb` to demonstrate the Gaussian-affine
+  fits from `output/yyw/aniso`, report stretch instead of skewness, use the
+  Gaussian spectrum in orientation calculations and renderings, and include
+  the affine factor in high-Q physical-consistency checks. Expensive
+  orientation and rendering cells remain unexecuted; the lightweight combined
+  fit comparison was regenerated and validated.
+- The affine calculation here is deliberately a scalar-spectrum
+  postprocessing model. A fully material deformation of line elements would
+  introduce the tangent-dependent weight `|F t|` and requires a
+  tangent-resolved correlation or new Kac-Rice calculation; it cannot in
+  general be reconstructed from the isotropic powder curve alone.

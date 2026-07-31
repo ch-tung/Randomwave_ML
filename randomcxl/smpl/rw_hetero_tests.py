@@ -296,6 +296,92 @@ def check_max_entropy_radial_moments() -> dict[str, float]:
     return {"mean": mean, "std": std, "skewness": skewness}
 
 
+def check_skew_normal_radial_moments() -> dict[str, float]:
+    target_mean = 1.0
+    target_std = 0.2
+    target_skewness = 0.4
+    radii, weights = rw.make_radial_k_quadrature(
+        4096,
+        "skew_normal_radial",
+        k0=target_mean,
+        sigma_k=target_std,
+        distribution_params={"skewness": target_skewness},
+    )
+    mean = float(np.dot(weights, radii))
+    centered = radii - mean
+    std = float(np.sqrt(np.dot(weights, centered * centered)))
+    skewness = float(np.dot(weights, centered**3) / std**3)
+    assert abs(mean - target_mean) < 2.0e-4
+    assert abs(std - target_std) < 2.0e-4
+    assert abs(skewness - target_skewness) < 2.0e-3
+    assert np.all(radii > 0.0)
+    return {"mean": mean, "std": std, "skewness": skewness}
+
+
+def check_bimodal_gaussian_radial_parameters() -> dict[str, float]:
+    target_mean = 1.0
+    center_distance_ratio = 0.45
+    major_width_ratio = 0.12
+    width_ratio = 1.6
+    weight_ratio = 0.35
+    locations, widths, component_weights = rw._bimodal_gaussian_components(
+        mean_k=target_mean,
+        r_sigma_k=major_width_ratio,
+        center_distance_ratio=center_distance_ratio,
+        width_ratio=width_ratio,
+        weight_ratio=weight_ratio,
+    )
+    assert abs((locations[1] - locations[0]) / target_mean - center_distance_ratio) < 1.0e-12
+    assert abs(widths[0] / target_mean - major_width_ratio) < 1.0e-12
+    assert abs(widths[1] / widths[0] - width_ratio) < 1.0e-12
+    assert abs(component_weights[1] / component_weights[0] - weight_ratio) < 1.0e-12
+    radii, weights = rw.make_radial_k_quadrature(
+        8192,
+        "bimodal_gaussian_radial",
+        k0=target_mean,
+        sigma_k=major_width_ratio * target_mean,
+        distribution_params={
+            "center_distance_ratio": center_distance_ratio,
+            "width_ratio": width_ratio,
+            "weight_ratio": weight_ratio,
+        },
+    )
+    mean = float(np.dot(weights, radii))
+    assert abs(float(np.sum(weights)) - 1.0) < 1.0e-12
+    assert abs(mean - target_mean) < 3.0e-4
+    assert np.all(radii > 0.0)
+    return {
+        "mean": mean,
+        "center_distance_ratio": center_distance_ratio,
+        "width_ratio": width_ratio,
+        "weight_ratio": weight_ratio,
+    }
+
+
+def check_spline_maxent_radial_constraints() -> dict[str, float]:
+    radii, weights = rw.make_radial_k_quadrature(
+        2048,
+        "spline_maxent_radial",
+        k0=1.0,
+        sigma_k=0.16,
+        distribution_params={
+            "spline_c1": 0.8,
+            "spline_c2": -0.6,
+            "spline_c3": 0.5,
+            "low_k_power": 2.0,
+            "support_min_ratio": 0.15,
+            "support_max_ratio": 2.5,
+        },
+    )
+    mean = float(np.dot(weights, radii))
+    assert abs(float(np.sum(weights)) - 1.0) < 1.0e-12
+    assert abs(mean - 1.0) < 1.0e-10
+    assert np.all(weights > 0.0)
+    assert float(np.min(radii)) > 0.15
+    assert float(np.max(radii)) < 2.5
+    return {"mean": mean, "minimum": float(np.min(radii)), "maximum": float(np.max(radii))}
+
+
 def check_nematic_sampled_infinite_baseline() -> dict[str, float]:
     n_samp = 2**10
     random_seed = 12345
@@ -345,6 +431,9 @@ def run_all_checks() -> dict[str, dict[str, float]]:
         "approximation_levels": check_approximation_levels(),
         "uniform_line_unchanged": check_uniform_line_unchanged(),
         "max_entropy_radial_moments": check_max_entropy_radial_moments(),
+        "skew_normal_radial_moments": check_skew_normal_radial_moments(),
+        "bimodal_gaussian_radial_parameters": check_bimodal_gaussian_radial_parameters(),
+        "spline_maxent_radial_constraints": check_spline_maxent_radial_constraints(),
         "nematic_sampled_infinite_baseline": check_nematic_sampled_infinite_baseline(),
     }
     return results

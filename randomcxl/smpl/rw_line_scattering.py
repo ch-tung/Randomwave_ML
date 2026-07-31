@@ -28,9 +28,10 @@ if __name__ == "__main__":
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import simpson
-from scipy.optimize import least_squares
+from scipy.interpolate import CubicSpline
+from scipy.optimize import brentq, least_squares
 from scipy.stats import gamma as gamma_dist
-from scipy.stats import norm, qmc
+from scipy.stats import norm, qmc, skewnorm
 
 
 DEFAULT_K0 = 1.0
@@ -88,7 +89,10 @@ KDistribution = Literal[
     "single_shell",
     "gaussian_radial",
     "gamma_radial",
+    "skew_normal_radial",
+    "bimodal_gaussian_radial",
     "max_entropy_radial",
+    "spline_maxent_radial",
     "uniform_band",
 ]
 JacobianMethod = Literal["direct_12d", "conditional_6d_2d"]
@@ -190,6 +194,194 @@ def _gamma_radii_from_unit(
 
 
 @lru_cache(maxsize=256)
+def _skew_normal_shape_from_skewness(skewness: float) -> float:
+    """Return the skew-normal shape parameter for a target skewness."""
+
+    target = float(skewness)
+    if not np.isfinite(target) or abs(target) >= 0.995:
+        raise ValueError("skew_normal_radial requires -0.995 < skewness < 0.995.")
+    if abs(target) < 1.0e-12:
+        return 0.0
+
+    def standardized_skewness(shape: float) -> float:
+        delta = shape / np.sqrt(1.0 + shape * shape)
+        mean = delta * np.sqrt(2.0 / np.pi)
+        variance = 1.0 - mean * mean
+        return float(
+            0.5
+            * (4.0 - np.pi)
+            * mean**3
+            / variance**1.5
+        )
+
+    return float(brentq(lambda shape: standardized_skewness(shape) - target, -1.0e4, 1.0e4))
+
+
+def _skew_normal_radii_from_unit(
+    u: np.ndarray,
+    k0: float,
+    sigma_k: float,
+    skewness: float,
+) -> np.ndarray:
+    """Map unit quantiles to a positive skew-normal radial distribution."""
+
+    mean = float(k0)
+    sigma = float(sigma_k)
+    if mean <= 0.0:
+        raise ValueError("k0 must be positive for skew_normal_radial.")
+    if sigma <= 0.0:
+        raise ValueError("sigma_k must be positive for skew_normal_radial.")
+    shape = _skew_normal_shape_from_skewness(round(float(skewness), 12))
+    delta = shape / np.sqrt(1.0 + shape * shape)
+    raw_mean = delta * np.sqrt(2.0 / np.pi)
+    raw_std = np.sqrt(1.0 - raw_mean * raw_mean)
+    raw_lower = raw_mean - raw_std * mean / sigma
+    lower_cdf = float(skewnorm.cdf(raw_lower, shape))
+    probability = lower_cdf + np.asarray(u, dtype=float) * (1.0 - lower_cdf)
+    probability = np.clip(probability, 1.0e-12, 1.0 - 1.0e-12)
+    standardized = (skewnorm.ppf(probability, shape) - raw_mean) / raw_std
+    return mean + sigma * standardized
+
+
+def _positive_normal_mean(location: float, sigma: float) -> float:
+    """Mean of N(location, sigma^2) conditioned on a positive value."""
+
+    alpha = -float(location) / float(sigma)
+    survival = max(float(norm.sf(alpha)), np.finfo(float).tiny)
+    return float(location) + float(sigma) * float(norm.pdf(alpha)) / survival
+
+
+def _bimodal_gaussian_components(
+    *,
+    mean_k: float,
+    r_sigma_k: float,
+    center_distance_ratio: float,
+    width_ratio: float,
+    weight_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return shifted locations, widths, and normalized major/minor weights."""
+
+    mean_k = float(mean_k)
+    r_sigma_k = float(r_sigma_k)
+    center_distance_ratio = float(center_distance_ratio)
+    width_ratio = float(width_ratio)
+    weight_ratio = float(weight_ratio)
+    if mean_k <= 0.0:
+        raise ValueError("mean_k must be positive for bimodal_gaussian_radial.")
+    if r_sigma_k <= 0.0:
+        raise ValueError("r_sigma_k must be positive for bimodal_gaussian_radial.")
+    if center_distance_ratio <= 0.0:
+        raise ValueError("center_distance_ratio must be positive.")
+    if width_ratio <= 0.0:
+        raise ValueError("width_ratio must be positive.")
+    if weight_ratio <= 0.0 or weight_ratio > 1.0:
+        raise ValueError("weight_ratio must satisfy 0 < weight_ratio <= 1.")
+
+    weights = np.array([1.0, weight_ratio], dtype=float)
+    weights /= np.sum(weights)
+    separation = center_distance_ratio * mean_k
+    locations = np.array(
+        [mean_k - weights[1] * separation, mean_k + weights[0] * separation],
+        dtype=float,
+    )
+    widths = np.array(
+        [r_sigma_k * mean_k, width_ratio * r_sigma_k * mean_k],
+        dtype=float,
+    )
+
+    def mixture_mean(shift: float) -> float:
+        return float(
+            np.dot(
+                weights,
+                [
+                    _positive_normal_mean(locations[0] + shift, widths[0]),
+                    _positive_normal_mean(locations[1] + shift, widths[1]),
+                ],
+            )
+        )
+
+    scale = mean_k + separation + float(np.max(widths))
+    lower = -20.0 * scale
+    upper = 20.0 * scale
+    shift = brentq(lambda value: mixture_mean(value) - mean_k, lower, upper)
+    return locations + shift, widths, weights
+
+
+def _positive_normal_quantiles(
+    u: np.ndarray,
+    location: float,
+    sigma: float,
+) -> np.ndarray:
+    lower_cdf = float(norm.cdf(-float(location) / float(sigma)))
+    probability = lower_cdf + np.asarray(u, dtype=float) * (1.0 - lower_cdf)
+    probability = np.clip(probability, 1.0e-12, 1.0 - 1.0e-12)
+    return float(location) + float(sigma) * norm.ppf(probability)
+
+
+def _bimodal_gaussian_radii_from_unit(
+    u: np.ndarray,
+    *,
+    mean_k: float,
+    r_sigma_k: float,
+    center_distance_ratio: float,
+    width_ratio: float,
+    weight_ratio: float,
+) -> np.ndarray:
+    locations, widths, weights = _bimodal_gaussian_components(
+        mean_k=mean_k,
+        r_sigma_k=r_sigma_k,
+        center_distance_ratio=center_distance_ratio,
+        width_ratio=width_ratio,
+        weight_ratio=weight_ratio,
+    )
+    u = np.asarray(u, dtype=float)
+    major = u < weights[0]
+    radii = np.empty_like(u)
+    radii[major] = _positive_normal_quantiles(
+        u[major] / weights[0],
+        locations[0],
+        widths[0],
+    )
+    radii[~major] = _positive_normal_quantiles(
+        (u[~major] - weights[0]) / weights[1],
+        locations[1],
+        widths[1],
+    )
+    return radii
+
+
+def bimodal_gaussian_radial_density(
+    k: np.ndarray,
+    *,
+    mean_k: float,
+    r_sigma_k: float,
+    center_distance_ratio: float,
+    width_ratio: float,
+    weight_ratio: float,
+) -> np.ndarray:
+    """Evaluate the normalized positive bimodal-Gaussian radial density."""
+
+    k = np.asarray(k, dtype=float)
+    locations, widths, weights = _bimodal_gaussian_components(
+        mean_k=mean_k,
+        r_sigma_k=r_sigma_k,
+        center_distance_ratio=center_distance_ratio,
+        width_ratio=width_ratio,
+        weight_ratio=weight_ratio,
+    )
+    density = np.zeros_like(k)
+    positive = k >= 0.0
+    for location, sigma, component_weight in zip(locations, widths, weights):
+        normalization = max(float(norm.sf(-location / sigma)), np.finfo(float).tiny)
+        density[positive] += (
+            component_weight
+            * norm.pdf((k[positive] - location) / sigma)
+            / (sigma * normalization)
+        )
+    return density
+
+
+@lru_cache(maxsize=256)
 def _maximum_entropy_standardized_quadrature(
     r_sigma_k: float,
     skewness: float,
@@ -285,6 +477,111 @@ def _distribution_param(
     return float(distribution_params.get(name, default))
 
 
+@lru_cache(maxsize=512)
+def _spline_maxent_dimensionless_quadrature(
+    r_sigma_k: float,
+    spline_c1: float,
+    spline_c2: float,
+    spline_c3: float,
+    low_k_power: float,
+    support_min_ratio: float,
+    support_max_ratio: float,
+    num_nodes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a positive spline density on x=k/<k> with E[x]=1.
+
+    A Gaussian reference supplies a stable width, ``x**low_k_power`` suppresses
+    the long-wavelength tail, and three natural-cubic-spline ordinates provide
+    general skewed or multimodal departures.  A fitted exponential tilt is
+    applied internally so the requested mean remains exact.
+    """
+
+    r_sigma_k = float(r_sigma_k)
+    low_k_power = float(low_k_power)
+    lower = float(support_min_ratio)
+    upper = float(support_max_ratio)
+    num_nodes = int(num_nodes)
+    if r_sigma_k <= 0.0:
+        raise ValueError("r_sigma_k must be positive for spline_maxent_radial.")
+    if low_k_power <= -1.0:
+        raise ValueError("low_k_power must exceed -1.")
+    if not (0.0 < lower < 1.0 < upper):
+        raise ValueError("Spline support must satisfy 0 < minimum < 1 < maximum.")
+    if num_nodes < 64:
+        raise ValueError("spline_maxent_radial requires at least 64 quadrature nodes.")
+
+    edges = np.linspace(lower, upper, num_nodes + 1)
+    x = 0.5 * (edges[:-1] + edges[1:])
+    # Keep the three free ordinates where the scattering is sensitive; the
+    # distant compact-support endpoints remain pinned to the reference shape.
+    knot_x = np.array([lower, 0.65, 1.0, 1.35, upper], dtype=float)
+    if not np.all(np.diff(knot_x) > 0.0):
+        raise ValueError("Spline support must enclose the fixed interior knots 0.65, 1.0, 1.35.")
+    knot_y = np.array([0.0, spline_c1, spline_c2, spline_c3, 0.0], dtype=float)
+    deformation = CubicSpline(knot_x, knot_y, bc_type="natural")(x)
+    log_base = (
+        low_k_power * np.log(x)
+        - 0.5 * ((x - 1.0) / r_sigma_k) ** 2
+        + deformation
+    )
+
+    def weights_and_mean(tilt: float) -> tuple[np.ndarray, float]:
+        log_weights = log_base + float(tilt) * x
+        log_weights -= np.max(log_weights)
+        weights = np.exp(log_weights)
+        weights /= np.sum(weights)
+        return weights, float(np.dot(weights, x))
+
+    tilt = brentq(lambda value: weights_and_mean(value)[1] - 1.0, -1.0e4, 1.0e4)
+    weights, _ = weights_and_mean(tilt)
+    return x, weights
+
+
+def _spline_maxent_radii_and_weights(
+    *,
+    k0: float,
+    sigma_k: float,
+    distribution_params: Mapping[str, float] | None,
+    num_nodes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    mean_k = float(k0)
+    if mean_k <= 0.0:
+        raise ValueError("k0 must be positive for spline_maxent_radial.")
+    r_sigma_k = float(sigma_k) / mean_k
+    x, weights = _spline_maxent_dimensionless_quadrature(
+        round(r_sigma_k, 12),
+        round(_distribution_param(distribution_params, "spline_c1", 0.0), 12),
+        round(_distribution_param(distribution_params, "spline_c2", 0.0), 12),
+        round(_distribution_param(distribution_params, "spline_c3", 0.0), 12),
+        round(_distribution_param(distribution_params, "low_k_power", 2.0), 12),
+        round(_distribution_param(distribution_params, "support_min_ratio", 0.15), 12),
+        round(_distribution_param(distribution_params, "support_max_ratio", 2.5), 12),
+        int(num_nodes),
+    )
+    return mean_k * x, weights.copy()
+
+
+def spline_maxent_radial_density(
+    k: np.ndarray,
+    *,
+    mean_k: float,
+    r_sigma_k: float,
+    distribution_params: Mapping[str, float] | None = None,
+    num_nodes: int = 4096,
+) -> np.ndarray:
+    """Evaluate the normalized, fixed-mean spline radial density."""
+
+    k = np.asarray(k, dtype=float)
+    nodes, weights = _spline_maxent_radii_and_weights(
+        k0=float(mean_k),
+        sigma_k=float(r_sigma_k) * float(mean_k),
+        distribution_params=distribution_params,
+        num_nodes=int(num_nodes),
+    )
+    density_nodes = weights / np.maximum(np.gradient(nodes), np.finfo(float).tiny)
+    return np.interp(k, nodes, density_nodes, left=0.0, right=0.0)
+
+
 def sample_k_vectors(
     count: int,
     distribution: KDistribution,
@@ -335,6 +632,41 @@ def sample_k_vectors(
             shape = (mean / sigma) ** 2
             scale = sigma * sigma / mean
             radii = rng.gamma(shape, scale, size=count)
+    elif distribution == "skew_normal_radial":
+        if sigma_k is None:
+            sigma_k = 0.15 * float(k0)
+        skewness = _distribution_param(distribution_params, "skewness", 0.0)
+        u = (
+            _sobol_points(count, 3, qmc_seed)[:, 2]
+            if use_qmc
+            else rng.random(count)
+        )
+        radii = _skew_normal_radii_from_unit(
+            u,
+            float(k0),
+            float(sigma_k),
+            skewness,
+        )
+    elif distribution == "bimodal_gaussian_radial":
+        if sigma_k is None:
+            sigma_k = 0.15 * float(k0)
+        u = (
+            _sobol_points(count, 3, qmc_seed)[:, 2]
+            if use_qmc
+            else rng.random(count)
+        )
+        radii = _bimodal_gaussian_radii_from_unit(
+            u,
+            mean_k=float(k0),
+            r_sigma_k=float(sigma_k) / float(k0),
+            center_distance_ratio=_distribution_param(
+                distribution_params,
+                "center_distance_ratio",
+                0.4,
+            ),
+            width_ratio=_distribution_param(distribution_params, "width_ratio", 1.0),
+            weight_ratio=_distribution_param(distribution_params, "weight_ratio", 0.5),
+        )
     elif distribution == "max_entropy_radial":
         if sigma_k is None:
             sigma_k = _distribution_param(distribution_params, "r_sigma_k", 0.15) * float(k0)
@@ -345,6 +677,22 @@ def sample_k_vectors(
             sigma_k=float(sigma_k),
             skewness=skewness,
             support_sigma=support_sigma,
+            num_nodes=4096,
+        )
+        u = (
+            _sobol_points(count, 3, qmc_seed)[:, 2]
+            if use_qmc
+            else rng.random(count)
+        )
+        cdf_midpoints = np.cumsum(weights) - 0.5 * weights
+        radii = np.interp(u, cdf_midpoints, nodes)
+    elif distribution == "spline_maxent_radial":
+        if sigma_k is None:
+            sigma_k = _distribution_param(distribution_params, "r_sigma_k", 0.16) * float(k0)
+        nodes, weights = _spline_maxent_radii_and_weights(
+            k0=float(k0),
+            sigma_k=float(sigma_k),
+            distribution_params=distribution_params,
             num_nodes=4096,
         )
         u = (
@@ -400,6 +748,34 @@ def make_radial_k_quadrature(
         if sigma_k is None:
             sigma_k = 0.15 * float(k0)
         return _gamma_radii_from_unit(u, float(k0), float(sigma_k)), weights
+    if distribution == "skew_normal_radial":
+        if sigma_k is None:
+            sigma_k = 0.15 * float(k0)
+        return (
+            _skew_normal_radii_from_unit(
+                u,
+                float(k0),
+                float(sigma_k),
+                _distribution_param(distribution_params, "skewness", 0.0),
+            ),
+            weights,
+        )
+    if distribution == "bimodal_gaussian_radial":
+        if sigma_k is None:
+            sigma_k = 0.15 * float(k0)
+        radii = _bimodal_gaussian_radii_from_unit(
+            u,
+            mean_k=float(k0),
+            r_sigma_k=float(sigma_k) / float(k0),
+            center_distance_ratio=_distribution_param(
+                distribution_params,
+                "center_distance_ratio",
+                0.4,
+            ),
+            width_ratio=_distribution_param(distribution_params, "width_ratio", 1.0),
+            weight_ratio=_distribution_param(distribution_params, "weight_ratio", 0.5),
+        )
+        return radii, weights
     if distribution == "max_entropy_radial":
         if sigma_k is None:
             sigma_k = _distribution_param(distribution_params, "r_sigma_k", 0.15) * float(k0)
@@ -408,6 +784,15 @@ def make_radial_k_quadrature(
             sigma_k=float(sigma_k),
             skewness=_distribution_param(distribution_params, "skewness", 0.0),
             support_sigma=_distribution_param(distribution_params, "support_sigma", 8.0),
+            num_nodes=max(num_nodes, 64),
+        )
+    if distribution == "spline_maxent_radial":
+        if sigma_k is None:
+            sigma_k = _distribution_param(distribution_params, "r_sigma_k", 0.16) * float(k0)
+        return _spline_maxent_radii_and_weights(
+            k0=float(k0),
+            sigma_k=float(sigma_k),
+            distribution_params=distribution_params,
             num_nodes=max(num_nodes, 64),
         )
     if distribution == "uniform_band":
@@ -3802,7 +4187,10 @@ def parse_args() -> argparse.Namespace:
             "single_shell",
             "gaussian_radial",
             "gamma_radial",
+            "skew_normal_radial",
+            "bimodal_gaussian_radial",
             "max_entropy_radial",
+            "spline_maxent_radial",
             "uniform_band",
         ],
         default="single_shell",
