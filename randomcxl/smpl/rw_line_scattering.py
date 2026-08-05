@@ -28,7 +28,7 @@ if __name__ == "__main__":
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import simpson
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, UnivariateSpline
 from scipy.optimize import brentq, least_squares
 from scipy.stats import gamma as gamma_dist
 from scipy.stats import norm, qmc, skewnorm
@@ -2396,6 +2396,60 @@ def stabilize_low_q_quadratic(
     )
 
 
+def _blend_low_q_quadratic(
+    q_grid: np.ndarray,
+    direct_values: np.ndarray,
+    fit: LowQAsymptoticFit,
+    *,
+    blend_start: float,
+    blend_end: float,
+    direct_log_derivative: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Blend an even quadratic low-Q limit into a direct radial transform.
+
+    A cubic smoothstep makes both the value and its first derivative continuous.
+    When ``direct_log_derivative`` is supplied, the returned derivative includes
+    the derivative of the blend weight and is therefore exactly consistent with
+    the blended curve.
+    """
+
+    q = np.asarray(q_grid, dtype=float)
+    direct = np.asarray(direct_values, dtype=float)
+    if q.shape != direct.shape:
+        raise ValueError("q_grid and direct_values must have the same shape.")
+    blend_start = float(blend_start)
+    blend_end = float(blend_end)
+    if not 0.0 <= blend_start < blend_end:
+        raise ValueError("low-Q blend must satisfy 0 <= start < end.")
+
+    t = np.clip((q - blend_start) / (blend_end - blend_start), 0.0, 1.0)
+    weight = t * t * (3.0 - 2.0 * t)
+    asymptotic = np.asarray(fit.I_asymptotic, dtype=float)
+    blended = (1.0 - weight) * asymptotic + weight * direct
+
+    if direct_log_derivative is None:
+        return blended, None
+    direct_d = np.asarray(direct_log_derivative, dtype=float)
+    if direct_d.shape != q.shape:
+        raise ValueError("direct_log_derivative must match q_grid.")
+    asymptotic_d = 2.0 * float(fit.I2) * q * q
+    d_weight = np.zeros_like(q)
+    transition = (q > blend_start) & (q < blend_end)
+    d_weight[transition] = (
+        q[transition]
+        * 6.0
+        * t[transition]
+        * (1.0 - t[transition])
+        / (blend_end - blend_start)
+    )
+    blended_d = (
+        (1.0 - weight) * asymptotic_d
+        + weight * direct_d
+        + d_weight * (direct - asymptotic)
+    )
+    return blended, blended_d
+
+
 def line_low_q_moments_from_CL(
     r_grid: np.ndarray,
     c_l: np.ndarray,
@@ -2938,6 +2992,34 @@ class LineScatteringSpectrum:
 
 
 @dataclass(frozen=True)
+class IncompressibleUniaxialScatteringResult:
+    """Exact scalar powder baseline plus the second-order geometric correction."""
+
+    Q_grid: np.ndarray
+    I_L: np.ndarray
+    I_scalar_exact: np.ndarray
+    I_scalar_second_order: np.ndarray
+    I_geom_second_order: np.ndarray
+    I_trho: np.ndarray
+    I_tt: np.ndarray
+    D_I_L: np.ndarray
+    D2_I_L: np.ndarray
+    D_I_trho: np.ndarray
+    r_grid: np.ndarray
+    C_L: np.ndarray
+    K_trho: np.ndarray
+    K_tt: np.ndarray
+    K_trho_baseline: float
+    K_tt_baseline: float
+    stretch_ratio: float
+    hencky_strain: float
+    T_H: float
+    k_eff: float
+    rho0: float
+    line_result: LineScatteringSpectrum
+
+
+@dataclass(frozen=True)
 class HeterogeneousLineScatteringResult:
     """Components of the independent heterogeneous-mask line intensity."""
 
@@ -3088,6 +3170,7 @@ def compute_uniform_line_scattering(
     lowq_replace_max_over_k_eff: float | None = DEFAULT_HETERO_LOWQ_REPLACE_MAX_OVER_K_EFF,
     tail_start_fraction: float = DEFAULT_HETERO_TAIL_START_FRACTION,
     use_qmc: bool = DEFAULT_HETERO_USE_QMC,
+    compute_tangent_correlations: bool = False,
     progress: bool = True,
 ) -> LineScatteringSpectrum:
     """Compute a uniform random-line scattering spectrum with reusable metadata.
@@ -3148,20 +3231,47 @@ def compute_uniform_line_scattering(
     )
     q_grid = np.geomspace(float(Q_min_factor) * k_mean, float(Q_max_factor) * k_mean, int(NQ))
 
-    m_j, c_l = compute_CL_general(
-        r_grid,
-        k_radii,
-        None,
-        k_weights=k_weights,
-        use_qmc=bool(use_qmc),
-        random_seed=int(random_seed),
-        progress=progress,
-        jacobian_method=jacobian_method,
-        N_samp_U=int(N_samp_U),
-        N_samp_st=int(N_samp_st),
-        st_sampling="quadrature",
-        n_jobs=1,
-    )
+    tangent = None
+    if compute_tangent_correlations:
+        if str(jacobian_method).lower() != "direct_12d":
+            raise ValueError(
+                "Shared tangent correlations currently require jacobian_method='direct_12d'."
+            )
+        tangent = compute_tangent_pair_correlations(
+            r_grid,
+            k_radii,
+            int(N_samp_U),
+            k_weights=k_weights,
+            use_qmc=bool(use_qmc),
+            random_seed=int(random_seed),
+            progress=progress,
+        )
+        m_j = np.asarray(tangent["M_J"], dtype=float)
+        g, _, _ = radial_covariance_numeric(
+            r_grid,
+            k_radii,
+            k_weights=k_weights,
+        )
+        denom = 4.0 * np.pi**2 * np.maximum(
+            1.0 - g * g,
+            np.finfo(float).tiny,
+        )
+        c_l = m_j / denom
+    else:
+        m_j, c_l = compute_CL_general(
+            r_grid,
+            k_radii,
+            None,
+            k_weights=k_weights,
+            use_qmc=bool(use_qmc),
+            random_seed=int(random_seed),
+            progress=progress,
+            jacobian_method=jacobian_method,
+            N_samp_U=int(N_samp_U),
+            N_samp_st=int(N_samp_st),
+            st_sampling="quadrature",
+            n_jobs=1,
+        )
     diag = compute_coherent_transform_diagnostics(
         r_grid,
         c_l,
@@ -3197,7 +3307,319 @@ def compute_uniform_line_scattering(
     object.__setattr__(result, "tail_start_fraction", float(tail_start_fraction))
     object.__setattr__(result, "use_qmc", bool(use_qmc))
     object.__setattr__(result, "uniform_meta", meta)
+    if tangent is not None:
+        object.__setattr__(result, "K_trho", np.asarray(tangent["K_trho"], dtype=float))
+        object.__setattr__(result, "K_tt", np.asarray(tangent["K_tt"], dtype=float))
+        object.__setattr__(result, "M_trho", np.asarray(tangent["M_trho"], dtype=float))
+        object.__setattr__(result, "M_tt", np.asarray(tangent["M_tt"], dtype=float))
+        object.__setattr__(result, "K_trho_inf_sampled", float(tangent["K_trho_inf_sampled"]))
+        object.__setattr__(result, "K_tt_inf_sampled", float(tangent["K_tt_inf_sampled"]))
+        object.__setattr__(result, "tangent_n_samp", int(N_samp_U))
+        object.__setattr__(result, "tangent_use_qmc", bool(use_qmc))
+        object.__setattr__(result, "tangent_random_seed", int(random_seed))
     return result
+
+
+def compute_incompressible_uniaxial_scattering(
+    *,
+    stretch_ratio: float,
+    line_result: LineScatteringSpectrum | None = None,
+    N_samp_tangent: int = DEFAULT_HETERO_N_SAMP,
+    tangent_use_qmc: bool = True,
+    tangent_random_seed: int | None = None,
+    n_mu: int = 256,
+    derivative_smoothing_fraction: float = 1.0e-4,
+    tail_start_fraction: float | None = None,
+    tangent_tail_start_factor: float | None = None,
+    tangent_tail_end_factor: float | None = None,
+    progress: bool = True,
+    **uniform_kwargs: object,
+) -> IncompressibleUniaxialScatteringResult:
+    """Compute scalar and physical-line powder spectra for a weak uniaxial stretch.
+
+    The physical-line result uses the exact scalar powder remapping as a smooth
+    baseline and adds the second-order geometric-minus-scalar correction with
+    ``T_H=3 log(stretch_ratio)^2/2``.  This is equal to the strict second-order
+    series through ``O(H^2)`` but avoids numerically differentiating ``I_L``
+    twice. ``D_Q I_trho`` is evaluated directly under the radial integral.
+    The tangent transforms use their even quadratic low-Q limit below
+    ``Q/k_eff=0.5``, joined smoothly to the direct transform by
+    ``Q/k_eff=0.8``.
+    ``I_trho`` and ``I_tt`` are the j0 transforms of ``C_L K_trho`` and
+    ``C_L K_tt``. The two tangent correlations are estimated from the same
+    weighted 12D conditional samples.
+
+    If line_result is omitted, compute_uniform_line_scattering is called with
+    uniform_kwargs. Supplying an existing result avoids recomputing the
+    isotropic spectrum.
+    """
+
+    stretch_ratio = float(stretch_ratio)
+    if not np.isfinite(stretch_ratio) or stretch_ratio <= 0.0:
+        raise ValueError("stretch_ratio must be a finite positive number.")
+    if line_result is None:
+        line_result = compute_uniform_line_scattering(
+            progress=progress,
+            **uniform_kwargs,
+        )
+    elif uniform_kwargs:
+        names = ", ".join(sorted(uniform_kwargs))
+        raise ValueError(
+            "uniform_kwargs cannot be used when line_result is supplied: "
+            f"{names}"
+        )
+
+    q_full = np.asarray(line_result.Q_grid, dtype=float)
+    i_full = np.asarray(line_result.I_L, dtype=float)
+    r_grid_value = _get_line_result_value(line_result, ("r_grid",))
+    c_l_value = _get_line_result_value(line_result, ("C_L", "c_l"))
+    if r_grid_value is None or c_l_value is None:
+        raise ValueError("line_result must retain r_grid and C_L.")
+    r_grid = np.asarray(r_grid_value, dtype=float)
+    c_l = np.asarray(c_l_value, dtype=float)
+    if r_grid.shape != c_l.shape:
+        raise ValueError("line_result r_grid and C_L must have identical shape.")
+    if line_result.k_radii is None:
+        raise ValueError("line_result must retain k_radii.")
+    k_radii = np.asarray(line_result.k_radii, dtype=float)
+    k_weights = (
+        None
+        if line_result.k_weights is None
+        else np.asarray(line_result.k_weights, dtype=float)
+    )
+
+    uniform_meta = _get_line_result_value(line_result, ("uniform_meta",))
+    seed = (
+        int(tangent_random_seed)
+        if tangent_random_seed is not None
+        else int(
+            uniform_meta.get("random_seed", DEFAULT_RANDOM_SEED)
+            if isinstance(uniform_meta, Mapping)
+            else DEFAULT_RANDOM_SEED
+        )
+    )
+    stored_k_trho = _get_line_result_value(line_result, ("K_trho",))
+    stored_k_tt = _get_line_result_value(line_result, ("K_tt",))
+    stored_trho_inf = _get_line_result_value(line_result, ("K_trho_inf_sampled",))
+    stored_tt_inf = _get_line_result_value(line_result, ("K_tt_inf_sampled",))
+    stored_n_samp = _get_line_result_value(line_result, ("tangent_n_samp",))
+    stored_use_qmc = _get_line_result_value(line_result, ("tangent_use_qmc",))
+    stored_seed = _get_line_result_value(line_result, ("tangent_random_seed",))
+    can_reuse_tangent = (
+        stored_k_trho is not None
+        and stored_k_tt is not None
+        and stored_trho_inf is not None
+        and stored_tt_inf is not None
+        and stored_n_samp is not None
+        and stored_use_qmc is not None
+        and stored_seed is not None
+        and int(stored_n_samp) == int(N_samp_tangent)
+        and bool(stored_use_qmc) == bool(tangent_use_qmc)
+        and int(stored_seed) == seed
+    )
+    if can_reuse_tangent:
+        tangent = {
+            "K_trho": np.asarray(stored_k_trho, dtype=float),
+            "K_tt": np.asarray(stored_k_tt, dtype=float),
+            "K_trho_inf_sampled": float(stored_trho_inf),
+            "K_tt_inf_sampled": float(stored_tt_inf),
+        }
+    else:
+        tangent = compute_tangent_pair_correlations(
+            r_grid,
+            k_radii,
+            int(N_samp_tangent),
+            k_weights=k_weights,
+            use_qmc=bool(tangent_use_qmc),
+            random_seed=seed,
+            progress=progress,
+        )
+    k_trho = np.asarray(tangent["K_trho"], dtype=float)
+    k_tt = np.asarray(tangent["K_tt"], dtype=float)
+    k_trho_baseline = float(tangent["K_trho_inf_sampled"])
+    k_tt_baseline = float(tangent["K_tt_inf_sampled"])
+    k_trho_centered = k_trho - k_trho_baseline
+    k_tt_centered = k_tt - k_tt_baseline
+
+    if tail_start_fraction is None:
+        stored_fraction = _get_line_result_value(line_result, ("tail_start_fraction",))
+        tail_start_fraction = (
+            float(stored_fraction)
+            if stored_fraction is not None
+            else DEFAULT_HETERO_TAIL_START_FRACTION
+        )
+    tail_start_fraction = float(tail_start_fraction)
+    if not 0.0 <= tail_start_fraction < 1.0:
+        raise ValueError("tail_start_fraction must satisfy 0 <= value < 1.")
+    k_eff = (
+        float(np.sqrt(line_result.mu2))
+        if line_result.mu2 is not None
+        else float(np.sqrt(np.average(k_radii**2, weights=k_weights)))
+    )
+    tangent_r_start = tail_start_fraction * float(r_grid[-1])
+    tangent_r_end = float(r_grid[-1])
+    if tangent_tail_start_factor is not None:
+        tangent_r_start = min(
+            tangent_r_start,
+            float(tangent_tail_start_factor) / k_eff,
+        )
+    if tangent_tail_end_factor is not None:
+        tangent_r_end = min(
+            tangent_r_end,
+            float(tangent_tail_end_factor) / k_eff,
+        )
+    if not 0.0 <= tangent_r_start < tangent_r_end:
+        raise ValueError(
+            "The tangent-transform taper must satisfy 0 <= start < end."
+        )
+    window = tail_window(
+        r_grid,
+        tangent_r_start,
+        tangent_r_end,
+    )
+    i_trho_full = hankel_transform(
+        r_grid,
+        c_l * k_trho_centered * window,
+        q_full,
+    )
+    i_tt_full = hankel_transform(
+        r_grid,
+        c_l * k_tt_centered * window,
+        q_full,
+    )
+    d_i_trho_full = hankel_log_derivative(
+        r_grid,
+        c_l * k_trho_centered * window,
+        q_full,
+    )
+    lowq_fit_bounds = tuple(
+        float(value) * k_eff
+        for value in DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF
+    )
+    lowq_blend_start = (
+        DEFAULT_HETERO_LOWQ_REPLACE_MAX_OVER_K_EFF * k_eff
+    )
+    lowq_blend_end = float(lowq_fit_bounds[1])
+    trho_lowq = stabilize_low_q_quadratic(
+        q_full,
+        i_trho_full,
+        r_grid=r_grid,
+        r_taper_start=tangent_r_start,
+        fit_bounds=lowq_fit_bounds,
+        q_replace_max=lowq_blend_end,
+    )
+    tt_lowq = stabilize_low_q_quadratic(
+        q_full,
+        i_tt_full,
+        r_grid=r_grid,
+        r_taper_start=tangent_r_start,
+        fit_bounds=lowq_fit_bounds,
+        q_replace_max=lowq_blend_end,
+    )
+    i_trho_full, d_i_trho_stable = _blend_low_q_quadratic(
+        q_full,
+        i_trho_full,
+        trho_lowq,
+        blend_start=lowq_blend_start,
+        blend_end=lowq_blend_end,
+        direct_log_derivative=d_i_trho_full,
+    )
+    i_tt_full, _ = _blend_low_q_quadratic(
+        q_full,
+        i_tt_full,
+        tt_lowq,
+        blend_start=lowq_blend_start,
+        blend_end=lowq_blend_end,
+    )
+    if d_i_trho_stable is None:  # pragma: no cover - guarded by the call above
+        raise RuntimeError("missing stabilized tangent-density derivative")
+    d_i_trho_full = d_i_trho_stable
+
+    log_q = np.log(q_full)
+    derivative_smoothing_fraction = float(derivative_smoothing_fraction)
+    if derivative_smoothing_fraction < 0.0:
+        raise ValueError("derivative_smoothing_fraction must be nonnegative.")
+    spline_i = UnivariateSpline(
+        log_q,
+        i_full,
+        k=3,
+        s=derivative_smoothing_fraction * q_full.size * float(np.var(i_full)),
+    )
+    d_i_full = spline_i(log_q, 1)
+    d2_i_full = spline_i(log_q, 2)
+
+    lambda_parallel = stretch_ratio
+    lambda_perp = stretch_ratio ** (-0.5)
+    scale_min = min(lambda_perp, lambda_parallel)
+    scale_max = max(lambda_perp, lambda_parallel)
+    safe = (
+        (q_full * scale_min >= q_full[0])
+        & (q_full * scale_max <= q_full[-1])
+    )
+    if np.count_nonzero(safe) < 4:
+        raise ValueError("The stretched arguments leave too little of the Q grid.")
+    q_grid = q_full[safe]
+    mu, mu_weights = np.polynomial.legendre.leggauss(int(n_mu))
+    scale = np.sqrt(
+        lambda_perp**2
+        + (lambda_parallel**2 - lambda_perp**2) * mu**2
+    )
+    stretched_q = q_grid[:, None] * scale[None, :]
+    scalar_values = np.interp(
+        np.log(stretched_q),
+        log_q,
+        i_full,
+    )
+    i_scalar_exact = 0.5 * np.sum(
+        scalar_values * mu_weights[None, :],
+        axis=1,
+    )
+
+    i_l = i_full[safe]
+    i_trho = i_trho_full[safe]
+    i_tt = i_tt_full[safe]
+    d_i = d_i_full[safe]
+    d2_i = d2_i_full[safe]
+    d_i_trho = d_i_trho_full[safe]
+    h = float(np.log(stretch_ratio))
+    t_h = 1.5 * h * h
+    i_scalar_second_order = i_l + t_h * (
+        d_i / 5.0
+        + d2_i / 15.0
+    )
+    # Algebraically this is Eq. (geometric-minus-scalar) added to the exact
+    # scalar powder average.  It retains every geometric O(H^2) term while
+    # resumming the scalar coordinate remapping and avoiding D_Q^2 I_L noise.
+    i_geom_second_order = i_scalar_exact + t_h * (
+        8.0 * i_l / 15.0
+        + 4.0 * d_i_trho / 15.0
+        + 2.0 * i_tt / 15.0
+    )
+
+    return IncompressibleUniaxialScatteringResult(
+        Q_grid=q_grid,
+        I_L=i_l,
+        I_scalar_exact=i_scalar_exact,
+        I_scalar_second_order=i_scalar_second_order,
+        I_geom_second_order=i_geom_second_order,
+        I_trho=i_trho,
+        I_tt=i_tt,
+        D_I_L=d_i,
+        D2_I_L=d2_i,
+        D_I_trho=d_i_trho,
+        r_grid=r_grid,
+        C_L=c_l,
+        K_trho=k_trho_centered,
+        K_tt=k_tt_centered,
+        K_trho_baseline=k_trho_baseline,
+        K_tt_baseline=k_tt_baseline,
+        stretch_ratio=stretch_ratio,
+        hencky_strain=h,
+        T_H=t_h,
+        k_eff=k_eff,
+        rho0=float(line_result.rho0),
+        line_result=line_result,
+    )
 
 
 def _get_line_result_value(line_result: object, names: Sequence[str]) -> object | None:
@@ -3416,6 +3838,32 @@ def heterogeneous_highQ_intensity(
     singular = ~positive
     if np.any(singular) and (p_H != 0.0 or alpha_H != 0.0):
         out[singular] = np.inf
+    return out
+
+
+def hankel_log_derivative(
+    r_grid: np.ndarray,
+    c_r: np.ndarray,
+    q_grid: np.ndarray,
+) -> np.ndarray:
+    """Compute ``D_Q H[c]`` directly, where ``D_Q=d/d(log Q)``.
+
+    For ``x=Qr``, ``D_Q j_0(x)=cos(x)-j_0(x)``.  Evaluating this kernel under
+    the radial integral avoids differentiating a sampled transform and is
+    substantially more stable near narrow spectral features.
+    """
+
+    r_grid = np.asarray(r_grid, dtype=float)
+    c_r = np.asarray(c_r, dtype=float)
+    q_grid = np.asarray(q_grid, dtype=float)
+    if r_grid.shape != c_r.shape:
+        raise ValueError("r_grid and c_r must have the same shape.")
+    weighted = r_grid**2 * c_r
+    out = np.empty_like(q_grid, dtype=float)
+    for idx, q_value in enumerate(q_grid):
+        phase = q_value * r_grid
+        kernel = np.cos(phase) - np.sinc(phase / np.pi)
+        out[idx] = 4.0 * np.pi * float(simpson(weighted * kernel, x=r_grid))
     return out
 
 
@@ -3699,6 +4147,150 @@ def _nematic_tangent_moments_from_gradient_samples(
     m_2 = float(np.mean(weight * p2))
     k_2 = m_2 / m_j if m_j != 0.0 else np.nan
     return m_j, m_2, k_2
+
+
+def _tangent_pair_moments_from_gradient_samples(
+    u: np.ndarray,
+    v: np.ndarray,
+) -> tuple[float, float, float, float, float]:
+    """Return weighted density, tangent-density, and tangent-tangent moments.
+
+    The separation axis is the z axis of the conditional covariance. The
+    tangent-density estimator is symmetrized over the two endpoints.
+    """
+
+    u = np.asarray(u, dtype=float)
+    v = np.asarray(v, dtype=float)
+    if u.ndim != 2 or u.shape[1] != 6 or v.shape != u.shape:
+        raise ValueError("u and v must have identical shape (n_samp, 6).")
+    omega_0 = np.cross(u[:, :3], v[:, :3])
+    omega_r = np.cross(u[:, 3:], v[:, 3:])
+    norm_0 = np.linalg.norm(omega_0, axis=1)
+    norm_r = np.linalg.norm(omega_r, axis=1)
+    weight = norm_0 * norm_r
+    t0_z = np.divide(
+        omega_0[:, 2],
+        norm_0,
+        out=np.zeros_like(norm_0),
+        where=norm_0 > 0.0,
+    )
+    tr_z = np.divide(
+        omega_r[:, 2],
+        norm_r,
+        out=np.zeros_like(norm_r),
+        where=norm_r > 0.0,
+    )
+    tangent_dot = np.divide(
+        np.einsum("ij,ij->i", omega_0, omega_r),
+        weight,
+        out=np.zeros_like(weight),
+        where=weight > 0.0,
+    )
+    tangent_dot = np.clip(tangent_dot, -1.0, 1.0)
+    p2_0r = 0.5 * (3.0 * t0_z * t0_z - 1.0)
+    p2_rr = 0.5 * (3.0 * tr_z * tr_z - 1.0)
+    p2_tt = 0.5 * (3.0 * tangent_dot * tangent_dot - 1.0)
+    p2_trho = 0.5 * (p2_0r + p2_rr)
+    m_j = float(np.mean(weight))
+    m_trho = float(np.mean(weight * p2_trho))
+    m_tt = float(np.mean(weight * p2_tt))
+    if m_j == 0.0:
+        return m_j, m_trho, m_tt, np.nan, np.nan
+    return m_j, m_trho, m_tt, m_trho / m_j, m_tt / m_j
+
+
+def estimate_tangent_pair_correlations_for_r_general(
+    r: float,
+    k_radii: np.ndarray,
+    z_u: np.ndarray,
+    z_v: np.ndarray,
+    *,
+    k_weights: np.ndarray | None = None,
+    jitter_scale: float = 1.0e-12,
+) -> tuple[float, float, float, float, float]:
+    """Estimate K_trho and K_tt from common weighted conditional samples."""
+
+    if r <= 0.0:
+        raise ValueError("r must be strictly positive.")
+    z_u = np.asarray(z_u, dtype=float)
+    z_v = np.asarray(z_v, dtype=float)
+    if z_u.ndim != 2 or z_u.shape[1] != 6 or z_v.shape != z_u.shape:
+        raise ValueError("z_u and z_v must have identical shape (n_samp, 6).")
+    sigma = conditional_covariance_from_radial_spectrum(
+        r,
+        k_radii,
+        k_weights=k_weights,
+    )
+    a = gradient_variance_from_k_radii(k_radii, k_weights=k_weights)
+    factor = covariance_factor(sigma, jitter_scale * a)
+    u = z_u @ factor.T
+    v = z_v @ factor.T
+    return _tangent_pair_moments_from_gradient_samples(u, v)
+
+
+def compute_tangent_pair_correlations(
+    r_grid: np.ndarray,
+    k_radii: np.ndarray,
+    n_samp: int = DEFAULT_N_SAMP,
+    *,
+    k_weights: np.ndarray | None = None,
+    use_qmc: bool = True,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    progress: bool = True,
+) -> dict[str, np.ndarray | float]:
+    """Compute line-density-weighted K_trho(r) and K_tt(r) together."""
+
+    r_grid = np.asarray(r_grid, dtype=float)
+    if r_grid.ndim != 1 or np.any(r_grid <= 0.0):
+        raise ValueError(
+            "r_grid must be a one-dimensional array of positive separations."
+        )
+    z_u, z_v = standard_normal_samples(
+        int(n_samp),
+        use_qmc=use_qmc,
+        random_seed=int(random_seed),
+    )
+    _, _, _, k_trho_inf, k_tt_inf = (
+        _tangent_pair_moments_from_gradient_samples(z_u, z_v)
+    )
+    m_j = np.empty_like(r_grid)
+    m_trho = np.empty_like(r_grid)
+    m_tt = np.empty_like(r_grid)
+    k_trho = np.empty_like(r_grid)
+    k_tt = np.empty_like(r_grid)
+    t0 = time.perf_counter()
+    report_every = max(1, len(r_grid) // 20)
+    for idx, r in enumerate(r_grid):
+        (
+            m_j[idx],
+            m_trho[idx],
+            m_tt[idx],
+            k_trho[idx],
+            k_tt[idx],
+        ) = estimate_tangent_pair_correlations_for_r_general(
+            float(r),
+            k_radii,
+            z_u,
+            z_v,
+            k_weights=k_weights,
+        )
+        if progress and (
+            (idx + 1) % report_every == 0 or idx + 1 == len(r_grid)
+        ):
+            print(
+                "K_trho/K_tt direct_12d: "
+                f"{idx + 1}/{len(r_grid)} r values "
+                f"({time.perf_counter() - t0:.1f}s)"
+            )
+    return {
+        "M_J": m_j,
+        "M_trho": m_trho,
+        "M_tt": m_tt,
+        "K_trho": k_trho,
+        "K_tt": k_tt,
+        "K_trho_inf_sampled": float(k_trho_inf),
+        "K_tt_inf_sampled": float(k_tt_inf),
+    }
 
 
 def compute_nematic_tangent_correlation(
