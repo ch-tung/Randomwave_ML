@@ -10,6 +10,135 @@ from math import erfc
 
 import numpy as np
 from scipy.optimize import least_squares, minimize
+from scipy.stats import gamma as gamma_dist, norm
+
+
+GAMMA_SVD1_WIDTH_BASIS_PATH = Path(__file__).with_name("svd_width_basis.npz")
+GAUSSIAN_SVD1_WIDTH_BASIS_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "rw_line_scan_output"
+    / "gaussian_width_svd_model.npz"
+)
+SVD1_WIDTH_BASIS_PATH = GAMMA_SVD1_WIDTH_BASIS_PATH
+
+
+@dataclass(frozen=True)
+class SvdWidthEstimate:
+    """Width estimate obtained from the first line-scan SVD basis vector."""
+
+    r_sigma_k: float
+    svd1_coefficient: float
+    k_eff: float
+    q_min: float
+    q_max: float
+    n_points: int
+    reconstruction_rmse: float
+    k_distribution: str
+
+
+def estimate_k_distribution_width_svd1(
+    q: np.ndarray,
+    intensity: np.ndarray,
+    k_eff: float,
+    *,
+    q_range: tuple[float, float] | None = None,
+    k_distribution: str = "gamma_radial",
+    basis_path: str | Path | None = None,
+) -> SvdWidthEstimate:
+    """Estimate radial ``r_sigma_k`` using its distribution-specific SVD basis.
+
+    ``q`` and ``k_eff`` must use the same inverse-length units.  The selected
+    data are normalized by a fitted Q^-1 tail, interpolated onto the stored
+    dimensionless ``Q/k_eff`` grid, and projected onto SVD component 1.  The
+    component coefficient is then inverted against the line-scan calibration.
+    """
+
+    q = np.asarray(q, dtype=float)
+    intensity = np.asarray(intensity, dtype=float)
+    if q.ndim != 1 or intensity.ndim != 1 or q.size != intensity.size:
+        raise ValueError("q and intensity must be equal-length one-dimensional arrays.")
+    k_eff = float(k_eff)
+    if not np.isfinite(k_eff) or k_eff <= 0.0:
+        raise ValueError("k_eff must be finite and positive.")
+    good = np.isfinite(q) & np.isfinite(intensity) & (q > 0.0) & (intensity > 0.0)
+    if q_range is not None:
+        q_lo, q_hi = map(float, q_range)
+        if not 0.0 < q_lo < q_hi:
+            raise ValueError("q_range must be an increasing positive pair.")
+        good &= (q >= q_lo) & (q <= q_hi)
+    q_data = q[good]
+    i_data = intensity[good]
+    order = np.argsort(q_data)
+    q_data, i_data = q_data[order], i_data[order]
+    if q_data.size < 12:
+        raise ValueError("Need at least 12 positive points in the selected Q range.")
+    q_data, unique = np.unique(q_data, return_index=True)
+    i_data = i_data[unique]
+
+    k_distribution = str(k_distribution)
+    if k_distribution not in {"gamma_radial", "gaussian_radial"}:
+        raise ValueError("k_distribution must be gamma_radial or gaussian_radial.")
+    if basis_path is None:
+        basis_path = (
+            GAMMA_SVD1_WIDTH_BASIS_PATH
+            if k_distribution == "gamma_radial"
+            else GAUSSIAN_SVD1_WIDTH_BASIS_PATH
+        )
+    basis_path = Path(basis_path)
+    if not basis_path.exists():
+        raise FileNotFoundError(f"Stored SVD1 width basis not found: {basis_path}")
+    with np.load(basis_path) as basis:
+        u_grid = np.asarray(basis["u_grid"], dtype=float)
+        mean_shape = np.asarray(basis["mean_shape"], dtype=float)
+        component = np.asarray(basis["components"], dtype=float)[0]
+        sigma_values = np.asarray(basis["sigma_values"], dtype=float)
+        polynomial = np.asarray(basis["polynomial_coefficients"], dtype=float)[0]
+        sigma_center = float(basis["sigma_center"])
+        sigma_scale = float(basis["sigma_scale"])
+        tail_u_min = float(basis["inverse_tail_u_min"])
+        if (
+            "k_distribution" in basis
+            and str(basis["k_distribution"].item()) != k_distribution
+        ):
+            raise ValueError(
+                f"The stored SVD width basis is not calibrated for {k_distribution}."
+            )
+        if "k_scale_convention" in basis and str(basis["k_scale_convention"].item()) != "k_eff":
+            raise ValueError("The stored SVD width basis does not use the k_eff convention.")
+
+    u_data = q_data / k_eff
+    overlap = (u_grid >= u_data[0]) & (u_grid <= u_data[-1])
+    tail = u_data >= tail_u_min
+    if np.count_nonzero(overlap) < 12:
+        raise ValueError("The selected Q range has fewer than 12 points on the stored SVD grid.")
+    if np.count_nonzero(tail) < 4:
+        raise ValueError(
+            f"Need at least four points with Q/k_eff >= {tail_u_min:g} for tail normalization."
+        )
+    tail_line = np.polyfit(np.log(u_data[tail]), np.log(i_data[tail]), 1)
+    log_shape_data = np.log(i_data) - np.polyval(tail_line, np.log(u_data))
+    log_shape = np.interp(np.log(u_grid[overlap]), np.log(u_data), log_shape_data)
+    centered = log_shape - mean_shape[overlap]
+    weight = component[overlap]
+    coefficient = float(np.dot(centered, weight) / np.dot(weight, weight))
+
+    sigma_dense = np.linspace(float(sigma_values.min()), float(sigma_values.max()), 10001)
+    coordinate = (sigma_dense - sigma_center) / sigma_scale
+    calibrated = np.polyval(polynomial, coordinate)
+    sigma_index = int(np.argmin(np.abs(calibrated - coefficient)))
+    r_sigma_k = float(sigma_dense[sigma_index])
+    reconstructed = mean_shape[overlap] + coefficient * weight
+    rmse = float(np.sqrt(np.mean((log_shape - reconstructed) ** 2)))
+    return SvdWidthEstimate(
+        r_sigma_k=r_sigma_k,
+        svd1_coefficient=coefficient,
+        k_eff=k_eff,
+        q_min=float(q_data[0]),
+        q_max=float(q_data[-1]),
+        n_points=int(q_data.size),
+        reconstruction_rmse=rmse,
+        k_distribution=k_distribution,
+    )
 
 
 @dataclass(frozen=True)
@@ -67,32 +196,36 @@ class AnchorFit:
 def gaussian_resolution_matrix(
     q: np.ndarray,
     resolution_sigma: np.ndarray,
+    *,
+    source_q: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return a row-normalized Gaussian Q-resolution convolution matrix.
 
-    Row ``i`` maps an unsmeared profile tabulated on ``q`` to the measured
-    intensity at ``q[i]`` using the pointwise standard deviation
-    ``resolution_sigma[i]`` and trapezoid-like integration weights.
+    Row ``i`` maps an unsmeared profile tabulated on ``source_q`` to the
+    measured intensity at ``q[i]`` using the pointwise standard deviation
+    ``resolution_sigma[i]`` and trapezoid-like integration weights. When
+    ``source_q`` is omitted, the input and output grids are both ``q``.
     """
 
     q = np.asarray(q, dtype=float)
     resolution_sigma = np.asarray(resolution_sigma, dtype=float)
+    source_q = q if source_q is None else np.asarray(source_q, dtype=float)
     if q.ndim != 1 or resolution_sigma.ndim != 1 or q.size != resolution_sigma.size:
         raise ValueError("q and resolution_sigma must be equal-length one-dimensional arrays.")
-    if q.size < 2:
-        raise ValueError("Need at least two Q points to construct a resolution matrix.")
-    if not np.all(np.isfinite(q)) or not np.all(np.isfinite(resolution_sigma)):
-        raise ValueError("q and resolution_sigma must be finite.")
-    if np.any(np.diff(q) <= 0.0):
-        raise ValueError("q must be strictly increasing.")
-    if np.any(q <= 0.0) or np.any(resolution_sigma <= 0.0):
-        raise ValueError("q and resolution_sigma must be positive.")
+    if source_q.ndim != 1 or source_q.size < 2:
+        raise ValueError("source_q must contain at least two Q points.")
+    if not np.all(np.isfinite(q)) or not np.all(np.isfinite(source_q)) or not np.all(np.isfinite(resolution_sigma)):
+        raise ValueError("q, source_q, and resolution_sigma must be finite.")
+    if np.any(np.diff(q) <= 0.0) or np.any(np.diff(source_q) <= 0.0):
+        raise ValueError("q and source_q must be strictly increasing.")
+    if np.any(q <= 0.0) or np.any(source_q <= 0.0) or np.any(resolution_sigma <= 0.0):
+        raise ValueError("q, source_q, and resolution_sigma must be positive.")
 
-    dq_weights = np.empty_like(q)
-    dq_weights[1:-1] = 0.5 * (q[2:] - q[:-2])
-    dq_weights[0] = 0.5 * (q[1] - q[0])
-    dq_weights[-1] = 0.5 * (q[-1] - q[-2])
-    delta = q[:, None] - q[None, :]
+    dq_weights = np.empty_like(source_q)
+    dq_weights[1:-1] = 0.5 * (source_q[2:] - source_q[:-2])
+    dq_weights[0] = 0.5 * (source_q[1] - source_q[0])
+    dq_weights[-1] = 0.5 * (source_q[-1] - source_q[-2])
+    delta = q[:, None] - source_q[None, :]
     matrix = np.exp(
         -0.5 * (delta / resolution_sigma[:, None]) ** 2
     ) * dq_weights[None, :]
@@ -753,7 +886,7 @@ def initial_heterogeneous_guess_from_anchors(
     scale = float(highq_coefficient) / max(np.pi * p_h * rho0, np.finfo(float).tiny)
     initial = {
         "scale": max(scale, np.finfo(float).tiny),
-        "mean_k": mean_k,
+        "mean_k": k_scale_metadata["mean_k"],
         "r_sigma_k": r_sigma_k,
         "k_H_over_k": k_h_over_k,
         "b": b,
@@ -866,6 +999,151 @@ def radial_k_distribution_density(
     density_nodes = weights / np.maximum(node_width, np.finfo(float).tiny)
     density = np.interp(k_grid, nodes, density_nodes, left=0.0, right=0.0)
     return k_grid, density
+
+
+def gamma_radial_parameters_from_k_eff(
+    k_eff: float,
+    r_sigma_k: float,
+) -> dict[str, float]:
+    """Convert ``(k_eff, sigma_k / mean_k)`` to gamma parameters."""
+
+    k_eff = float(k_eff)
+    r_sigma_k = float(r_sigma_k)
+    if not np.isfinite(k_eff) or k_eff <= 0.0:
+        raise ValueError("k_eff must be finite and positive.")
+    if not np.isfinite(r_sigma_k) or r_sigma_k <= 0.0:
+        raise ValueError("r_sigma_k must be finite and positive.")
+    mean_k = k_eff / np.sqrt(1.0 + r_sigma_k * r_sigma_k)
+    sigma_k = r_sigma_k * mean_k
+    return {
+        "k_eff": k_eff,
+        "mean_k": float(mean_k),
+        "sigma_k": float(sigma_k),
+        "gamma_shape": float(1.0 / (r_sigma_k * r_sigma_k)),
+        "gamma_scale": float(mean_k * r_sigma_k * r_sigma_k),
+    }
+
+
+def gamma_radial_density_from_k_eff(
+    k_eff: float,
+    r_sigma_k: float,
+    *,
+    num_points: int = 600,
+    upper_quantile: float = 0.9995,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate the positive gamma density parameterized by ``k_eff``."""
+
+    parameters = gamma_radial_parameters_from_k_eff(k_eff, r_sigma_k)
+    upper = float(gamma_dist.ppf(
+        float(upper_quantile),
+        a=parameters["gamma_shape"],
+        scale=parameters["gamma_scale"],
+    ))
+    k_grid = np.linspace(0.0, upper, int(num_points))
+    density = gamma_dist.pdf(
+        k_grid,
+        a=parameters["gamma_shape"],
+        scale=parameters["gamma_scale"],
+    )
+    return k_grid, np.asarray(density, dtype=float)
+
+
+def gaussian_radial_parameters_from_k_eff(
+    k_eff: float,
+    r_sigma_k: float,
+) -> dict[str, float]:
+    """Convert ``k_eff`` to parameters of a Gaussian truncated at ``k=0``.
+
+    ``r_sigma_k`` retains the Gaussian-model definition ``sigma/location``.
+    Returned ``mean_k`` and ``sigma_k`` are the moments after truncation.
+    """
+
+    k_eff = float(k_eff)
+    r_sigma_k = float(r_sigma_k)
+    if not np.isfinite(k_eff) or k_eff <= 0.0:
+        raise ValueError("k_eff must be finite and positive.")
+    if not np.isfinite(r_sigma_k) or r_sigma_k <= 0.0:
+        raise ValueError("r_sigma_k must be finite and positive.")
+    inverse_width = 1.0 / r_sigma_k
+    mills_ratio = float(norm.pdf(inverse_width) / norm.cdf(inverse_width))
+    unit_second_moment = (
+        1.0 + r_sigma_k * r_sigma_k + r_sigma_k * mills_ratio
+    )
+    location = k_eff / np.sqrt(unit_second_moment)
+    nominal_sigma = r_sigma_k * location
+    mean_k = location * (1.0 + r_sigma_k * mills_ratio)
+    variance = nominal_sigma**2 * (
+        1.0 - inverse_width * mills_ratio - mills_ratio * mills_ratio
+    )
+    return {
+        "k_eff": k_eff,
+        "k0_nominal": float(location),
+        "gaussian_location": float(location),
+        "gaussian_nominal_sigma": float(nominal_sigma),
+        "mean_k": float(mean_k),
+        "sigma_k": float(np.sqrt(max(variance, 0.0))),
+    }
+
+
+def gaussian_radial_density_from_k_eff(
+    k_eff: float,
+    r_sigma_k: float,
+    *,
+    num_points: int = 600,
+    upper_quantile: float = 0.9995,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate the positive truncated-Gaussian density through a tail quantile."""
+
+    num_points = int(num_points)
+    upper_quantile = float(upper_quantile)
+    if num_points < 2:
+        raise ValueError("num_points must be at least 2.")
+    if not 0.0 < upper_quantile < 1.0:
+        raise ValueError("upper_quantile must satisfy 0 < value < 1.")
+    parameters = gaussian_radial_parameters_from_k_eff(k_eff, r_sigma_k)
+    location = float(parameters["gaussian_location"])
+    sigma = float(parameters["gaussian_nominal_sigma"])
+    lower_cdf = float(norm.cdf(-location / sigma))
+    target_cdf = lower_cdf + upper_quantile * (1.0 - lower_cdf)
+    upper = location + sigma * float(norm.ppf(target_cdf))
+    k_grid = np.linspace(0.0, upper, num_points)
+    density = norm.pdf((k_grid - location) / sigma) / (
+        sigma * (1.0 - lower_cdf)
+    )
+    return k_grid, np.asarray(density, dtype=float)
+
+
+def _resolve_line_k_scale(
+    parameters: Mapping[str, float],
+    model_settings: Mapping[str, float | int | str | bool | None],
+) -> tuple[str, float, float, dict[str, float]]:
+    """Resolve the fitted k scale and the distribution mean used by the line model."""
+
+    convention = str(model_settings.get("k_scale_convention", "mean")).lower()
+    distribution = str(model_settings.get("k_distribution", "gaussian_radial"))
+    r_sigma_k = float(parameters["r_sigma_k"])
+    if convention == "mean":
+        mean_k = float(parameters["mean_k"])
+        metadata = {
+            "mean_k": mean_k,
+            "sigma_k": r_sigma_k * mean_k,
+            "k_eff": mean_k * np.sqrt(1.0 + r_sigma_k * r_sigma_k),
+        }
+        return "mean_k", mean_k, mean_k, metadata
+    if convention != "k_eff":
+        raise ValueError("k_scale_convention must be 'mean' or 'k_eff'.")
+    k_eff = float(parameters["k_eff"])
+    if distribution == "gamma_radial":
+        metadata = gamma_radial_parameters_from_k_eff(k_eff, r_sigma_k)
+        k0_nominal = metadata["mean_k"]
+    elif distribution == "gaussian_radial":
+        metadata = gaussian_radial_parameters_from_k_eff(k_eff, r_sigma_k)
+        k0_nominal = metadata["k0_nominal"]
+    else:
+        raise ValueError(
+            "k_scale_convention='k_eff' is defined for gamma_radial and gaussian_radial."
+        )
+    return "k_eff", k_eff, float(k0_nominal), metadata
 
 
 def compute_fit_orientation_correlations(
@@ -1010,6 +1288,123 @@ def uniaxial_affine_highq_factor(stretch_ratio: float, *, n_mu: int = 128) -> fl
     return float(0.5 * np.sum(weights / scale))
 
 
+def _affine_powder_curve(
+    q: np.ndarray,
+    line: object,
+    model_q: np.ndarray,
+    model_intensity: np.ndarray,
+    stretch_ratio: float,
+    *,
+    model_mode: str,
+    model_settings: Mapping[str, float | int | str | bool | None],
+    rls: object,
+) -> tuple[np.ndarray, float, object | None]:
+    """Evaluate the selected incompressible affine powder model."""
+
+    affine_model = str(model_settings.get("affine_model", "scalar")).lower()
+    if affine_model == "scalar":
+        curve = uniaxial_affine_powder_average(
+            q,
+            model_q,
+            model_intensity,
+            stretch_ratio,
+            n_mu=int(model_settings.get("powder_n_mu", 64)),
+        )
+        return (
+            curve,
+            uniaxial_affine_highq_factor(stretch_ratio),
+            None,
+        )
+    if affine_model != "geometric_second_order":
+        raise ValueError(
+            "affine_model must be 'scalar' or 'geometric_second_order'."
+        )
+    if model_mode != "line_only":
+        raise ValueError(
+            "geometric_second_order is currently defined only for line_only mode."
+        )
+    geometric = rls.compute_incompressible_uniaxial_scattering(
+        stretch_ratio=stretch_ratio,
+        line_result=line,
+        N_samp_tangent=int(
+            model_settings.get(
+                "N_samp_tangent",
+                model_settings.get("N_samp_U", 2**12),
+            )
+        ),
+        tangent_use_qmc=bool(model_settings.get("tangent_use_qmc", True)),
+        tangent_random_seed=int(
+            model_settings.get("tangent_random_seed", 12345)
+        ),
+        n_mu=int(model_settings.get("powder_n_mu", 64)),
+        derivative_smoothing_fraction=float(
+            model_settings.get("derivative_smoothing_fraction", 1.0e-4)
+        ),
+        tail_start_fraction=float(
+            model_settings.get("tail_start_fraction", 0.8)
+        ),
+        tangent_tail_start_factor=(
+            None
+            if model_settings.get("tangent_tail_start_factor") is None
+            else float(model_settings["tangent_tail_start_factor"])
+        ),
+        tangent_tail_end_factor=(
+            None
+            if model_settings.get("tangent_tail_end_factor") is None
+            else float(model_settings["tangent_tail_end_factor"])
+        ),
+        progress=bool(model_settings.get("progress", False)),
+    )
+    if np.min(q) < geometric.Q_grid[0] or np.max(q) > geometric.Q_grid[-1]:
+        raise ValueError(
+            "The geometric powder Q range does not cover all observations."
+        )
+    curve = np.interp(
+        np.log(q),
+        np.log(geometric.Q_grid),
+        geometric.I_geom_second_order,
+    )
+    tail = geometric.Q_grid / geometric.k_eff >= 5.0
+    if np.count_nonzero(tail) < 6:
+        tail = np.zeros_like(geometric.Q_grid, dtype=bool)
+        tail[-min(12, tail.size):] = True
+    positive = tail & np.isfinite(geometric.I_geom_second_order)
+    positive &= geometric.I_geom_second_order > 0.0
+    if np.count_nonzero(positive) < 3:
+        raise ValueError("Could not determine the geometric high-Q coefficient.")
+    highq_coefficient = float(
+        np.median(
+            geometric.Q_grid[positive]
+            * geometric.I_geom_second_order[positive]
+        )
+    )
+    highq_factor = highq_coefficient / (
+        np.pi * float(geometric.rho0)
+    )
+    return curve, highq_factor, geometric
+
+
+def _can_share_affine_tangent_samples(
+    affine_stretch: bool,
+    model_settings: Mapping[str, float | int | str | bool | None],
+) -> bool:
+    """Whether one direct-12D pass can supply density and tangent moments."""
+
+    n_density = int(model_settings.get("N_samp_U", 2**12))
+    return bool(
+        affine_stretch
+        and str(model_settings.get("affine_model", "scalar")).lower()
+        == "geometric_second_order"
+        and str(model_settings.get("jacobian_method", "direct_12d")).lower()
+        == "direct_12d"
+        and int(model_settings.get("N_samp_tangent", n_density)) == n_density
+        and bool(model_settings.get("tangent_use_qmc", True))
+        == bool(model_settings.get("use_qmc", True))
+        and int(model_settings.get("tangent_random_seed", 12345))
+        == int(model_settings.get("random_seed", 12345))
+    )
+
+
 def evaluate_heterogeneous_line_guess(
     observation: RadialProfile,
     *,
@@ -1029,8 +1424,9 @@ def evaluate_heterogeneous_line_guess(
     ``model_mode="heterogeneous"`` applies the independent binary mask.
     ``model_mode="line_only"`` fits the uniform random-line spectrum directly.
     When ``resolution_sigma`` is supplied, the trial curve is Gaussian-smeared
-    before its scale and residual are evaluated. ``regression_weights`` may be
-    used to emphasize selected observation points without discarding the rest.
+    on the full available observation Q grid before it is restricted to
+    ``q_bounds`` for scale and residual evaluation. ``regression_weights`` may
+    be used to emphasize selected observation points without discarding the rest.
     """
 
     rls = _import_line_scattering()
@@ -1064,26 +1460,35 @@ def evaluate_heterogeneous_line_guess(
         if not np.all(np.isfinite(point_weights) & (point_weights > 0.0)):
             raise ValueError("regression_weights must be finite and strictly positive.")
     resolution_matrix = None
+    q_model_eval = q_obs
     if resolution_sigma is not None:
         resolution_sigma = np.asarray(resolution_sigma, dtype=float)
         if resolution_sigma.shape != observation.q.shape:
             raise ValueError("resolution_sigma must have the same shape as observation.q.")
-        resolution_matrix = gaussian_resolution_matrix(q_obs, resolution_sigma[mask])
+        support_mask = np.isfinite(observation.q) & (observation.q > 0.0)
+        q_model_eval = observation.q[support_mask]
+        resolution_matrix = gaussian_resolution_matrix(
+            q_obs,
+            resolution_sigma[mask],
+            source_q=q_model_eval,
+        )
 
-    mean_k = float(parameters["mean_k"])
     stretch_ratio = float(parameters.get("stretch_ratio", 1.0)) if affine_stretch else 1.0
     k_distribution_params = _distribution_parameter_values(
         parameters,
         distribution_parameter_set,
     )
     r_sigma_k = float(k_distribution_params["r_sigma_k"])
+    _, k_scale, mean_k, k_scale_metadata = _resolve_line_k_scale(
+        {**parameters, "r_sigma_k": r_sigma_k}, model_settings
+    )
     k_h_over_k = float(parameters.get("k_H_over_k", 0.0))
     b = float(parameters.get("b", -np.inf))
     lambda_perp = stretch_ratio ** -0.5
     min_stretch = min(lambda_perp, stretch_ratio)
     max_stretch = max(lambda_perp, stretch_ratio)
-    q_min_factor = max(0.5 * q_min * min_stretch / mean_k, 1.0e-5)
-    q_max_factor = max(1.3 * q_max * max_stretch / mean_k, q_min_factor * 2.0)
+    q_min_factor = max(0.5 * float(q_model_eval[0]) * min_stretch / k_scale, 1.0e-5)
+    q_max_factor = max(1.3 * float(q_model_eval[-1]) * max_stretch / k_scale, q_min_factor * 2.0)
     line_kwargs = {
         "k0_nominal": mean_k,
         "r_sigma_k": r_sigma_k,
@@ -1109,6 +1514,9 @@ def evaluate_heterogeneous_line_guess(
         "use_asymptotic": bool(model_settings.get("use_asymptotic", True)),
         "lowq_fit_bounds_over_k_eff": model_settings.get("lowq_fit_bounds_over_k_eff", (0.35, 0.8)),
         "lowq_replace_max_over_k_eff": model_settings.get("lowq_replace_max_over_k_eff", 0.5),
+        "compute_tangent_correlations": _can_share_affine_tangent_samples(
+            affine_stretch, model_settings
+        ),
         "progress": bool(model_settings.get("progress", False)),
     }
     line = rls.compute_uniform_line_scattering(**line_kwargs)
@@ -1131,16 +1539,21 @@ def evaluate_heterogeneous_line_guess(
         alpha_h = 0.0
         kappa_h = 0.0
         rho0 = float(line.rho0)
+    affine_highq_factor = 1.0
+    affine_geometric_result = None
     if affine_stretch:
-        raw = uniaxial_affine_powder_average(
-            q_obs,
+        raw, affine_highq_factor, affine_geometric_result = _affine_powder_curve(
+            q_model_eval,
+            line,
             model_q,
             model_i,
             stretch_ratio,
-            n_mu=int(model_settings.get("powder_n_mu", 64)),
+            model_mode=model_mode,
+            model_settings=model_settings,
+            rls=rls,
         )
     else:
-        raw = np.interp(np.log(q_obs), np.log(model_q), model_i)
+        raw = np.interp(np.log(q_model_eval), np.log(model_q), model_i)
     if resolution_matrix is not None:
         raw = resolution_matrix @ raw
     raw = np.maximum(raw, np.finfo(float).tiny)
@@ -1164,6 +1577,8 @@ def evaluate_heterogeneous_line_guess(
     params = {
         "scale": scale,
         "mean_k": mean_k,
+        "k_eff": k_scale_metadata["k_eff"],
+        "sigma_k": k_scale_metadata["sigma_k"],
         "r_sigma_k": r_sigma_k,
         "k_H_over_k": k_h_over_k,
         "b": b,
@@ -1174,18 +1589,28 @@ def evaluate_heterogeneous_line_guess(
         "kappa_H": kappa_h,
         "rho0": rho0,
         "stretch_ratio": stretch_ratio,
-        "highq_coefficient": scale * np.pi * p_h * rho0 * (
-            uniaxial_affine_highq_factor(stretch_ratio) if affine_stretch else 1.0
-        ),
+        "highq_coefficient": scale * np.pi * p_h * rho0 * affine_highq_factor,
     }
+    params.update(
+        {
+            name: k_scale_metadata[name]
+            for name in (
+                "gamma_shape",
+                "gamma_scale",
+                "gaussian_location",
+                "gaussian_nominal_sigma",
+            )
+            if name in k_scale_metadata
+        }
+    )
     params.update(k_distribution_params)
-    return HeterogeneousFitResult(
+    result = HeterogeneousFitResult(
         parameters=params,
         free_parameters=np.asarray(
             (
-                [mean_k, *k_distribution_params.values(), *([stretch_ratio] if affine_stretch else []), k_h_over_k, b]
+                [k_scale, *k_distribution_params.values(), *([stretch_ratio] if affine_stretch else []), k_h_over_k, b]
                 if model_mode == "heterogeneous"
-                else [mean_k, *k_distribution_params.values(), *([stretch_ratio] if affine_stretch else [])]
+                else [k_scale, *k_distribution_params.values(), *([stretch_ratio] if affine_stretch else [])]
             ),
             dtype=float,
         ),
@@ -1200,6 +1625,56 @@ def evaluate_heterogeneous_line_guess(
         cost=0.5 * float(np.sum(residual * residual)),
         nfev=1,
     )
+    if affine_geometric_result is not None:
+        object.__setattr__(result, "affine_geometric_result", affine_geometric_result)
+    object.__setattr__(
+        result,
+        "affine_model",
+        str(model_settings.get("affine_model", "scalar")),
+    )
+    return result
+
+
+def _smooth_inverse_square_lower_residual(
+    value: float,
+    *,
+    lower_limit: float,
+    cutoff: float,
+    strength: float,
+    epsilon_fraction: float,
+) -> float:
+    """Compact C1 inverse-square barrier used for a soft lower limit."""
+
+    width = float(cutoff) - float(lower_limit)
+    if not np.isfinite(width) or width <= 0.0:
+        raise ValueError("inverse-square barrier requires lower_limit < cutoff")
+    epsilon = float(epsilon_fraction)
+    if not np.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("epsilon_fraction must be finite and positive")
+    amplitude = float(strength)
+    if not np.isfinite(amplitude) or amplitude <= 0.0:
+        raise ValueError("strength must be finite and positive")
+
+    t = (float(value) - float(lower_limit)) / width
+    if t >= 1.0:
+        return 0.0
+
+    endpoint_inverse = 1.0 / (1.0 + epsilon)
+
+    def profile(x: float) -> float:
+        return (
+            1.0 / (x + epsilon) ** 2
+            - endpoint_inverse**2
+            + 2.0 * (x - 1.0) * endpoint_inverse**3
+        )
+
+    if t <= 0.0:
+        value_at_lower = profile(0.0)
+        slope_at_lower = -2.0 / epsilon**3 + 2.0 * endpoint_inverse**3
+        barrier = value_at_lower + slope_at_lower * t
+    else:
+        barrier = profile(t)
+    return amplitude * max(0.0, float(barrier))
 
 
 def fit_heterogeneous_line_least_squares(
@@ -1221,21 +1696,35 @@ def fit_heterogeneous_line_least_squares(
     distribution_parameter_set: Mapping[str, Mapping[str, object]] | None = None,
     fixed_parameters: Mapping[str, float] | None = None,
     parameter_penalties: Mapping[str, tuple[float, float]] | None = None,
+    soft_lower_bounds: Mapping[str, tuple[float, float]] | None = None,
+    inverse_square_lower_barriers: Mapping[
+        str, tuple[float, float, float, float]
+    ] | None = None,
     verbose: int = 0,
     affine_stretch: bool = False,
 ) -> HeterogeneousFitResult:
     """Constrained first-pass fit of a random-line model.
 
-    Heterogeneous mode searches ``mean_k``, ``k_H_over_k``, ``b``, and the
+    Heterogeneous mode searches the selected k scale, ``k_H_over_k``, ``b``, and the
     distribution parameters. ``line_only`` mode omits the two mask parameters.
     Entries supplied in ``fixed_parameters`` are excluded from either search.
     ``parameter_penalties`` maps a parameter to ``(center, sigma)`` and adds a
     Gaussian regularization residual, useful for parsimonious spline shapes.
+    ``soft_lower_bounds`` maps a parameter to ``(threshold, sigma)`` and adds
+    ``max(0, (threshold-value)/sigma)^2`` to the residual. It is therefore
+    inactive above the threshold and quartic in the least-squares objective
+    below it.
+    ``inverse_square_lower_barriers`` maps a parameter to
+    ``(lower, cutoff, strength, epsilon_fraction)``. Between ``lower`` and
+    ``cutoff`` it follows a regularized inverse-square profile whose value and
+    first derivative vanish at ``cutoff``. Below ``lower`` its tangent is
+    continued linearly, keeping the residual and derivative continuous while
+    strongly driving the parameter upward.
     The overall scale is solved at each trial by weighted amplitude matching.
-    When ``resolution_sigma`` is supplied, every trial curve is convolved with
-    the pointwise Gaussian resolution before regression. Positive
-    ``regression_weights`` can emphasize a feature region while retaining the
-    full fitted Q range.
+    When ``resolution_sigma`` is supplied, every trial curve is evaluated and
+    convolved on the full available observation Q grid. Only the output points
+    inside ``q_bounds`` enter the regression loss. Positive ``regression_weights``
+    can emphasize a feature region while retaining the full fitted Q range.
     """
 
     rls = _import_line_scattering()
@@ -1270,21 +1759,40 @@ def fit_heterogeneous_line_least_squares(
         if not np.all(np.isfinite(point_weights) & (point_weights > 0.0)):
             raise ValueError("regression_weights must be finite and strictly positive.")
     resolution_matrix = None
+    q_model_eval = q_obs
     if resolution_sigma is not None:
         resolution_sigma = np.asarray(resolution_sigma, dtype=float)
         if resolution_sigma.shape != observation.q.shape:
             raise ValueError("resolution_sigma must have the same shape as observation.q.")
-        resolution_matrix = gaussian_resolution_matrix(q_obs, resolution_sigma[mask])
+        support_mask = np.isfinite(observation.q) & (observation.q > 0.0)
+        q_model_eval = observation.q[support_mask]
+        resolution_matrix = gaussian_resolution_matrix(
+            q_obs,
+            resolution_sigma[mask],
+            source_q=q_model_eval,
+        )
 
     parameter_set = dict(distribution_parameter_set or {})
     distribution_names = tuple(parameter_set) if parameter_set else ("r_sigma_k",)
     if "r_sigma_k" not in distribution_names:
         raise ValueError("distribution_parameter_set must include 'r_sigma_k'.")
     stretch_names = ("stretch_ratio",) if affine_stretch else ()
+    k_scale_convention = str(model_settings.get("k_scale_convention", "mean")).lower()
+    if k_scale_convention not in {"mean", "k_eff"}:
+        raise ValueError("k_scale_convention must be 'mean' or 'k_eff'.")
+    if (
+        k_scale_convention == "k_eff"
+        and str(model_settings.get("k_distribution", "gaussian_radial"))
+        not in {"gamma_radial", "gaussian_radial"}
+    ):
+        raise ValueError(
+            "k_scale_convention='k_eff' is defined for gamma_radial and gaussian_radial."
+        )
+    k_parameter_name = "k_eff" if k_scale_convention == "k_eff" else "mean_k"
     names = (
-        ("mean_k", *distribution_names, *stretch_names, "k_H_over_k", "b")
+        (k_parameter_name, *distribution_names, *stretch_names, "k_H_over_k", "b")
         if model_mode == "heterogeneous"
-        else ("mean_k", *distribution_names, *stretch_names)
+        else (k_parameter_name, *distribution_names, *stretch_names)
     )
     fixed = {name: float(value) for name, value in dict(fixed_parameters or {}).items()}
     unknown_fixed = tuple(name for name in fixed if name not in names)
@@ -1303,9 +1811,47 @@ def fit_heterogeneous_line_least_squares(
     for name, (center, sigma) in penalties.items():
         if not np.isfinite(center) or not np.isfinite(sigma) or sigma <= 0.0:
             raise ValueError(f"Penalty for {name!r} needs a finite center and positive sigma.")
+    lower_penalties = {
+        str(name): tuple(map(float, specification))
+        for name, specification in dict(soft_lower_bounds or {}).items()
+    }
+    unknown_lower_penalties = tuple(name for name in lower_penalties if name not in names)
+    if unknown_lower_penalties:
+        raise ValueError(f"Unknown soft-lower-bound parameter(s): {unknown_lower_penalties}.")
+    for name, (threshold, sigma) in lower_penalties.items():
+        if not np.isfinite(threshold) or not np.isfinite(sigma) or sigma <= 0.0:
+            raise ValueError(
+                f"Soft lower bound for {name!r} needs a finite threshold and positive sigma."
+            )
+    inverse_square_barriers = {
+        str(name): tuple(map(float, specification))
+        for name, specification in dict(inverse_square_lower_barriers or {}).items()
+    }
+    unknown_inverse_square = tuple(name for name in inverse_square_barriers if name not in names)
+    if unknown_inverse_square:
+        raise ValueError(
+            f"Unknown inverse-square lower-barrier parameter(s): {unknown_inverse_square}."
+        )
+    for name, specification in inverse_square_barriers.items():
+        if len(specification) != 4:
+            raise ValueError(
+                f"Inverse-square lower barrier for {name!r} requires "
+                "(lower, cutoff, strength, epsilon_fraction)."
+            )
+        lower_limit, cutoff, strength, epsilon_fraction = specification
+        if not all(np.isfinite(specification)):
+            raise ValueError(f"Inverse-square lower barrier for {name!r} must be finite.")
+        if not lower_limit < cutoff:
+            raise ValueError(f"Inverse-square lower barrier for {name!r} needs lower < cutoff.")
+        if strength <= 0.0 or epsilon_fraction <= 0.0:
+            raise ValueError(
+                f"Inverse-square lower barrier for {name!r} needs positive strength "
+                "and epsilon_fraction."
+            )
     free_names = tuple(name for name in names if name not in fixed)
     default_bounds = {
         "mean_k": (0.03, 0.3),
+        "k_eff": (0.03, 0.3),
         "r_sigma_k": (0.03, 0.8),
         "stretch_ratio": (0.7, 1.8),
         "k_H_over_k": (0.005, 0.5),
@@ -1328,17 +1874,42 @@ def fit_heterogeneous_line_least_squares(
     upper = np.array([all_bounds[name][1] for name in free_names], dtype=float)
     x0 = np.array([float(initial[name]) for name in free_names], dtype=float)
     x0 = np.minimum(np.maximum(x0, lower + 1.0e-12), upper - 1.0e-12)
-    cache: dict[tuple[float, ...], tuple[np.ndarray, object, object]] = {}
+    cache: dict[
+        tuple[float, ...],
+        tuple[np.ndarray, object, object, float, object | None],
+    ] = {}
+    line_cache: dict[tuple[float, ...], object] = {}
+    if affine_stretch:
+        if "stretch_ratio" in fixed:
+            stretch_coverage = (fixed["stretch_ratio"], fixed["stretch_ratio"])
+        else:
+            stretch_coverage = all_bounds["stretch_ratio"]
+        stretch_candidates = np.asarray(
+            [
+                stretch_coverage[0],
+                stretch_coverage[1],
+                stretch_coverage[0] ** -0.5,
+                stretch_coverage[1] ** -0.5,
+            ],
+            dtype=float,
+        )
+        coverage_min_stretch = float(np.min(stretch_candidates))
+        coverage_max_stretch = float(np.max(stretch_candidates))
+    else:
+        coverage_min_stretch = 1.0
+        coverage_max_stretch = 1.0
 
     def values_from_free(params: np.ndarray) -> dict[str, float]:
         values = dict(fixed)
         values.update(zip(free_names, map(float, params)))
         return values
 
-    def evaluate_raw(params: np.ndarray) -> tuple[np.ndarray, object, object]:
+    def evaluate_raw(
+        params: np.ndarray,
+    ) -> tuple[np.ndarray, object, object, float, object | None]:
         values = values_from_free(params)
-        mean_k = values["mean_k"]
         r_sigma_k = values["r_sigma_k"]
+        _, k_scale, mean_k, _ = _resolve_line_k_scale(values, model_settings)
         stretch_ratio = values.get("stretch_ratio", 1.0)
         k_h_over_k = values.get("k_H_over_k", 0.0)
         b = values.get("b", -np.inf)
@@ -1349,11 +1920,14 @@ def fit_heterogeneous_line_least_squares(
         key = tuple(round(values[name], 10) for name in names)
         if key in cache:
             return cache[key]
-        lambda_perp = stretch_ratio ** -0.5
-        min_stretch = min(lambda_perp, stretch_ratio)
-        max_stretch = max(lambda_perp, stretch_ratio)
-        q_min_factor = max(0.5 * q_min * min_stretch / mean_k, 1.0e-5)
-        q_max_factor = max(1.3 * q_max * max_stretch / mean_k, q_min_factor * 2.0)
+        q_min_factor = max(
+            0.5 * float(q_model_eval[0]) * coverage_min_stretch / k_scale,
+            1.0e-5,
+        )
+        q_max_factor = max(
+            1.3 * float(q_model_eval[-1]) * coverage_max_stretch / k_scale,
+            q_min_factor * 2.0,
+        )
         line_kwargs = {
             "k0_nominal": mean_k,
             "r_sigma_k": r_sigma_k,
@@ -1379,9 +1953,18 @@ def fit_heterogeneous_line_least_squares(
             "use_asymptotic": bool(model_settings.get("use_asymptotic", True)),
             "lowq_fit_bounds_over_k_eff": model_settings.get("lowq_fit_bounds_over_k_eff", (0.35, 0.8)),
             "lowq_replace_max_over_k_eff": model_settings.get("lowq_replace_max_over_k_eff", 0.5),
+            "compute_tangent_correlations": _can_share_affine_tangent_samples(
+                affine_stretch, model_settings
+            ),
             "progress": bool(model_settings.get("progress", False)),
         }
-        line = rls.compute_uniform_line_scattering(**line_kwargs)
+        line_key = tuple(
+            round(values[name], 10)
+            for name in (k_parameter_name, *distribution_names)
+        )
+        if line_key not in line_cache:
+            line_cache[line_key] = rls.compute_uniform_line_scattering(**line_kwargs)
+        line = line_cache[line_key]
         if model_mode == "heterogeneous":
             k_h = k_h_over_k * float(getattr(line, "uniform_meta", {}).get("k_mean", mean_k))
             model_result = rls.heterogeneous_line_scattering(
@@ -1396,19 +1979,34 @@ def fit_heterogeneous_line_least_squares(
             model_result = line
             model_q = line.Q_grid
             model_i = line.I_L
+        affine_highq_factor = 1.0
+        affine_geometric_result = None
         if affine_stretch:
-            model_grid = uniaxial_affine_powder_average(
-                q_obs,
+            (
+                model_grid,
+                affine_highq_factor,
+                affine_geometric_result,
+            ) = _affine_powder_curve(
+                q_model_eval,
+                line,
                 model_q,
                 model_i,
                 stretch_ratio,
-                n_mu=int(model_settings.get("powder_n_mu", 64)),
+                model_mode=model_mode,
+                model_settings=model_settings,
+                rls=rls,
             )
         else:
-            model_grid = np.interp(np.log(q_obs), np.log(model_q), model_i)
+            model_grid = np.interp(np.log(q_model_eval), np.log(model_q), model_i)
         if resolution_matrix is not None:
             model_grid = resolution_matrix @ model_grid
-        cache[key] = (model_grid, line, model_result)
+        cache[key] = (
+            model_grid,
+            line,
+            model_result,
+            affine_highq_factor,
+            affine_geometric_result,
+        )
         return cache[key]
 
     loss_mode = str(regression_loss or model_settings.get("regression_loss", "log")).lower()
@@ -1416,7 +2014,7 @@ def fit_heterogeneous_line_least_squares(
         raise ValueError("regression_loss must be 'relative' or 'log'.")
 
     def scaled_model_and_residual(params: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-        raw, line, model_result = evaluate_raw(params)
+        raw, line, model_result, affine_highq_factor, _ = evaluate_raw(params)
         raw = np.maximum(raw, np.finfo(float).tiny)
         if loss_mode == "relative":
             err_abs = np.maximum(e_obs, float(log_error_floor) * np.maximum(np.abs(i_obs), np.finfo(float).tiny))
@@ -1434,12 +2032,7 @@ def fit_heterogeneous_line_least_squares(
         if highq_coefficient_anchor is not None:
             p_h = float(model_result.p_H) if model_mode == "heterogeneous" else 1.0
             rho0 = float(model_result.rho0)
-            powder_factor = (
-                uniaxial_affine_highq_factor(values_from_free(params).get("stretch_ratio", 1.0))
-                if affine_stretch
-                else 1.0
-            )
-            coeff = scale * np.pi * p_h * rho0 * powder_factor
+            coeff = scale * np.pi * p_h * rho0 * affine_highq_factor
             anchor_residuals.append(float(anchor_weight) * np.log(coeff / float(highq_coefficient_anchor)))
         if (
             model_mode == "heterogeneous"
@@ -1459,12 +2052,53 @@ def fit_heterogeneous_line_least_squares(
                 dtype=float,
             )
             residual = np.concatenate([residual, penalty_residuals])
+        if lower_penalties:
+            values = values_from_free(params)
+            lower_residuals = np.asarray(
+                [
+                    max(0.0, (threshold - values[name]) / sigma) ** 2
+                    for name, (threshold, sigma) in lower_penalties.items()
+                ],
+                dtype=float,
+            )
+            residual = np.concatenate([residual, lower_residuals])
+        if inverse_square_barriers:
+            values = values_from_free(params)
+            barrier_residuals = np.asarray(
+                [
+                    _smooth_inverse_square_lower_residual(
+                        values[name],
+                        lower_limit=lower_limit,
+                        cutoff=cutoff,
+                        strength=strength,
+                        epsilon_fraction=epsilon_fraction,
+                    )
+                    for name, (
+                        lower_limit,
+                        cutoff,
+                        strength,
+                        epsilon_fraction,
+                    ) in inverse_square_barriers.items()
+                ],
+                dtype=float,
+            )
+            residual = np.concatenate([residual, barrier_residuals])
         return scale, scale * raw, residual
 
     def residual_fn(params: np.ndarray) -> np.ndarray:
         _, _, residual = scaled_model_and_residual(params)
         if not np.all(np.isfinite(residual)):
-            return np.full(q_obs.size + len(penalties) + 2, 1.0e6, dtype=float)
+            n_anchors = int(highq_coefficient_anchor is not None)
+            n_anchors += int(model_mode == "heterogeneous" and lowq_kappa_anchor is not None)
+            return np.full(
+                q_obs.size
+                + n_anchors
+                + len(penalties)
+                + len(lower_penalties)
+                + len(inverse_square_barriers),
+                1.0e6,
+                dtype=float,
+            )
         return residual
 
     if free_names:
@@ -1488,10 +2122,16 @@ def fit_heterogeneous_line_least_squares(
         nfev = 1
         cost = 0.5 * float(np.sum(direct_residual * direct_residual))
     scale, model, residual = scaled_model_and_residual(free_values)
-    raw, line, model_result = evaluate_raw(free_values)
+    (
+        raw,
+        line,
+        model_result,
+        affine_highq_factor,
+        affine_geometric_result,
+    ) = evaluate_raw(free_values)
     fitted = values_from_free(free_values)
-    mean_k = fitted["mean_k"]
     r_sigma_k = fitted["r_sigma_k"]
+    _, k_scale, mean_k, k_scale_metadata = _resolve_line_k_scale(fitted, model_settings)
     stretch_ratio = fitted.get("stretch_ratio", 1.0)
     k_h_over_k = fitted.get("k_H_over_k", 0.0)
     b = fitted.get("b", -np.inf)
@@ -1511,9 +2151,23 @@ def fit_heterogeneous_line_least_squares(
         alpha_h = 0.0
         kappa_h = 0.0
     rho0 = float(model_result.rho0)
+    chi_square_error = np.maximum(
+        e_obs,
+        float(log_error_floor) * np.maximum(np.abs(i_obs), np.finfo(float).tiny),
+    )
+    data_chi_square = float(np.sum(((model - i_obs) / chi_square_error) ** 2))
+    n_fitted_parameters = len(free_names) + 1  # nonlinear parameters plus fitted scale
+    data_degrees_of_freedom = int(q_obs.size - n_fitted_parameters)
+    data_reduced_chi_square = (
+        data_chi_square / data_degrees_of_freedom
+        if data_degrees_of_freedom > 0
+        else np.nan
+    )
     params = {
         "scale": scale,
-        "mean_k": mean_k,
+        "mean_k": k_scale_metadata["mean_k"],
+        "k_eff": k_scale_metadata["k_eff"],
+        "sigma_k": k_scale_metadata["sigma_k"],
         "r_sigma_k": r_sigma_k,
         "k_H_over_k": k_h_over_k,
         "b": b,
@@ -1524,12 +2178,26 @@ def fit_heterogeneous_line_least_squares(
         "kappa_H": kappa_h,
         "rho0": rho0,
         "stretch_ratio": stretch_ratio,
-        "highq_coefficient": scale * np.pi * p_h * rho0 * (
-            uniaxial_affine_highq_factor(stretch_ratio) if affine_stretch else 1.0
-        ),
+        "highq_coefficient": scale * np.pi * p_h * rho0 * affine_highq_factor,
+        "data_chi_square": data_chi_square,
+        "data_reduced_chi_square": data_reduced_chi_square,
+        "data_degrees_of_freedom": float(data_degrees_of_freedom),
+        "n_fitted_parameters": float(n_fitted_parameters),
     }
+    params.update(
+        {
+            name: k_scale_metadata[name]
+            for name in (
+                "gamma_shape",
+                "gamma_scale",
+                "gaussian_location",
+                "gaussian_nominal_sigma",
+            )
+            if name in k_scale_metadata
+        }
+    )
     params.update({name: fitted[name] for name in distribution_names})
-    return HeterogeneousFitResult(
+    result = HeterogeneousFitResult(
         parameters=params,
         free_parameters=free_values,
         residual=residual,
@@ -1543,6 +2211,14 @@ def fit_heterogeneous_line_least_squares(
         cost=cost,
         nfev=nfev,
     )
+    if affine_geometric_result is not None:
+        object.__setattr__(result, "affine_geometric_result", affine_geometric_result)
+    object.__setattr__(
+        result,
+        "affine_model",
+        str(model_settings.get("affine_model", "scalar")),
+    )
+    return result
 
 
 # -----------------------------------------------------------------------------
