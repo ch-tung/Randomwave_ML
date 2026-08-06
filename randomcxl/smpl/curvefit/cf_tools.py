@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 import sys
@@ -34,6 +34,158 @@ class SvdWidthEstimate:
     n_points: int
     reconstruction_rmse: float
     k_distribution: str
+
+
+@dataclass(frozen=True)
+class LinearizedBootstrapResult:
+    """Parameter samples from a fixed-Jacobian residual bootstrap."""
+
+    parameter_names: tuple[str, ...]
+    samples: np.ndarray
+    deltas: np.ndarray
+    jacobian_rank: int
+    jacobian_condition: float
+
+
+def linearized_residual_bootstrap(
+    parameter_names: tuple[str, ...],
+    center: np.ndarray,
+    data_jacobian: np.ndarray,
+    standardized_residuals: np.ndarray,
+    *,
+    fixed_jacobian_rows: np.ndarray | None = None,
+    n_bootstrap: int = 4000,
+    random_seed: int = 12345,
+    rcond: float = 1.0e-10,
+) -> LinearizedBootstrapResult:
+    """Bootstrap local parameter changes without repeating nonlinear fits.
+
+    ``data_jacobian`` is the derivative of the standardized fitted curve with
+    respect to ``center``. Experimental standardized residuals are centered
+    and resampled, while optional fixed rows (for priors or anchors) receive a
+    zero bootstrap perturbation. The returned approximation solves the local
+    least-squares problem with one fixed pseudoinverse.
+    """
+
+    names = tuple(str(name) for name in parameter_names)
+    center = np.asarray(center, dtype=float)
+    jacobian = np.asarray(data_jacobian, dtype=float)
+    residuals = np.asarray(standardized_residuals, dtype=float)
+    if center.shape != (len(names),):
+        raise ValueError("center must contain one value for every parameter name.")
+    if jacobian.ndim != 2 or jacobian.shape != (residuals.size, center.size):
+        raise ValueError(
+            "data_jacobian must have shape (n_residuals, n_parameters)."
+        )
+    if residuals.ndim != 1 or residuals.size < center.size + 1:
+        raise ValueError("Need more one-dimensional residuals than parameters.")
+    if not np.all(np.isfinite(center)) or not np.all(np.isfinite(jacobian)):
+        raise ValueError("Bootstrap center and Jacobian must be finite.")
+    if not np.all(np.isfinite(residuals)):
+        raise ValueError("Bootstrap residuals must be finite.")
+    n_bootstrap = int(n_bootstrap)
+    if n_bootstrap < 2:
+        raise ValueError("n_bootstrap must be at least two.")
+    fixed_rows = np.empty((0, center.size), dtype=float)
+    if fixed_jacobian_rows is not None:
+        fixed_rows = np.asarray(fixed_jacobian_rows, dtype=float)
+        if fixed_rows.ndim == 1:
+            fixed_rows = fixed_rows[None, :]
+        if fixed_rows.ndim != 2 or fixed_rows.shape[1] != center.size:
+            raise ValueError(
+                "fixed_jacobian_rows must have one column per parameter."
+            )
+        if not np.all(np.isfinite(fixed_rows)):
+            raise ValueError("fixed_jacobian_rows must be finite.")
+    full_jacobian = np.vstack((jacobian, fixed_rows))
+    singular_values = np.linalg.svd(full_jacobian, compute_uv=False)
+    tolerance = float(rcond) * singular_values[0]
+    rank = int(np.count_nonzero(singular_values > tolerance))
+    condition = (
+        float(singular_values[0] / singular_values[-1])
+        if singular_values[-1] > 0.0
+        else np.inf
+    )
+    pseudoinverse = np.linalg.pinv(full_jacobian, rcond=float(rcond))
+    centered_residuals = residuals - np.mean(residuals)
+    generator = np.random.default_rng(int(random_seed))
+    sampled_data = generator.choice(
+        centered_residuals,
+        size=(n_bootstrap, centered_residuals.size),
+        replace=True,
+    )
+    if fixed_rows.shape[0]:
+        sampled_rhs = np.hstack(
+            (sampled_data, np.zeros((n_bootstrap, fixed_rows.shape[0]), dtype=float))
+        )
+    else:
+        sampled_rhs = sampled_data
+    deltas = sampled_rhs @ pseudoinverse.T
+    return LinearizedBootstrapResult(
+        parameter_names=names,
+        samples=center[None, :] + deltas,
+        deltas=deltas,
+        jacobian_rank=rank,
+        jacobian_condition=condition,
+    )
+
+
+@dataclass(frozen=True)
+class LineFitConstraints:
+    """Reusable constraints for random-line least-squares fits.
+
+    ``line_density_anchor`` is ``(reference_density, relative_sigma)`` and
+    penalizes the logarithmic deviation of the model's geometrical high-Q line
+    density from the reference.  ``line_density_anchor_mode`` may be
+    ``"two_sided"`` or ``"below_reference_only"``.  A relative sigma of
+    ``0.10`` corresponds approximately to a ten-percent one-sigma tolerance.
+    """
+
+    fixed_parameters: Mapping[str, float] | None = None
+    parameter_penalties: Mapping[str, tuple[float, float]] | None = None
+    soft_lower_bounds: Mapping[str, tuple[float, float]] | None = None
+    inverse_square_lower_barriers: Mapping[
+        str, tuple[float, float, float, float]
+    ] | None = None
+    line_density_anchor: tuple[float, float] | None = None
+    line_density_anchor_mode: str = "two_sided"
+
+    def with_fixed_parameters(
+        self,
+        fixed_parameters: Mapping[str, float] | None,
+    ) -> "LineFitConstraints":
+        """Return a copy with the supplied fit-specific fixed parameters."""
+
+        return replace(
+            self,
+            fixed_parameters=dict(fixed_parameters or {}),
+        )
+
+
+def line_density_from_fit_parameters(parameters: Mapping[str, float]) -> float:
+    """Recover geometrical line density from saved fit parameters.
+
+    New results store ``line_density_geometric`` explicitly.  Older results
+    are reconstructed from their fitted high-Q coefficient and scale, which
+    gives the same ``rho0 * p_H * affine_highq_factor`` quantity.
+    """
+
+    if "line_density_geometric" in parameters:
+        density = float(parameters["line_density_geometric"])
+    elif "highq_coefficient" in parameters and "scale" in parameters:
+        scale = float(parameters["scale"])
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError("Saved fit scale must be finite and positive.")
+        density = float(parameters["highq_coefficient"]) / (np.pi * scale)
+    elif "rho0" in parameters:
+        density = float(parameters["rho0"])
+    else:
+        raise KeyError(
+            "Need line_density_geometric, highq_coefficient with scale, or rho0."
+        )
+    if not np.isfinite(density) or density <= 0.0:
+        raise ValueError("Recovered line density must be finite and positive.")
+    return density
 
 
 def estimate_k_distribution_width_svd1(
@@ -1298,8 +1450,15 @@ def _affine_powder_curve(
     model_mode: str,
     model_settings: Mapping[str, float | int | str | bool | None],
     rls: object,
+    k_h: float = 0.0,
+    b: float = -np.inf,
 ) -> tuple[np.ndarray, float, object | None]:
-    """Evaluate the selected incompressible affine powder model."""
+    """Evaluate the selected incompressible affine powder model.
+
+    For an independent heterogeneous mask, the physical-line spectrum is
+    transformed first and the existing mask operator is then applied to the
+    transformed spectrum and its geometrical line density.
+    """
 
     affine_model = str(model_settings.get("affine_model", "scalar")).lower()
     if affine_model == "scalar":
@@ -1318,10 +1477,6 @@ def _affine_powder_curve(
     if affine_model != "geometric_second_order":
         raise ValueError(
             "affine_model must be 'scalar' or 'geometric_second_order'."
-        )
-    if model_mode != "line_only":
-        raise ValueError(
-            "geometric_second_order is currently defined only for line_only mode."
         )
     geometric = rls.compute_incompressible_uniaxial_scattering(
         stretch_ratio=stretch_ratio,
@@ -1359,11 +1514,6 @@ def _affine_powder_curve(
         raise ValueError(
             "The geometric powder Q range does not cover all observations."
         )
-    curve = np.interp(
-        np.log(q),
-        np.log(geometric.Q_grid),
-        geometric.I_geom_second_order,
-    )
     tail = geometric.Q_grid / geometric.k_eff >= 5.0
     if np.count_nonzero(tail) < 6:
         tail = np.zeros_like(geometric.Q_grid, dtype=bool)
@@ -1380,6 +1530,27 @@ def _affine_powder_curve(
     )
     highq_factor = highq_coefficient / (
         np.pi * float(geometric.rho0)
+    )
+    geometric_intensity = geometric.I_geom_second_order
+    if model_mode == "heterogeneous":
+        stretched_line = rls.make_line_scattering_spectrum(
+            geometric.Q_grid,
+            geometric_intensity,
+            rho0=float(geometric.rho0) * highq_factor,
+        )
+        heterogeneous = rls.heterogeneous_line_scattering(
+            stretched_line,
+            k_H=float(k_h),
+            b=float(b),
+            return_components=True,
+        )
+        geometric_intensity = heterogeneous.I_h
+    elif model_mode != "line_only":
+        raise ValueError("model_mode must be 'heterogeneous' or 'line_only'.")
+    curve = np.interp(
+        np.log(q),
+        np.log(geometric.Q_grid),
+        geometric_intensity,
     )
     return curve, highq_factor, geometric
 
@@ -1551,6 +1722,8 @@ def evaluate_heterogeneous_line_guess(
             model_mode=model_mode,
             model_settings=model_settings,
             rls=rls,
+            k_h=k_h,
+            b=b,
         )
     else:
         raw = np.interp(np.log(q_model_eval), np.log(model_q), model_i)
@@ -1694,6 +1867,7 @@ def fit_heterogeneous_line_least_squares(
     log_error_floor: float = 0.03,
     regression_loss: str | None = None,
     distribution_parameter_set: Mapping[str, Mapping[str, object]] | None = None,
+    constraints: LineFitConstraints | None = None,
     fixed_parameters: Mapping[str, float] | None = None,
     parameter_penalties: Mapping[str, tuple[float, float]] | None = None,
     soft_lower_bounds: Mapping[str, tuple[float, float]] | None = None,
@@ -1720,6 +1894,9 @@ def fit_heterogeneous_line_least_squares(
     first derivative vanish at ``cutoff``. Below ``lower`` its tangent is
     continued linearly, keeping the residual and derivative continuous while
     strongly driving the parameter upward.
+    ``constraints`` groups all of these optional regularizers and additionally
+    supports a derived geometrical line-density anchor.  Do not mix the grouped
+    object with the individual legacy constraint arguments.
     The overall scale is solved at each trial by weighted amplitude matching.
     When ``resolution_sigma`` is supplied, every trial curve is evaluated and
     convolved on the full available observation Q grid. Only the output points
@@ -1733,6 +1910,29 @@ def fit_heterogeneous_line_least_squares(
         raise ValueError("model_mode must be 'heterogeneous' or 'line_only'.")
     bounds = dict(bounds or {})
     model_settings = dict(model_settings or {})
+    if constraints is not None:
+        if not isinstance(constraints, LineFitConstraints):
+            raise TypeError("constraints must be a LineFitConstraints instance.")
+        legacy_constraints = (
+            fixed_parameters,
+            parameter_penalties,
+            soft_lower_bounds,
+            inverse_square_lower_barriers,
+        )
+        if any(value is not None for value in legacy_constraints):
+            raise ValueError(
+                "Pass either constraints=LineFitConstraints(...) or the individual "
+                "constraint arguments, not both."
+            )
+        fixed_parameters = constraints.fixed_parameters
+        parameter_penalties = constraints.parameter_penalties
+        soft_lower_bounds = constraints.soft_lower_bounds
+        inverse_square_lower_barriers = constraints.inverse_square_lower_barriers
+        line_density_anchor = constraints.line_density_anchor
+        line_density_anchor_mode = constraints.line_density_anchor_mode
+    else:
+        line_density_anchor = None
+        line_density_anchor_mode = "two_sided"
     q_min, q_max = map(float, q_bounds)
     mask = (
         np.isfinite(observation.q)
@@ -1848,6 +2048,38 @@ def fit_heterogeneous_line_least_squares(
                 f"Inverse-square lower barrier for {name!r} needs positive strength "
                 "and epsilon_fraction."
             )
+    penalties = {name: value for name, value in penalties.items() if name not in fixed}
+    lower_penalties = {
+        name: value for name, value in lower_penalties.items() if name not in fixed
+    }
+    inverse_square_barriers = {
+        name: value for name, value in inverse_square_barriers.items() if name not in fixed
+    }
+    density_anchor: tuple[float, float] | None = None
+    density_anchor_mode = str(line_density_anchor_mode).lower()
+    valid_density_anchor_modes = {"two_sided", "below_reference_only"}
+    if density_anchor_mode not in valid_density_anchor_modes:
+        raise ValueError(
+            "line_density_anchor_mode must be 'two_sided' or "
+            "'below_reference_only'."
+        )
+    if line_density_anchor is not None:
+        if len(line_density_anchor) != 2:
+            raise ValueError(
+                "line_density_anchor requires (reference_density, relative_sigma)."
+            )
+        reference_density, relative_sigma = map(float, line_density_anchor)
+        if (
+            not np.isfinite(reference_density)
+            or reference_density <= 0.0
+            or not np.isfinite(relative_sigma)
+            or relative_sigma <= 0.0
+        ):
+            raise ValueError(
+                "line_density_anchor needs a positive finite reference density "
+                "and relative sigma."
+            )
+        density_anchor = (reference_density, relative_sigma)
     free_names = tuple(name for name in names if name not in fixed)
     default_bounds = {
         "mean_k": (0.03, 0.3),
@@ -1995,6 +2227,8 @@ def fit_heterogeneous_line_least_squares(
                 model_mode=model_mode,
                 model_settings=model_settings,
                 rls=rls,
+                k_h=k_h,
+                b=b,
             )
         else:
             model_grid = np.interp(np.log(q_model_eval), np.log(model_q), model_i)
@@ -2045,6 +2279,19 @@ def fit_heterogeneous_line_least_squares(
             )
         if anchor_residuals:
             residual = np.concatenate([residual, np.asarray(anchor_residuals, dtype=float)])
+        if density_anchor is not None:
+            reference_density, relative_sigma = density_anchor
+            p_h = float(model_result.p_H) if model_mode == "heterogeneous" else 1.0
+            line_density = (
+                p_h * float(model_result.rho0) * float(affine_highq_factor)
+            )
+            density_log_ratio = np.log(line_density / reference_density)
+            if density_anchor_mode == "below_reference_only":
+                density_log_ratio = min(0.0, density_log_ratio)
+            density_residual = density_log_ratio / relative_sigma
+            residual = np.concatenate(
+                [residual, np.asarray([density_residual], dtype=float)]
+            )
         if penalties:
             values = values_from_free(params)
             penalty_residuals = np.asarray(
@@ -2095,7 +2342,8 @@ def fit_heterogeneous_line_least_squares(
                 + n_anchors
                 + len(penalties)
                 + len(lower_penalties)
-                + len(inverse_square_barriers),
+                + len(inverse_square_barriers)
+                + int(density_anchor is not None),
                 1.0e6,
                 dtype=float,
             )
@@ -2151,6 +2399,7 @@ def fit_heterogeneous_line_least_squares(
         alpha_h = 0.0
         kappa_h = 0.0
     rho0 = float(model_result.rho0)
+    line_density_geometric = p_h * rho0 * float(affine_highq_factor)
     chi_square_error = np.maximum(
         e_obs,
         float(log_error_floor) * np.maximum(np.abs(i_obs), np.finfo(float).tiny),
@@ -2177,8 +2426,10 @@ def fit_heterogeneous_line_least_squares(
         "alpha_H": alpha_h,
         "kappa_H": kappa_h,
         "rho0": rho0,
+        "affine_highq_factor": float(affine_highq_factor),
+        "line_density_geometric": line_density_geometric,
         "stretch_ratio": stretch_ratio,
-        "highq_coefficient": scale * np.pi * p_h * rho0 * affine_highq_factor,
+        "highq_coefficient": scale * np.pi * line_density_geometric,
         "data_chi_square": data_chi_square,
         "data_reduced_chi_square": data_reduced_chi_square,
         "data_degrees_of_freedom": float(data_degrees_of_freedom),
