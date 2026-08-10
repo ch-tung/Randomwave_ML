@@ -2993,7 +2993,7 @@ class LineScatteringSpectrum:
 
 @dataclass(frozen=True)
 class IncompressibleUniaxialScatteringResult:
-    """Exact scalar powder baseline plus the second-order geometric correction."""
+    """Exact scalar powder baseline plus the requested geometric correction."""
 
     Q_grid: np.ndarray
     I_L: np.ndarray
@@ -3017,6 +3017,19 @@ class IncompressibleUniaxialScatteringResult:
     k_eff: float
     rho0: float
     line_result: LineScatteringSpectrum
+    approximation_order: int = 2
+    I_geom_approx: np.ndarray | None = None
+    I_geom_third_order: np.ndarray | None = None
+    delta_I_geom_third_order: np.ndarray | None = None
+    I_K30: np.ndarray | None = None
+    I_K31: np.ndarray | None = None
+    I_K32: np.ndarray | None = None
+    K30: np.ndarray | None = None
+    K31: np.ndarray | None = None
+    K32: np.ndarray | None = None
+    K30_baseline: float | None = None
+    K31_baseline: float | None = None
+    K32_baseline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3332,10 +3345,16 @@ def compute_incompressible_uniaxial_scattering(
     tail_start_fraction: float | None = None,
     tangent_tail_start_factor: float | None = None,
     tangent_tail_end_factor: float | None = None,
+    approximation_order: int = 2,
+    N_samp_cubic: int | None = None,
+    cubic_use_qmc: bool | None = None,
+    cubic_random_seed: int | None = None,
+    cubic_tail_start_factor: float | None = None,
+    cubic_tail_end_factor: float | None = None,
     progress: bool = True,
     **uniform_kwargs: object,
 ) -> IncompressibleUniaxialScatteringResult:
-    """Compute scalar and physical-line powder spectra for a weak uniaxial stretch.
+    """Compute scalar and physical-line powder spectra through order two or three.
 
     The physical-line result uses the exact scalar powder remapping as a smooth
     baseline and adds the second-order geometric-minus-scalar correction with
@@ -3357,6 +3376,13 @@ def compute_incompressible_uniaxial_scattering(
     stretch_ratio = float(stretch_ratio)
     if not np.isfinite(stretch_ratio) or stretch_ratio <= 0.0:
         raise ValueError("stretch_ratio must be a finite positive number.")
+    approximation_order = int(approximation_order)
+    if approximation_order not in (2, 3):
+        raise ValueError("approximation_order must be 2 or 3.")
+    if N_samp_cubic is None:
+        N_samp_cubic = int(N_samp_tangent)
+    if cubic_use_qmc is None:
+        cubic_use_qmc = bool(tangent_use_qmc)
     if line_result is None:
         line_result = compute_uniform_line_scattering(
             progress=progress,
@@ -3456,6 +3482,43 @@ def compute_incompressible_uniaxial_scattering(
         if line_result.mu2 is not None
         else float(np.sqrt(np.average(k_radii**2, weights=k_weights)))
     )
+
+    cubic: dict[str, np.ndarray | float] | None = None
+    cubic_seed = seed if cubic_random_seed is None else int(cubic_random_seed)
+    if approximation_order == 3:
+        cubic_keys = ("K30", "K31", "K32")
+        can_reuse_cubic = (
+            all(_get_line_result_value(line_result, (name,)) is not None for name in cubic_keys)
+            and all(_get_line_result_value(line_result, (f"{name}_inf_sampled",)) is not None for name in cubic_keys)
+            and _get_line_result_value(line_result, ("cubic_n_samp",)) == int(N_samp_cubic)
+            and _get_line_result_value(line_result, ("cubic_use_qmc",)) == bool(cubic_use_qmc)
+            and _get_line_result_value(line_result, ("cubic_random_seed",)) == cubic_seed
+        )
+        if can_reuse_cubic:
+            cubic = {
+                name: np.asarray(_get_line_result_value(line_result, (name,)), dtype=float)
+                for name in cubic_keys
+            }
+            cubic.update({
+                f"{name}_inf_sampled": float(_get_line_result_value(line_result, (f"{name}_inf_sampled",)))
+                for name in cubic_keys
+            })
+        else:
+            cubic = compute_geometric_powder_pair_correlations(
+                r_grid,
+                k_radii,
+                int(N_samp_cubic),
+                k_weights=k_weights,
+                use_qmc=bool(cubic_use_qmc),
+                random_seed=cubic_seed,
+                progress=progress,
+            )
+            for name in cubic_keys:
+                object.__setattr__(line_result, name, np.asarray(cubic[name], dtype=float))
+                object.__setattr__(line_result, f"{name}_inf_sampled", float(cubic[f"{name}_inf_sampled"]))
+            object.__setattr__(line_result, "cubic_n_samp", int(N_samp_cubic))
+            object.__setattr__(line_result, "cubic_use_qmc", bool(cubic_use_qmc))
+            object.__setattr__(line_result, "cubic_random_seed", cubic_seed)
     tangent_r_start = tail_start_fraction * float(r_grid[-1])
     tangent_r_end = float(r_grid[-1])
     if tangent_tail_start_factor is not None:
@@ -3492,6 +3555,31 @@ def compute_incompressible_uniaxial_scattering(
         c_l * k_trho_centered * window,
         q_full,
     )
+
+    k30 = k31 = k32 = None
+    k30_baseline = k31_baseline = k32_baseline = None
+    i_k30_full = i_k31_full = i_k32_full = None
+    if cubic is not None:
+        mean_k = float(np.average(k_radii, weights=k_weights))
+        std_k = float(np.sqrt(np.average((k_radii - mean_k) ** 2, weights=k_weights)))
+        relative_width = std_k / mean_k if mean_k > 0.0 else 0.0
+        adaptive_start = float(np.clip(3.0 / max(relative_width, 1.0e-12), 5.0, 20.0))
+        cubic_start = adaptive_start if cubic_tail_start_factor is None else float(cubic_tail_start_factor)
+        cubic_end = 2.0 * cubic_start if cubic_tail_end_factor is None else float(cubic_tail_end_factor)
+        cubic_r_start = min(float(r_grid[-1]) * tail_start_fraction, cubic_start / k_eff)
+        cubic_r_end = min(float(r_grid[-1]), cubic_end / k_eff)
+        if not 0.0 <= cubic_r_start < cubic_r_end:
+            raise ValueError("The cubic-transform taper must satisfy 0 <= start < end.")
+        cubic_window = tail_window(r_grid, cubic_r_start, cubic_r_end)
+        k30 = np.asarray(cubic["K30"], dtype=float)
+        k31 = np.asarray(cubic["K31"], dtype=float)
+        k32 = np.asarray(cubic["K32"], dtype=float)
+        k30_baseline = float(cubic["K30_inf_sampled"])
+        k31_baseline = float(cubic["K31_inf_sampled"])
+        k32_baseline = float(cubic["K32_inf_sampled"])
+        i_k30_full = stable_hankel_log_transform(r_grid, c_l * (k30 - k30_baseline) * cubic_window, q_full, 0, k_eff=k_eff) + (4.0 / 21.0) * i_full
+        i_k31_full = stable_hankel_log_transform(r_grid, c_l * (k31 - k31_baseline) * cubic_window, q_full, 1, k_eff=k_eff)
+        i_k32_full = stable_hankel_log_transform(r_grid, c_l * (k32 - k32_baseline) * cubic_window, q_full, 2, k_eff=k_eff)
     lowq_fit_bounds = tuple(
         float(value) * k_eff
         for value in DEFAULT_HETERO_LOWQ_FIT_BOUNDS_OVER_K_EFF
@@ -3595,6 +3683,17 @@ def compute_incompressible_uniaxial_scattering(
         + 4.0 * d_i_trho / 15.0
         + 2.0 * i_tt / 15.0
     )
+    i_k30 = None if i_k30_full is None else i_k30_full[safe]
+    i_k31 = None if i_k31_full is None else i_k31_full[safe]
+    i_k32 = None if i_k32_full is None else i_k32_full[safe]
+    delta_i_geom_third_order = None
+    i_geom_third_order = None
+    if approximation_order == 3:
+        if i_k30 is None or i_k31 is None or i_k32 is None:
+            raise RuntimeError("missing cubic geometric transforms")
+        delta_i_geom_third_order = h**3 * (i_k30 + i_k31 + i_k32)
+        i_geom_third_order = i_geom_second_order + delta_i_geom_third_order
+    i_geom_approx = i_geom_second_order if approximation_order == 2 else i_geom_third_order
 
     return IncompressibleUniaxialScatteringResult(
         Q_grid=q_grid,
@@ -3619,6 +3718,19 @@ def compute_incompressible_uniaxial_scattering(
         k_eff=k_eff,
         rho0=float(line_result.rho0),
         line_result=line_result,
+        approximation_order=approximation_order,
+        I_geom_approx=i_geom_approx,
+        I_geom_third_order=i_geom_third_order,
+        delta_I_geom_third_order=delta_i_geom_third_order,
+        I_K30=i_k30,
+        I_K31=i_k31,
+        I_K32=i_k32,
+        K30=None if k30 is None else k30 - float(k30_baseline),
+        K31=None if k31 is None else k31 - float(k31_baseline),
+        K32=None if k32 is None else k32 - float(k32_baseline),
+        K30_baseline=k30_baseline,
+        K31_baseline=k31_baseline,
+        K32_baseline=k32_baseline,
     )
 
 
@@ -3865,6 +3977,67 @@ def hankel_log_derivative(
         kernel = np.cos(phase) - np.sinc(phase / np.pi)
         out[idx] = 4.0 * np.pi * float(simpson(weighted * kernel, x=r_grid))
     return out
+
+
+def hankel_log_derivative_second(
+    r_grid: np.ndarray,
+    c_r: np.ndarray,
+    q_grid: np.ndarray,
+) -> np.ndarray:
+    """Compute ``D_Q^2 H[c]`` directly under the radial integral."""
+
+    r_grid = np.asarray(r_grid, dtype=float)
+    c_r = np.asarray(c_r, dtype=float)
+    q_grid = np.asarray(q_grid, dtype=float)
+    if r_grid.shape != c_r.shape:
+        raise ValueError("r_grid and c_r must have the same shape.")
+    weighted = r_grid**2 * c_r
+    out = np.empty_like(q_grid, dtype=float)
+    for idx, q_value in enumerate(q_grid):
+        phase = q_value * r_grid
+        j0 = np.sinc(phase / np.pi)
+        kernel = -phase * np.sin(phase) - np.cos(phase) + j0
+        small = np.abs(phase) < 1.0e-3
+        x = phase[small]
+        kernel[small] = -2.0 * x**2 / 3.0 + 2.0 * x**4 / 15.0 - x**6 / 140.0
+        out[idx] = 4.0 * np.pi * float(simpson(weighted * kernel, x=r_grid))
+    return out
+
+
+def stable_hankel_log_transform(
+    r_grid: np.ndarray,
+    c_r: np.ndarray,
+    q_grid: np.ndarray,
+    order: int,
+    *,
+    k_eff: float,
+    blend_start_over_k: float = 0.5,
+    blend_end_over_k: float = 0.8,
+) -> np.ndarray:
+    """Direct H0/H1/H2 transform with its moment series at low Q."""
+
+    if order == 0:
+        direct = hankel_transform(r_grid, c_r, q_grid)
+        coefficients = ((0, 1.0), (2, -1 / 6), (4, 1 / 120), (6, -1 / 5040))
+    elif order == 1:
+        direct = hankel_log_derivative(r_grid, c_r, q_grid)
+        coefficients = ((2, -1 / 3), (4, 1 / 30), (6, -1 / 840))
+    elif order == 2:
+        direct = hankel_log_derivative_second(r_grid, c_r, q_grid)
+        coefficients = ((2, -2 / 3), (4, 2 / 15), (6, -1 / 140))
+    else:
+        raise ValueError("order must be 0, 1, or 2")
+    r_grid = np.asarray(r_grid, dtype=float)
+    c_r = np.asarray(c_r, dtype=float)
+    q_grid = np.asarray(q_grid, dtype=float)
+    series = np.zeros_like(q_grid)
+    for power, coefficient in coefficients:
+        moment = 4.0 * np.pi * float(simpson(r_grid ** (2 + power) * c_r, x=r_grid))
+        series += coefficient * moment * q_grid**power
+    x = q_grid / float(k_eff)
+    blend = np.clip((x - blend_start_over_k) / (blend_end_over_k - blend_start_over_k), 0.0, 1.0)
+    blend = blend**2 * (3.0 - 2.0 * blend)
+    return (1.0 - blend) * series + blend * direct
 
 
 def heterogeneous_line_scattering(
@@ -4226,6 +4399,104 @@ def estimate_tangent_pair_correlations_for_r_general(
     u = z_u @ factor.T
     v = z_v @ factor.T
     return _tangent_pair_moments_from_gradient_samples(u, v)
+
+
+_GEOMETRIC_POWDER_POLYNOMIALS = {
+    "K20": [((0, 0, 0), 1 / 2), ((0, 1, 0), 3 / 4), ((0, 2, 0), -9 / 8), ((1, 0, 0), 3 / 4), ((1, 1, 0), 9 / 4), ((2, 0, 0), -9 / 8)],
+    "K21": [((0, 0, 0), 1 / 2), ((0, 0, 1), -3 / 2), ((0, 1, 0), -3 / 4), ((0, 1, 1), 9 / 4), ((1, 0, 0), -3 / 4), ((1, 0, 1), 9 / 4)],
+    "K30": [((0, 0, 0), -1 / 6), ((0, 1, 0), 3 / 4), ((0, 2, 0), -9 / 4), ((0, 3, 0), 27 / 16), ((1, 0, 0), 3 / 4), ((1, 1, 0), 9 / 2), ((1, 2, 0), -27 / 16), ((2, 0, 0), -9 / 4), ((2, 1, 0), -27 / 16), ((3, 0, 0), 27 / 16)],
+    "K31": [((0, 0, 0), -1 / 4), ((0, 0, 1), -3 / 2), ((0, 0, 2), 9 / 4), ((0, 1, 0), -3 / 8), ((0, 1, 1), 9 / 2), ((0, 1, 2), -27 / 8), ((0, 2, 0), 9 / 16), ((0, 2, 1), -27 / 16), ((1, 0, 0), -3 / 8), ((1, 0, 1), 9 / 2), ((1, 0, 2), -27 / 8), ((1, 1, 0), -9 / 8), ((1, 1, 1), 27 / 8), ((2, 0, 0), 9 / 16), ((2, 0, 1), -27 / 16)],
+    "K32": [((0, 0, 0), -1 / 8), ((0, 0, 1), 3 / 4), ((0, 0, 2), -9 / 8), ((0, 1, 0), 3 / 16), ((0, 1, 1), -9 / 8), ((0, 1, 2), 27 / 16), ((1, 0, 0), 3 / 16), ((1, 0, 1), -9 / 8), ((1, 0, 2), 27 / 16)],
+}
+
+
+def _pair_tangents_from_gradient_samples(
+    u: np.ndarray, v: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    omega_0 = np.cross(u[:, :3], v[:, :3])
+    omega_r = np.cross(u[:, 3:], v[:, 3:])
+    norm_0 = np.linalg.norm(omega_0, axis=1)
+    norm_r = np.linalg.norm(omega_r, axis=1)
+    t_0 = np.divide(omega_0, norm_0[:, None], out=np.zeros_like(omega_0), where=norm_0[:, None] > 0)
+    t_r = np.divide(omega_r, norm_r[:, None], out=np.zeros_like(omega_r), where=norm_r[:, None] > 0)
+    return t_0, t_r, norm_0 * norm_r
+
+
+def _isotropic_axis_monomial_average(
+    exponents: tuple[int, int, int],
+    t0_tr: np.ndarray,
+    t0_n: np.ndarray,
+    tr_n: np.ndarray,
+) -> np.ndarray:
+    labels = [0] * exponents[0] + [1] * exponents[1] + [2] * exponents[2]
+    if not labels:
+        return np.ones_like(t0_tr)
+    if len(labels) == 1:
+        return np.full_like(t0_tr, 1.0 / 3.0)
+
+    def dot(i: int, j: int) -> np.ndarray:
+        if i == j:
+            return np.ones_like(t0_tr)
+        return {(0, 1): t0_tr, (0, 2): t0_n, (1, 2): tr_n}[tuple(sorted((i, j)))]
+
+    if len(labels) == 2:
+        d01 = dot(labels[0], labels[1])
+        return (1.0 + 2.0 * d01**2) / 15.0
+    if len(labels) == 3:
+        d01, d02, d12 = dot(labels[0], labels[1]), dot(labels[0], labels[2]), dot(labels[1], labels[2])
+        return (1.0 + 2.0 * (d01**2 + d02**2 + d12**2) + 8.0 * d01 * d02 * d12) / 105.0
+    raise ValueError("the cubic expansion requires axis moments only through degree six")
+
+
+def _geometric_powder_pair_coefficients(t_0: np.ndarray, t_r: np.ndarray) -> np.ndarray:
+    t0_tr = np.einsum("ij,ij->i", t_0, t_r)
+    t0_n, tr_n = t_0[:, 2], t_r[:, 2]
+    columns = []
+    for name in ("K20", "K21", "K30", "K31", "K32"):
+        value = np.zeros_like(t0_tr)
+        for exponents, coefficient in _GEOMETRIC_POWDER_POLYNOMIALS[name]:
+            value += coefficient * _isotropic_axis_monomial_average(exponents, t0_tr, t0_n, tr_n)
+        columns.append(value)
+    return np.column_stack(columns)
+
+
+def compute_geometric_powder_pair_correlations(
+    r_grid: np.ndarray,
+    k_radii: np.ndarray,
+    n_samp: int = DEFAULT_N_SAMP,
+    *,
+    k_weights: np.ndarray | None = None,
+    use_qmc: bool = True,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    progress: bool = True,
+) -> dict[str, np.ndarray | float]:
+    """Estimate the conditional K20/K21/K30/K31/K32 coefficients.
+
+    The powder-axis average is analytic.  Only the conditioned tangent pair is
+    sampled, using common 12D points for all radii and all five coefficients.
+    """
+
+    r_grid = np.asarray(r_grid, dtype=float)
+    if r_grid.ndim != 1 or np.any(r_grid <= 0.0):
+        raise ValueError("r_grid must be a one-dimensional array of positive separations.")
+    z_u, z_v = standard_normal_samples(int(n_samp), use_qmc=use_qmc, random_seed=int(random_seed))
+    t0_inf, tr_inf, weight_inf = _pair_tangents_from_gradient_samples(z_u, z_v)
+    sampled_inf = np.average(_geometric_powder_pair_coefficients(t0_inf, tr_inf), axis=0, weights=weight_inf)
+    values = np.empty((r_grid.size, 5), dtype=float)
+    a = gradient_variance_from_k_radii(k_radii, k_weights=k_weights)
+    report_every = max(1, r_grid.size // 20)
+    t_start = time.perf_counter()
+    for idx, radius in enumerate(r_grid):
+        sigma = conditional_covariance_from_radial_spectrum(float(radius), k_radii, k_weights=k_weights)
+        factor = covariance_factor(sigma, 1.0e-12 * a)
+        t_0, t_r, weight = _pair_tangents_from_gradient_samples(z_u @ factor.T, z_v @ factor.T)
+        values[idx] = np.average(_geometric_powder_pair_coefficients(t_0, t_r), axis=0, weights=weight)
+        if progress and ((idx + 1) % report_every == 0 or idx + 1 == r_grid.size):
+            print(f"K20/K21/K30/K31/K32 direct_12d: {idx + 1}/{r_grid.size} r values ({time.perf_counter() - t_start:.1f}s)")
+    names = ("K20", "K21", "K30", "K31", "K32")
+    result: dict[str, np.ndarray | float] = {name: values[:, idx] for idx, name in enumerate(names)}
+    result.update({f"{name}_inf_sampled": float(sampled_inf[idx]) for idx, name in enumerate(names)})
+    return result
 
 
 def compute_tangent_pair_correlations(

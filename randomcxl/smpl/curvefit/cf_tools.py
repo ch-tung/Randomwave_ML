@@ -147,6 +147,9 @@ class LineFitConstraints:
     inverse_square_lower_barriers: Mapping[
         str, tuple[float, float, float, float]
     ] | None = None
+    inverse_square_upper_barriers: Mapping[
+        str, tuple[float, float, float, float]
+    ] | None = None
     line_density_anchor: tuple[float, float] | None = None
     line_density_anchor_mode: str = "two_sided"
 
@@ -1474,10 +1477,18 @@ def _affine_powder_curve(
             uniaxial_affine_highq_factor(stretch_ratio),
             None,
         )
-    if affine_model != "geometric_second_order":
+    if affine_model not in {"geometric", "geometric_second_order", "geometric_third_order"}:
         raise ValueError(
-            "affine_model must be 'scalar' or 'geometric_second_order'."
+            "affine_model must be 'scalar', 'geometric', "
+            "'geometric_second_order', or 'geometric_third_order'."
         )
+    approximation_order = int(model_settings.get("approximation_order", 2))
+    if affine_model == "geometric_second_order":
+        approximation_order = 2
+    elif affine_model == "geometric_third_order":
+        approximation_order = 3
+    if approximation_order not in (2, 3):
+        raise ValueError("approximation_order must be 2 or 3.")
     geometric = rls.compute_incompressible_uniaxial_scattering(
         stretch_ratio=stretch_ratio,
         line_result=line,
@@ -1508,6 +1519,12 @@ def _affine_powder_curve(
             if model_settings.get("tangent_tail_end_factor") is None
             else float(model_settings["tangent_tail_end_factor"])
         ),
+        approximation_order=approximation_order,
+        N_samp_cubic=int(model_settings.get("N_samp_cubic", model_settings.get("N_samp_tangent", model_settings.get("N_samp_U", 2**12)))),
+        cubic_use_qmc=bool(model_settings.get("cubic_use_qmc", model_settings.get("tangent_use_qmc", True))),
+        cubic_random_seed=int(model_settings.get("cubic_random_seed", model_settings.get("tangent_random_seed", 12345))),
+        cubic_tail_start_factor=(None if model_settings.get("cubic_tail_start_factor") is None else float(model_settings["cubic_tail_start_factor"])),
+        cubic_tail_end_factor=(None if model_settings.get("cubic_tail_end_factor") is None else float(model_settings["cubic_tail_end_factor"])),
         progress=bool(model_settings.get("progress", False)),
     )
     if np.min(q) < geometric.Q_grid[0] or np.max(q) > geometric.Q_grid[-1]:
@@ -1518,20 +1535,21 @@ def _affine_powder_curve(
     if np.count_nonzero(tail) < 6:
         tail = np.zeros_like(geometric.Q_grid, dtype=bool)
         tail[-min(12, tail.size):] = True
-    positive = tail & np.isfinite(geometric.I_geom_second_order)
-    positive &= geometric.I_geom_second_order > 0.0
+    geometric_curve = np.asarray(geometric.I_geom_approx, dtype=float)
+    positive = tail & np.isfinite(geometric_curve)
+    positive &= geometric_curve > 0.0
     if np.count_nonzero(positive) < 3:
         raise ValueError("Could not determine the geometric high-Q coefficient.")
     highq_coefficient = float(
         np.median(
             geometric.Q_grid[positive]
-            * geometric.I_geom_second_order[positive]
+            * geometric_curve[positive]
         )
     )
     highq_factor = highq_coefficient / (
         np.pi * float(geometric.rho0)
     )
-    geometric_intensity = geometric.I_geom_second_order
+    geometric_intensity = geometric_curve
     if model_mode == "heterogeneous":
         stretched_line = rls.make_line_scattering_spectrum(
             geometric.Q_grid,
@@ -1565,7 +1583,7 @@ def _can_share_affine_tangent_samples(
     return bool(
         affine_stretch
         and str(model_settings.get("affine_model", "scalar")).lower()
-        == "geometric_second_order"
+        in {"geometric", "geometric_second_order", "geometric_third_order"}
         and str(model_settings.get("jacobian_method", "direct_12d")).lower()
         == "direct_12d"
         and int(model_settings.get("N_samp_tangent", n_density)) == n_density
@@ -1850,6 +1868,25 @@ def _smooth_inverse_square_lower_residual(
     return amplitude * max(0.0, float(barrier))
 
 
+def _smooth_inverse_square_upper_residual(
+    value: float,
+    *,
+    cutoff: float,
+    upper_limit: float,
+    strength: float,
+    epsilon_fraction: float,
+) -> float:
+    """Compact C1 inverse-square barrier used for a soft upper limit."""
+
+    return _smooth_inverse_square_lower_residual(
+        -float(value),
+        lower_limit=-float(upper_limit),
+        cutoff=-float(cutoff),
+        strength=float(strength),
+        epsilon_fraction=float(epsilon_fraction),
+    )
+
+
 def fit_heterogeneous_line_least_squares(
     observation: RadialProfile,
     *,
@@ -1872,6 +1909,9 @@ def fit_heterogeneous_line_least_squares(
     parameter_penalties: Mapping[str, tuple[float, float]] | None = None,
     soft_lower_bounds: Mapping[str, tuple[float, float]] | None = None,
     inverse_square_lower_barriers: Mapping[
+        str, tuple[float, float, float, float]
+    ] | None = None,
+    inverse_square_upper_barriers: Mapping[
         str, tuple[float, float, float, float]
     ] | None = None,
     verbose: int = 0,
@@ -1918,6 +1958,7 @@ def fit_heterogeneous_line_least_squares(
             parameter_penalties,
             soft_lower_bounds,
             inverse_square_lower_barriers,
+            inverse_square_upper_barriers,
         )
         if any(value is not None for value in legacy_constraints):
             raise ValueError(
@@ -1928,6 +1969,7 @@ def fit_heterogeneous_line_least_squares(
         parameter_penalties = constraints.parameter_penalties
         soft_lower_bounds = constraints.soft_lower_bounds
         inverse_square_lower_barriers = constraints.inverse_square_lower_barriers
+        inverse_square_upper_barriers = constraints.inverse_square_upper_barriers
         line_density_anchor = constraints.line_density_anchor
         line_density_anchor_mode = constraints.line_density_anchor_mode
     else:
@@ -2048,12 +2090,43 @@ def fit_heterogeneous_line_least_squares(
                 f"Inverse-square lower barrier for {name!r} needs positive strength "
                 "and epsilon_fraction."
             )
+    inverse_square_upper = {
+        str(name): tuple(map(float, specification))
+        for name, specification in dict(inverse_square_upper_barriers or {}).items()
+    }
+    unknown_inverse_square_upper = tuple(
+        name for name in inverse_square_upper if name not in names
+    )
+    if unknown_inverse_square_upper:
+        raise ValueError(
+            "Unknown inverse-square upper-barrier parameter(s): "
+            f"{unknown_inverse_square_upper}."
+        )
+    for name, specification in inverse_square_upper.items():
+        if len(specification) != 4:
+            raise ValueError(
+                f"Inverse-square upper barrier for {name!r} requires "
+                "(cutoff, upper, strength, epsilon_fraction)."
+            )
+        cutoff, upper_limit, strength, epsilon_fraction = specification
+        if not all(np.isfinite(specification)):
+            raise ValueError(f"Inverse-square upper barrier for {name!r} must be finite.")
+        if not cutoff < upper_limit:
+            raise ValueError(f"Inverse-square upper barrier for {name!r} needs cutoff < upper.")
+        if strength <= 0.0 or epsilon_fraction <= 0.0:
+            raise ValueError(
+                f"Inverse-square upper barrier for {name!r} needs positive strength "
+                "and epsilon_fraction."
+            )
     penalties = {name: value for name, value in penalties.items() if name not in fixed}
     lower_penalties = {
         name: value for name, value in lower_penalties.items() if name not in fixed
     }
     inverse_square_barriers = {
         name: value for name, value in inverse_square_barriers.items() if name not in fixed
+    }
+    inverse_square_upper = {
+        name: value for name, value in inverse_square_upper.items() if name not in fixed
     }
     density_anchor: tuple[float, float] | None = None
     density_anchor_mode = str(line_density_anchor_mode).lower()
@@ -2208,6 +2281,10 @@ def fit_heterogeneous_line_least_squares(
             model_q = model_result.Q_grid
             model_i = model_result.I_h
         else:
+            # The mask scale does not exist in line-only mode.  Keep an
+            # explicit neutral value because the shared affine assembler takes
+            # the argument even though it uses it only for heterogeneous data.
+            k_h = 0.0
             model_result = line
             model_q = line.Q_grid
             model_i = line.I_L
@@ -2330,6 +2407,27 @@ def fit_heterogeneous_line_least_squares(
                 dtype=float,
             )
             residual = np.concatenate([residual, barrier_residuals])
+        if inverse_square_upper:
+            values = values_from_free(params)
+            upper_barrier_residuals = np.asarray(
+                [
+                    _smooth_inverse_square_upper_residual(
+                        values[name],
+                        cutoff=cutoff,
+                        upper_limit=upper_limit,
+                        strength=strength,
+                        epsilon_fraction=epsilon_fraction,
+                    )
+                    for name, (
+                        cutoff,
+                        upper_limit,
+                        strength,
+                        epsilon_fraction,
+                    ) in inverse_square_upper.items()
+                ],
+                dtype=float,
+            )
+            residual = np.concatenate([residual, upper_barrier_residuals])
         return scale, scale * raw, residual
 
     def residual_fn(params: np.ndarray) -> np.ndarray:
@@ -2343,6 +2441,7 @@ def fit_heterogeneous_line_least_squares(
                 + len(penalties)
                 + len(lower_penalties)
                 + len(inverse_square_barriers)
+                + len(inverse_square_upper)
                 + int(density_anchor is not None),
                 1.0e6,
                 dtype=float,

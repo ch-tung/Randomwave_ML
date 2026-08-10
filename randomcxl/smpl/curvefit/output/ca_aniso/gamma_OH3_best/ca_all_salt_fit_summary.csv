@@ -1,0 +1,2 @@
+concentration_mM,cost,figure,fine_tune_source,k_eff,message,nfev,r_sigma_k,r_sigma_k_bound_high,r_sigma_k_bound_low,r_sigma_k_seed,r_sigma_k_svd1,series,stretch_ratio,success
+100.0,61.37187087071661,output\ca_aniso\ca_100mM_line_only_gamma_radial_unguided_gamma_radial_full_geom_OH3_fit.png,output\ca_aniso\ca_100mM_gamma_radial_unguided_gamma_radial_spectrum_OH2_fit_parameters.csv,0.043071115785484254,`xtol` termination condition is satisfied.,29,0.5090207178005869,0.8826265201160897,0.22065663002902242,0.44131326005804483,nan,100mM,1.7507696588970805,True
