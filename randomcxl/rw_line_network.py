@@ -48,10 +48,11 @@ NUM_MODES: int | tuple[int, int, int] = (180, 180, 180)
 # K-distribution choices:
 #   "single_shell"   : |k| = K0 with isotropic directions
 #   "gaussian_radial": |k| ~ Normal(K0, r_SIGMA_K*K0) with isotropic directions
+#   "gamma_radial"   : |k| is gamma distributed with the same mean and std
 #   "uniform_band"   : |k| in [r_K_MIN*K0, r_K_MAX*K0]
 #   "user_list"      : use USER_K_VECTORS below
 K_DISTRIBUTION: Literal[
-    "single_shell", "gaussian_radial", "uniform_band", "user_list"
+    "single_shell", "gaussian_radial", "gamma_radial", "uniform_band", "user_list"
 ] = "single_shell"
 
 # Use one float for all fields or a 3-tuple for (phi_1, phi_2, phi_3).
@@ -189,7 +190,9 @@ S13_MESH_NAME = "S13_blue_domain.vtp"
 # =============================================================================
 
 
-KDistribution = Literal["single_shell", "gaussian_radial", "uniform_band", "user_list"]
+KDistribution = Literal[
+    "single_shell", "gaussian_radial", "gamma_radial", "uniform_band", "user_list"
+]
 
 
 @dataclass(frozen=True)
@@ -285,6 +288,18 @@ def sample_k_vectors(
         while np.any(radii <= 0.0):
             bad = radii <= 0.0
             radii[bad] = rng.normal(float(k0), float(sigma_k), size=np.count_nonzero(bad))
+    elif distribution == "gamma_radial":
+        if sigma_k is None:
+            sigma_k = float(k0) * 0.15
+        mean = float(k0)
+        sigma = float(sigma_k)
+        if mean <= 0.0:
+            raise ValueError("k0 must be positive for 'gamma_radial'.")
+        if sigma <= 0.0:
+            raise ValueError("sigma_k must be positive for 'gamma_radial'.")
+        shape = (mean / sigma) ** 2
+        scale = sigma * sigma / mean
+        radii = rng.gamma(shape, scale, size=count)
     elif distribution == "uniform_band":
         if k_min is None:
             k_min = 0.7 * float(k0)

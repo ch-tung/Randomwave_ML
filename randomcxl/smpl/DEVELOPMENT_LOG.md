@@ -1002,3 +1002,23 @@ printed figure's original `(q, I(q))` coordinate system.
   introduce the tangent-dependent weight `|F t|` and requires a
   tangent-resolved correlation or new Kac-Rice calculation; it cannot in
   general be reconstructed from the isotropic powder curve alone.
+
+## 2026-08-14 Local Interaction Inference
+
+- Added `curvefit/cf_ca_interaction.ipynb`, using the 0 mM condition as the
+  reference measure for local interaction extraction from the fitted
+  `gamma_OH3_best` random-wave spectra.
+- The notebook tests the dependence of the remaining contour degrees of
+  freedom on $X=(\kappa,\kappa\tau)$ and compares traced distributions with
+  local exponential reweighting.
+- Reported the fitted changes in $c_2$ and $B$. With the bare persistence
+  length held constant, these changes are also represented by the relative
+  Yukawa strength $g/g_{\rm ref}$ and range $D/D_{\rm ref}$.
+- Added the concentration trajectory in the $(\Delta c_2,\Delta B)$ plane,
+  contours of $g/g_{\rm ref}$ and $D/D_{\rm ref}$, reconstruction checks for
+  $\kappa$ and $\kappa\tau$, and the reduced potential
+  $D_{\rm ref}V(r)/g_{\rm ref}$ versus $r/D_{\rm ref}$.
+- Added `gamma_radial` sampling to `rw_line_network.py`, which is required to
+  trace contours from the fitted positive-support radial spectra.
+- Reused the discrete CA-series color palette from `cf_compare_ca.ipynb` and
+  verified the notebook by executing it from start to finish.
