@@ -1,0 +1,767 @@
+\documentclass[11pt]{article}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45\baselineskip}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+
+\title{Inferring Interaction Changes from Random-Wave Local Geometric Statistics}
+
+\begin{document}
+\maketitle
+
+\section*{1. Separation of local and nonlocal interactions}
+
+Consider a contour \(\mathbf R(s)\), \(0\leq s\leq L\), and define the chord distance between two contour positions separated by \(\Delta s\) as
+\begin{equation}
+d(s,\Delta s)
+=
+\left|
+\mathbf R(s+\Delta s)-\mathbf R(s)
+\right|.
+\end{equation}
+
+For a general pair interaction \(V(d)\), define the geometry-dependent pair-energy contribution for \(\Delta s>0\) as
+\begin{equation}
+\mathcal V\!\left[d(s,\Delta s),\Delta s\right]
+=
+\beta\left[
+V\!\left(d(s,\Delta s)\right)
+-
+V(\Delta s)
+\right].
+\end{equation}
+The subtraction removes the geometry-independent contribution and expresses the interaction energy relative to the locally straight configuration with \(d=\Delta s\), following the same physical reference used in electrostatic bending theories of polyelectrolytes.
+% ~\cite{Odijk1977,SkolnickFixman1977}.
+% \footnote{For a locally straight contour, two contour positions separated by \(\Delta s\) have spatial separation \(d=\Delta s\). Equivalently, introducing the radial force \(F(r)=-V'(r)\),
+% \[
+% V(d)-V(\Delta s)
+% =
+% -\int_{\Delta s}^{d}F(r)\,dr,
+% \]
+% so that \(\mathcal V\) is the dimensionless reversible work associated with changing the pair separation from the straight-contour value \(\Delta s\) to the geometry-dependent chord distance \(d\).}
+
+The conformation-dependent pair-interaction Hamiltonian may then be written schematically as
+\begin{equation}
+\beta\mathcal H_{\rm pair}[\mathbf R]
+=
+\mathrm{const.}
++
+\int_0^L ds
+\int_0^\infty d\Delta s\,
+\mathcal V\!\left[d(s,\Delta s),\Delta s\right],
+\end{equation}
+where end effects are omitted for notational simplicity.
+
+Let
+\begin{equation}
+\ell=\frac{1}{k_{\rm eff}}
+\end{equation}
+denote the largest contour separation over which the chord distance can be represented accurately by the local geometric expansion introduced below. The pair-interaction Hamiltonian can then be separated according to contour separation as
+\begin{align}
+\beta\mathcal H_{\rm pair,loc}
+&=
+\int_0^L ds
+\int_0^\ell d\Delta s\,
+\mathcal V\!\left[d(s,\Delta s),\Delta s\right],
+\nonumber\\
+\beta\mathcal H_{\rm nl}
+&=
+\int_0^L ds
+\int_\ell^\infty d\Delta s\,
+\mathcal V\!\left[d(s,\Delta s),\Delta s\right].
+\end{align}
+
+Any intrinsic local chain Hamiltonian \(\mathcal H_{\rm int}\) is combined with the locally expanded pair-interaction contribution,
+\begin{equation}
+\mathcal H_{\rm loc}
+=
+\mathcal H_{\rm int}
++
+\mathcal H_{\rm pair,loc},
+\end{equation}
+so that the full conformation-dependent Hamiltonian is
+\begin{equation}
+\mathcal H[\mathbf R]
+=
+\mathrm{const.}
++
+\mathcal H_{\rm loc}
++
+\mathcal H_{\rm nl}.
+\label{eq:H_decomposition}
+\end{equation}
+
+For \(\Delta s\lesssim\ell\), the chord distance is well approximated by local derivatives of the contour and may therefore be represented by a finite set of local geometric variables. We denote this retained local information collectively by \(X\), with its explicit components identified from the chord expansion below, so that the local Hamiltonian may be written as \(\mathcal H_{\rm loc}[X]\).
+
+For \(\Delta s>\ell\), the chord distance is no longer well approximated by this finite local description alone. We denote the complementary contour information required, together with \(X\), to determine these longer-range chord distances by \(X_{\rm c}\), so that the nonlocal contribution is written as \(\mathcal H_{\rm nl}[X,X_{\rm c}]\).
+
+The Hamiltonian decomposition may therefore be represented as
+\begin{equation}
+\mathcal H[\mathbf R]
+=
+\mathrm{const.}
++
+\mathcal H_{\rm loc}[X]
++
+\mathcal H_{\rm nl}[X,X_{\rm c}].
+\end{equation}
+The pair \((X,X_{\rm c})\) thus separates the configurational information into the local geometric variables retained explicitly and the complementary information required for the nonlocal interaction.
+
+\section*{2. Local geometric expansion}
+
+Expanding the two contour positions symmetrically about the midpoint \(\bar{s}\) gives
+\begin{align}
+d(\bar{s},\Delta s)
+=\Delta s\Bigg[1
+&-\frac{\kappa^2}{24}(\Delta s)^2
+\nonumber\\
+&+(\Delta s)^4\left(
+\frac{\kappa^4}{1920}
++\frac{\kappa^2\tau^2}{720}
+-\frac{\kappa\kappa''}{480}
+-\frac{(\kappa')^2}{1440}
+\right)
++O((\Delta s)^6)\Bigg],
+\label{eq:rw_midpoint_chord_expansion}
+\end{align}
+where all geometric quantities are evaluated at \(\bar{s}\). Curvature controls the leading departure of the chord length from the contour separation, while curvature variation and torsion enter at the next displayed order.
+
+At fourth geometric order, substitution into the local pair interaction generates the combinations \(\kappa^4\), \(\kappa^2\tau^2\), \(\kappa\kappa''\), and \((\kappa')^2\). The \(\kappa\kappa''\) contribution is not an independent bulk term and may be absorbed into \((\kappa')^2\) by integration by parts over \(s\), up to an endpoint contribution. For bulk statistics or sufficiently long contour segments, the retained local geometric variables may therefore be taken as
+\begin{equation}
+X=
+\left\{
+\kappa(s),\kappa'(s),\kappa(s)\tau(s)
+\right\}.
+\end{equation}
+The combination \(\kappa\tau\) is used rather than \(\tau\) itself because it remains regular as \(\kappa\rightarrow0\) and is the torsional quantity entering directly in the chord expansion.
+% \footnote{Integration by parts along the contour gives
+% \[
+% \int ds\,\kappa\kappa''
+% =
+% \left[\kappa\kappa'\right]_{\rm endpoints}
+% -
+% \int ds\,(\kappa')^2.
+% \]
+% Thus \(\kappa\kappa''\) does not constitute an independent bulk invariant when the endpoint term vanishes or is negligible. This occurs exactly for closed or periodic contours and becomes subextensive for sufficiently long contour segments.}
+
+To connect these geometric terms to a general pair potential, expand
+\begin{equation}
+\beta\left[V(d)-V(\Delta s)\right]
+=
+\beta V'(\Delta s)\,\delta d
++
+\frac{\beta}{2}V''(\Delta s)\,(\delta d)^2
++\cdots,
+\qquad
+\delta d=d-\Delta s.
+\end{equation}
+Using Eq.~\eqref{eq:rw_midpoint_chord_expansion}, the local geometric coefficients are obtained from moments of the interaction over \(0<\Delta s<\ell\). Writing
+\begin{equation}
+c_2
+=
+c_2^{(\rm int)}
+-
+\frac{1}{24}
+\int_0^\ell d\Delta s\,(\Delta s)^3\beta V'(\Delta s),
+\label{eq:c2_general}
+\end{equation}
+and
+\begin{equation}
+c_4
+=
+-\frac{1}{30}
+\int_0^\ell d\Delta s\,(\Delta s)^5\beta V'(\Delta s),
+\label{eq:c4_general}
+\end{equation}
+the local Hamiltonian may be written, up to a finite-cutoff correction, as
+\begin{equation}
+\beta\mathcal H_{\rm loc}[X]
+=
+\mathrm{const.}
++
+\int ds\Bigg[
+c_2\kappa^2
++
+c_4\left(
+\frac{9}{64}\kappa^4
+-\frac{1}{24}(\kappa')^2
+-\frac{1}{24}\kappa^2\tau^2
+\right)
++\cdots
+\Bigg].
+\label{eq:Hloc_linked}
+\end{equation}
+The finite-cutoff correction is small when the residual interaction force at \(\Delta s=\ell\) has substantially decayed; interactions extending beyond \(\ell\) are treated separately through \(\mathcal H_{\rm nl}\) and do not alter the local geometric expansion over \(0<\Delta s<\ell\).
+% \footnote{Before the final reduction, the fourth-order coefficients are
+% \begin{align}
+% c_{4,1}
+% &=
+% \frac{1}{1920}
+% \int_0^\ell d\Delta s\,(\Delta s)^5\beta V'(\Delta s)
+% +
+% \frac{1}{1152}
+% \int_0^\ell d\Delta s\,(\Delta s)^6\beta V''(\Delta s),
+% \\
+% c_{4,2}
+% &=
+% c_{4,3}
+% =
+% \frac{1}{720}
+% \int_0^\ell d\Delta s\,(\Delta s)^5\beta V'(\Delta s).
+% \end{align}
+% Integration by parts gives
+% \[
+% \int_0^\ell d\Delta s\,(\Delta s)^6\beta V''(\Delta s)
+% =
+% \ell^6\beta V'(\ell)
+% -
+% 6\int_0^\ell d\Delta s\,(\Delta s)^5\beta V'(\Delta s),
+% \]
+% assuming the lower boundary contribution vanishes. Hence
+% \[
+% c_{4,1}
+% =
+% \frac{9}{64}c_4
+% +
+% \frac{\ell^6\beta V'(\ell)}{1152},
+% \qquad
+% c_{4,2}
+% =
+% c_{4,3}
+% =
+% -\frac{1}{24}c_4.
+% \]
+% The linked form in Eq.~\eqref{eq:Hloc_linked} is therefore recovered when the residual-force term at the cutoff is negligible.}
+
+For example, consider a wormlike chain whose intrinsic local Hamiltonian is
+\begin{equation}
+\beta\mathcal H_{\rm int}
+=
+\beta\mathcal H_{\rm bend}
+=
+\frac{\ell_{p,0}}{2}
+\int ds\,\kappa^2.
+\end{equation}
+The intrinsic contribution in Eq.~\eqref{eq:c2_general} is then
+\(c_2^{(\rm int)}
+=
+\frac{\ell_{p,0}}{2}\).
+For a screened Yukawa pair interaction,
+\begin{equation}
+\beta V(r)
+=
+g\,\frac{e^{-r/D}}{r},
+\end{equation}
+where \(g\) sets the interaction strength and \(D\) is the screening length. Substitution into Eqs.~\eqref{eq:c2_general} and \eqref{eq:c4_general} gives the corresponding local geometric coefficients.
+
+For the Yukawa interaction, the finite interaction moments may be written as
+\begin{equation}
+c_2
+=
+\frac{\ell_{p,0}}{2}
++
+\frac{gD^2}{8}
+f_2\!\left(\frac{\ell}{D}\right),
+\qquad
+c_4
+=
+gD^4
+f_4\!\left(\frac{\ell}{D}\right),
+\label{eq:yukawa_finite_coefficients}
+\end{equation}
+where
+\begin{align}
+f_2(u)
+&=
+1-
+\frac{e^{-u}}{3}
+\left(u^2+3u+3\right),
+\\
+f_4(u)
+&=
+1-
+\frac{e^{-u}}{30}
+\left(u^4+5u^3+15u^2+30u+30\right).
+\end{align}
+When \(D\) is not small compared with \(\ell\), these cutoff factors retain the finite upper limit of the local interaction moments rather than extending them to infinity. In the short-range limit \(D\ll\ell\), \(f_2,f_4\rightarrow1\), recovering \(c_2=\ell_{p,0}/2+gD^2/8\) and \(c_4=gD^4\). Thus the quadratic coefficient \(c_2\) contains the intrinsic bending contribution \(\ell_{p,0}/2\) together with the interaction-induced curvature penalty, whereas \(c_4\) is determined entirely by the pair interaction at this order.
+
+% The local expansion itself remains applicable over \(0<\Delta s<\ell\) even when appreciable interaction remains at larger contour separations. Such longer-range contributions are contained in \(\mathcal H_{\rm nl}\) and treated separately below; only the small residual-force correction at the cutoff controls the accuracy of the linked fourth-order form in Eq.~\eqref{eq:Hloc_linked}.
+
+\section*{3. Effect of complementary degrees of freedom}
+
+For an ensemble described by the Hamiltonian decomposition in Eq.~\eqref{eq:H_decomposition}, the joint conformational probability is
+\begin{equation}
+P(X,X_{\rm c})
+=
+\frac{1}{Z}
+\exp\left[
+-\beta\mathcal H_{\rm loc}(X)
+-\beta\mathcal H_{\rm nl}(X,X_{\rm c})
+\right],
+\end{equation}
+where \(X\) denotes the local geometric variables and \(X_{\rm c}\) denotes the remaining configurational degrees of freedom required to specify the contour beyond this local description. The full conformational partition function is
+\begin{equation}
+Z
+=
+\int\mathcal D X\,\mathcal D X_{\rm c}\,
+\exp\left[
+-\beta\mathcal H_{\rm loc}(X)
+-\beta\mathcal H_{\rm nl}(X,X_{\rm c})
+\right].
+\end{equation}
+
+Here \(\mathcal H_{\rm loc}\) contains the intrinsic local chain contribution together with the locally expanded short-contour pair interaction, whereas \(\mathcal H_{\rm nl}\) contains the pair interaction from contour separations beyond \(\ell\). The variables \(X\) and \(X_{\rm c}\) refer separately to the local and complementary configurational information.
+
+The marginal distribution of the local geometry is obtained by integrating over the complementary degrees of freedom,
+\begin{equation}
+P(X)
+=
+\int\mathcal D X_{\rm c}\,P(X,X_{\rm c})
+=
+\frac{1}{Z}
+\exp[-\beta\mathcal H_{\rm loc}(X)]
+Z_{\rm nl}(X),
+\end{equation}
+where
+\begin{equation}
+Z_{\rm nl}(X)
+=
+\int\mathcal D X_{\rm c}\,
+\exp[-\beta\mathcal H_{\rm nl}(X,X_{\rm c})]
+\label{eq:Znl}
+\end{equation}
+is the conditional nonlocal partition function obtained by integrating over the complementary degrees of freedom given the local geometry \(X\).
+% \footnote{The notation is analogous to a conditional probability in Bayes' theorem. The joint conformational distribution may be factorized as \(P(X,X_{\rm c})=P(X)P(X_{\rm c}\mid X)\), where
+% \[
+% P(X_{\rm c}\mid X)
+% =
+% \frac{\exp[-\beta\mathcal H_{\rm nl}(X,X_{\rm c})]}{Z_{\rm nl}(X)},
+% \qquad
+% Z_{\rm nl}(X)
+% =
+% \int\mathcal D X_{\rm c}\,
+% \exp[-\beta\mathcal H_{\rm nl}(X,X_{\rm c})].
+% \]
+% Thus \(Z_{\rm nl}(X)\) normalizes the conditional ensemble of complementary configurations given \(X\), while \(P(X)\) is obtained by marginalizing the joint distribution over \(X_{\rm c}\).}
+
+Thus the effect of the long-contour-separation interaction on the local statistics is contained in the \(X\)-dependence of \(Z_{\rm nl}(X)\) in Eq.~\eqref{eq:Znl}. Direct evaluation of this conditional configurational integral is generally impractical, so we instead test the \(X\)-dependence of the nonlocal interaction energy. To define a conservative nonlocal-dependence test, we use a representative interaction range \(D\sim1/k_{\rm eff}\), motivated by the comparable interaction and structural correlation scales of polyelectrolyte solutions.
+% ~\cite{Muthukumar1996}.
+
+For each contour position \(s\), define the nonlocal pair-energy contribution
+\begin{equation}
+\epsilon_{\rm nl}(s)
+=
+\int_\ell^\infty d\Delta s\,
+\mathcal V\!\left[d(s,\Delta s),\Delta s\right],
+\label{eq:epsilon_nl}
+\end{equation}
+so that
+\begin{equation}
+\beta\mathcal H_{\rm nl}
+=
+\int ds\,\epsilon_{\rm nl}(s).
+\label{eq:Hnl_epsilon}
+\end{equation}
+Each sampled local state \(X(s)\) is associated with \(\epsilon_{\rm nl}(s)\), and a low-order polynomial basis of the normalized variables \(\kappa\), \(\kappa'\), and \(\kappa\tau\) is used to quantify the fraction of variation in \(\epsilon_{\rm nl}\) systematically associated with \(X\).
+
+% \footnote{Let \(\delta\epsilon_{\rm nl}=\epsilon_{\rm nl}-\langle\epsilon_{\rm nl}\rangle\) denote the centered sampled nonlocal pair-energy contribution and let \(\Phi_X=U\Sigma V^T\) be the singular-value decomposition of the basis matrix constructed from \(X\). The component associated with the \(X\)-generated subspace is the projection \(UU^T\delta\epsilon_{\rm nl}\), giving the ideal retained variance fraction
+% \[
+% \eta_X=
+% \frac{\|U^T\delta\epsilon_{\rm nl}\|^2}
+% {\|\delta\epsilon_{\rm nl}\|^2}.
+% \]
+% In practice, the corresponding fraction is evaluated by grouped cross validation over independent traced contours or field realizations.}
+
+\section*{4. Reweighting of the structural ensemble under interaction variations}
+
+A variation in interaction changes the statistical weights of configurations relative to a reference ensemble and therefore reweights the distribution of local geometric states. We use this relative reweighting to connect the observed change in geometric statistics to the corresponding change in interaction.
+
+Let the reference ensemble have the joint distribution
+\begin{equation}
+P_0(X,X_{\rm c})
+=
+P_0(X)\,P_0(X_{\rm c}\mid X),
+\end{equation}
+where \(P_0(X)\) may be known empirically without requiring an explicit form for the Hamiltonian that generates it.
+
+Let \(\mathcal H_0(X,X_{\rm c})\) and \(\mathcal H(X,X_{\rm c})\) denote the Hamiltonians associated with the reference and target ensembles, respectively, and define
+\begin{equation}
+\Delta\mathcal H(X,X_{\rm c})
+=
+\mathcal H(X,X_{\rm c})
+-
+\mathcal H_0(X,X_{\rm c}).
+\end{equation}
+Applying the same local--nonlocal decomposition gives
+\begin{equation}
+\Delta\mathcal H(X,X_{\rm c})
+=
+\Delta\mathcal H_{\rm loc}(X)
++
+\Delta\mathcal H_{\rm nl}(X,X_{\rm c}),
+\end{equation}
+where
+\begin{equation}
+\Delta\mathcal H_{\rm loc}
+=
+\mathcal H_{\rm loc}
+-
+\mathcal H_{{\rm loc},0},
+\qquad
+\Delta\mathcal H_{\rm nl}
+=
+\mathcal H_{\rm nl}
+-
+\mathcal H_{{\rm nl},0}.
+\label{eq:DeltaHnl}
+\end{equation}
+
+For the reference and target ensembles, define the corresponding conditional nonlocal partition functions
+\begin{align}
+Z_{{\rm nl},0}(X)
+&=
+\int\mathcal D X_{\rm c}\,
+\exp[-\beta\mathcal H_{{\rm nl},0}(X,X_{\rm c})],
+\\
+Z_{\rm nl}(X)
+&=
+\int\mathcal D X_{\rm c}\,
+\exp[-\beta\mathcal H_{\rm nl}(X,X_{\rm c})].
+\end{align}
+The reference conditional distribution of the complementary coordinates is therefore
+\begin{equation}
+P_0(X_{\rm c}\mid X)
+=
+\frac{
+\exp[-\beta\mathcal H_{{\rm nl},0}(X,X_{\rm c})]
+}{
+Z_{{\rm nl},0}(X)
+}.
+\label{eq:P0_Xc_given_X}
+\end{equation}
+
+The nonlocal change in configurational weight for a given \((X,X_{\rm c})\) is
+\begin{equation}
+W_{\rm nl}(X,X_{\rm c})
+=
+\exp[-\beta\Delta\mathcal H_{\rm nl}(X,X_{\rm c})].
+\label{eq:Wnl}
+\end{equation}
+Averaging this factor over the complementary configurations of the reference ensemble gives
+\begin{align}
+\overline W_{\rm nl}(X)
+&=
+\int\mathcal D X_{\rm c}\,
+P_0(X_{\rm c}\mid X)
+W_{\rm nl}(X,X_{\rm c})
+\nonumber\\
+&=
+\frac{Z_{\rm nl}(X)}
+{Z_{{\rm nl},0}(X)}.
+\label{eq:Wnl_avg}
+\end{align}
+
+It is convenient to express this ratio as a conditional nonlocal free-energy change,
+\begin{equation}
+\Delta F_{\rm nl}(X)
+=
+-\frac{1}{\beta}
+\log
+\frac{Z_{\rm nl}(X)}
+{Z_{{\rm nl},0}(X)}
+=
+-\frac{1}{\beta}
+\log\overline W_{\rm nl}(X).
+\label{eq:DeltaFnl}
+\end{equation}
+The marginal distribution of the target local geometry can then be written as
+\begin{equation}
+P(X)
+=
+\frac{
+P_0(X)
+\exp\left\{
+-\beta\left[
+\Delta\mathcal H_{\rm loc}(X)
++
+\Delta F_{\rm nl}(X)
+\right]
+\right\}
+}{
+\displaystyle
+\int\mathcal D X\,
+P_0(X)
+\exp\left\{
+-\beta\left[
+\Delta\mathcal H_{\rm loc}(X)
++
+\Delta F_{\rm nl}(X)
+\right]
+\right\}
+}.
+\label{eq:relative_reweighting}
+\end{equation}
+
+Weak \(X\)-dependence of \(\epsilon_{\rm nl}\) supports approximating \(\Delta F_{\rm nl}(X)\) as \(X\)-independent and absorbing it into the normalization. If appreciable dependence remains for the interaction change, \(\Delta\mathcal H_{\rm nl}\) is evaluated from the parametrized interaction on the reference ensemble. 
+The nonlocal free-energy correction is then estimated directly from
+\(\Delta F_{\rm nl}(X)
+=
+-\frac{1}{\beta}
+\log
+\left\langle
+e^{-\beta\Delta\mathcal H_{\rm nl}}
+\mid X
+\right\rangle_0,\)
+where \(\langle\cdot\rangle_0\) denotes the conditional average evaluated from finite random-wave samples of the reference ensemble.
+% \footnote{
+% The nonlocal interaction change can be estimated from the inferred local coefficients without separately specifying the absolute reference and target interactions by introducing a minimal effective interaction-change kernel
+% \[
+% \beta\Delta V_{\rm eff}(r)
+% =
+% g_\Delta\frac{e^{-r/D_\Delta}}{r}.
+% \]
+% The parameters \(g_\Delta\) and \(D_\Delta\) are constrained by the same finite-cutoff moments that determine the local coefficients,
+% \[
+% \Delta c_2
+% =
+% \frac{g_\Delta D_\Delta^2}{8}
+% f_2\!\left(\frac{\ell}{D_\Delta}\right),
+% \qquad
+% \Delta c_4
+% =
+% g_\Delta D_\Delta^4
+% f_4\!\left(\frac{\ell}{D_\Delta}\right).
+% \]
+% Eliminating \(g_\Delta\) gives the implicit relation
+% \[
+% D_\Delta^2
+% =
+% \frac{\Delta c_4}{8\Delta c_2}
+% \frac{
+% f_2(\ell/D_\Delta)
+% }{
+% f_4(\ell/D_\Delta)
+% },
+% \]
+% which is solved self-consistently for \(D_\Delta\), after which
+% \[
+% g_\Delta
+% =
+% \frac{
+% 8\Delta c_2
+% }{
+% D_\Delta^2
+% f_2(\ell/D_\Delta)
+% }.
+% \]
+% The resulting kernel is then evaluated on the actual nonlocal chords of the traced reference configurations,
+% \[
+% \beta\Delta\mathcal H_{\rm nl}(X,X_{\rm c})
+% \simeq
+% \int ds
+% \int_\ell^\infty d\Delta s\,
+% \left[
+% \beta\Delta V_{\rm eff}\!\left(d(s,\Delta s)\right)
+% -
+% \beta\Delta V_{\rm eff}(\Delta s)
+% \right].
+% \]
+% }
+
+% Taking the logarithm of Eq.~\eqref{eq:relative_reweighting} gives
+% \begin{equation}
+% \log\frac{P(X)}{P_0(X)}
+% =
+% \mathrm{const.}
+% -\beta\Delta\mathcal H_{\rm loc}(X)
+% -\beta\Delta F_{\rm nl}(X),
+% \label{eq:log_relative_reweighting}
+% \end{equation}
+% which separates the local interaction change from the nonlocal free-energy correction.
+
+\section*{5. Zero-salt ensemble as the practical reference}
+
+For the present analysis, the zero-salt random-wave ensemble is used as the empirical reference. The distribution \(P_0(X)\) is obtained directly from the random-wave spectrum fitted to the zero-salt scattering data, without requiring an explicit Hamiltonian that generates this reference distribution.
+
+For a target salt condition, the change in the local Hamiltonian relative to zero salt is written
+\begin{equation}
+\beta\Delta\mathcal H_{\rm loc}(X)
+=
+\Delta c_2 K_2(X)
++
+\Delta c_4 K_4(X),
+\end{equation}
+where
+\begin{equation}
+\Delta c_2=c_2-c_{2,0},
+\qquad
+\Delta c_4=c_4-c_{4,0},
+\end{equation}
+and
+\begin{equation}
+K_2(X)
+=
+\int ds\,\kappa^2,
+\end{equation}
+\begin{equation}
+K_4(X)
+=
+\int ds\left[
+\frac{9}{64}\kappa^4
+-\frac{1}{24}(\kappa')^2
+-\frac{1}{24}\kappa^2\tau^2
+\right].
+\end{equation}
+
+Including the conditional nonlocal free-energy correction, the target distribution is
+\begin{equation}
+P(X)
+=
+\frac{
+P_0(X)
+\exp\left[
+-\Delta c_2K_2(X)
+-\Delta c_4K_4(X)
+-\beta\Delta F_{\rm nl}(X)
+\right]
+}{
+\displaystyle
+\int\mathcal D X\,
+P_0(X)
+\exp\left[
+-\Delta c_2K_2(X)
+-\Delta c_4K_4(X)
+-\beta\Delta F_{\rm nl}(X)
+\right]
+}.
+\end{equation}
+
+When the nonlocal-dependence test supports a subleading nonlocal correction, the observed change in local conformational statistics is described directly by \(\Delta c_2\) and \(\Delta c_4\). When required, the estimated \(\Delta F_{\rm nl}(X)\) is retained in the same reweighting expression.
+
+\section*{6. Numerical procedure}
+
+The numerical analysis proceeds as follows.
+
+\begin{enumerate}
+
+\item Load \(k_{\rm eff}\) and the radial spectral-width parameters obtained from the scattering fit for each salt condition, and generate isotropic random-wave fields using the fitted radial spectrum.
+% , without imposing stretch or anisotropy.
+
+\item Trace the intersection lines and evaluate the local geometric variables
+\begin{equation}
+X=
+\{\kappa,\kappa',\kappa\tau\}.
+\end{equation}
+
+\item Use the zero-salt random-wave ensemble as the empirical reference to estimate \(P_0(X)\), with the complementary information represented by the nonlocal chord distances \(d(s,\Delta s)\) required to evaluate \(\mathcal H_{\rm nl}\).
+
+\item Evaluate the nonlocal-dependence test on the reference contours using the representative interaction range \(D\sim1/k_{\rm eff}\), and quantify the dependence of \(\epsilon_{\rm nl}\) on \(X\). 
+% using the low-order polynomial basis and grouped SVD/cross-validation procedure described above.
+
+\item If the nonlocal-dependence test finds appreciable \(X\)-dependence, evaluate \(\Delta\mathcal H_{\rm nl}\) for the parametrized reference-to-target interaction on the same reference configurations. Estimate the leading correction as \(\Delta F_{\rm nl}(X)\simeq\mathrm{const.}+\langle\Delta\mathcal H_{\rm nl}\mid X\rangle_0\).
+
+\item Calculate \(K_2\) and \(K_4\) for the sampled geometries, then iteratively adjust \(\Delta c_2\) and \(\Delta c_4\) and reweight \(P_0(X)\) until the predicted local geometric statistics reproduce the target ensemble, including \(\Delta F_{\rm nl}(X)\) when required.
+
+\end{enumerate}
+
+\section*{7. Relation of fitted coefficients to interaction parameters}
+
+The inferred coefficients satisfy
+\begin{equation}
+c_2=c_{2,0}+\Delta c_2,
+\qquad
+c_4=c_{4,0}+\Delta c_4.
+\end{equation}
+Assuming that the intrinsic chain flexibility is unchanged between the reference and target conditions, the bare persistence-length contribution \(\ell_{p,0}/2\) is common to both ensembles. Define
+\begin{equation}
+a=c_2-\frac{\ell_{p,0}}{2},
+\qquad
+a_0=c_{2,0}-\frac{\ell_{p,0}}{2}.
+\end{equation}
+
+Using the finite-cutoff Yukawa coefficients in Eq.~\eqref{eq:yukawa_finite_coefficients},
+\begin{equation}
+a
+=
+\frac{gD^2}{8}
+f_2\!\left(\frac{\ell}{D}\right),
+\qquad
+c_4
+=
+gD^4
+f_4\!\left(\frac{\ell}{D}\right).
+\end{equation}
+Eliminating \(g\) gives
+\begin{equation}
+D^2
+=
+\frac{c_4}{8a}
+\frac{
+f_2\!\left(\ell/D\right)
+}{
+f_4\!\left(\ell/D\right)
+},
+\end{equation}
+which determines \(D\) implicitly for the corresponding \(\ell=1/k_{\rm eff}\). The interaction strength then follows from
+\begin{equation}
+g
+=
+\frac{8a}{
+D^2 f_2\!\left(\ell/D\right)
+}.
+\end{equation}
+
+Equivalently, the relative changes between the target and reference conditions satisfy
+\begin{align}
+\frac{\Delta D}{D_0}
+&=
+\left[
+\frac{c_4\,a_0}
+{c_{4,0}\,a}
+\frac{
+f_2(\ell/D)\,
+f_4(\ell_0/D_0)
+}{
+f_4(\ell/D)\,
+f_2(\ell_0/D_0)
+}
+\right]^{1/2}
+-1,
+\\
+\frac{\Delta g}{g_0}
+&=
+\frac{a^2c_{4,0}}
+{a_0^2c_4}
+\frac{
+f_4(\ell/D)\,
+f_2^2(\ell_0/D_0)
+}{
+f_4(\ell_0/D_0)\,
+f_2^2(\ell/D)
+}
+-1,
+\end{align}
+where \(\ell\) and \(\ell_0\) are obtained from the fitted \(k_{\rm eff}\) of the target and reference conditions, respectively.
+
+When \(D\ll\ell\) and \(D_0\ll\ell_0\), \(f_2\) and \(f_4\) approach unity, recovering
+\begin{align}
+\frac{\Delta D}{D_0}
+&=
+\left(
+\frac{c_4\,a_0}
+{c_{4,0}\,a}
+\right)^{1/2}-1,
+\\
+\frac{\Delta g}{g_0}
+&=
+\frac{a^2c_{4,0}}
+{a_0^2c_4}-1.
+\end{align}
+
+Thus the fitted \(\Delta c_2\) and \(\Delta c_4\), together with the measured local cutoff \(\ell=1/k_{\rm eff}\), determine the changes in interaction range and strength relative to the zero-salt reference, with the nonlocal free-energy correction retained when required by the nonlocal-dependence test.
+
+% \bibliographystyle{plain}
+% \bibliography{ref}
+
+\end{document}
