@@ -1022,3 +1022,51 @@ printed figure's original `(q, I(q))` coordinate system.
   trace contours from the fitted positive-support radial spectra.
 - Reused the discrete CA-series color palette from `cf_compare_ca.ipynb` and
   verified the notebook by executing it from start to finish.
+
+## 2026-08-27 Relative Interaction Analysis Refactor
+
+- Split the interaction workflow into `curvefit/cf_ca_interaction_compute.ipynb`
+  and `curvefit/cf_ca_interaction_results.ipynb`, supported by reusable code in
+  `curvefit/cf_ca_interaction.py`. The compute notebook owns sampling and
+  expensive checks; the results notebook reads saved tables and produces the
+  scientific figures.
+- Returned the primary inference to relative random-wave comparisons. The
+  fitted spectrum and Kac--Rice-weighted local geometry are the measured
+  inputs, and the primary interaction outputs are
+  $\Delta c_2 k_{\rm ref}$ and $\Delta c_4 k_{\rm ref}^3$, without assuming
+  an absolute zero-salt potential.
+- Used the former fixed-potential result only as the expected qualitative
+  behavior. Added a four-panel summary connecting
+  $k_{\rm eff}/k_{\rm ref}$, spectral width, cumulative $\Delta c_2$, and
+  cumulative $\Delta c_4$. Adjacent-state runs now display cumulative changes
+  relative to the selected reference rather than only the small individual
+  steps.
+- Added a common-normalization plot of the directly sampled changes in
+  $\langle k_2\rangle$ and $\langle k_4\rangle$, exposing the systematic
+  geometric trend before converting it into interaction coefficients.
+- Kept linked maximum-entropy matching of the random-wave $K_2,K_4$ means as
+  the coefficient estimator. The broader fourth-degree density-ratio model is
+  retained as a diagnostic. Current fits match the two means numerically but
+  leave roughly 75--82% of the flexible log-density variation outside the
+  linked direction, so the reported coefficients are effective interaction
+  moments rather than a unique full potential.
+- Removed forced shape dependence from the distant-interaction correction. A
+  varying correction is accepted only when its dependence is resolved on
+  traced data, its self-consistent coefficient iteration and corrected moment
+  fit converge, and at least 20% effective source samples remain. Otherwise it
+  reduces to a normalization-cancelling constant and the accepted result
+  remains the local relative fit.
+- Correction outputs now record acceptance, rejection reason, candidate and
+  accepted coefficients, corrected target/fitted $K_2,K_4$ means, residuals,
+  and overlap diagnostics. The results notebook does not plot rejected or
+  pre-safeguard correction files.
+- The optional Yukawa conversion defaults to a range of reference choices.
+  Fixed-reference mode remains available. For
+  $g_0/k_{\rm ref}=5,D_0k_{\rm ref}=1$, the finite-cutoff quadratic interaction
+  moment becomes nonpositive after the measured high-salt $\Delta c_2$. The
+  notebook now reports the incompatibility and uses an explicitly labelled
+  short-range fallback rather than stopping.
+- No production tracing or full compute notebook was run during this update.
+  Notebook syntax, reduced results execution, the fixed-reference fallback,
+  and 62 deterministic tests were checked successfully in the development
+  workspace.
