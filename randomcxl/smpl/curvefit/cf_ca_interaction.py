@@ -10,6 +10,11 @@ the local expansion range ``ell=1/k_ref``. The optional
 note. Pair-potential strengths and distances must use the same physical length
 unit as the trace; integrating the pair kernel over both contour coordinates
 then gives a dimensionless ``beta*H``.
+
+The optional ``model_free`` nonlocal branch is interaction-form-independent:
+it expands the complementary traced geometry in a finite physical radial basis
+and jointly fits ``[K2,K4,Y]``.  The public dispatcher continues to default to
+the established Yukawa implementation.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from scipy.interpolate import CubicSpline
 from scipy.linalg import expm
 from scipy.optimize import brentq, minimize
 from scipy.special import gammainc, gammaln, logsumexp
+from scipy.spatial import cKDTree
 from scipy.stats import gamma as gamma_distribution
 from scipy.stats import norm, qmc
 
@@ -338,6 +344,108 @@ class NonlocalTable:
 
 
 @dataclass(frozen=True)
+class RadialHatBasis:
+    """Compact piecewise-linear basis on one common physical radial axis."""
+
+    centers: FloatArray
+    width: float
+    r_min: float
+    r_max: float
+
+    def __post_init__(self) -> None:
+        centers=np.asarray(self.centers,dtype=float)
+        if (centers.ndim!=1 or len(centers)<2 or np.any(~np.isfinite(centers)) or
+                np.any(np.diff(centers)<=0)):
+            raise ValueError("radial basis centers must be finite and increasing")
+        if not np.isfinite(self.width) or self.width<=0:
+            raise ValueError("radial basis width must be finite and positive")
+        if not (0<=self.r_min<self.r_max):
+            raise ValueError("radial basis support must be finite and ordered")
+        object.__setattr__(self,"centers",centers)
+
+    @classmethod
+    def from_range(cls, r_min: float, r_max: float,
+                   count: int=8) -> "RadialHatBasis":
+        if count<2 or not np.isfinite(r_min+r_max) or not 0<=r_min<r_max:
+            raise ValueError("a positive radial range and at least two basis functions are required")
+        knots=np.linspace(r_min,r_max,count+2)
+        return cls(knots[1:-1],float(knots[1]-knots[0]),r_min,r_max)
+
+    def evaluate(self, distance: ArrayLike) -> FloatArray:
+        values=np.asarray(distance,dtype=float)
+        if np.any(~np.isfinite(values)) or np.any(values<0):
+            raise ValueError("radial distances must be finite and nonnegative")
+        evaluated=np.maximum(
+            1-np.abs(values[...,None]-self.centers)/self.width,0.0)
+        outside=(values<self.r_min)|(values>self.r_max)
+        return np.where(outside[...,None],0.0,evaluated)
+
+
+@dataclass(frozen=True)
+class ModelFreeNonlocalConfig:
+    """Controls for the interaction-form-independent nonlocal branch."""
+
+    basis_count: int = 8
+    r_min: float|None = None
+    r_max: float|None = None
+    nonlocal_ridge: float = 1e-4
+    nonlocal_smoothness: float = 1e-3
+    conditional_neighbors: int = 64
+    conditional_bandwidth: float|None = None
+    conditional_min_effective_count: float = 8.0
+    support_quantiles: tuple[float,float] = (0.002,0.998)
+
+    def __post_init__(self) -> None:
+        if self.basis_count<2:
+            raise ValueError("basis_count must be at least two")
+        if self.r_min is not None and (not np.isfinite(self.r_min) or self.r_min<0):
+            raise ValueError("r_min must be finite and nonnegative")
+        if self.r_max is not None and (not np.isfinite(self.r_max) or self.r_max<=0):
+            raise ValueError("r_max must be finite and positive")
+        if self.r_min is not None and self.r_max is not None and self.r_min>=self.r_max:
+            raise ValueError("r_min must be smaller than r_max")
+        if self.nonlocal_ridge<0 or self.nonlocal_smoothness<0:
+            raise ValueError("regularization strengths must be nonnegative")
+        if self.conditional_neighbors<2 or self.conditional_min_effective_count<=0:
+            raise ValueError("conditional averaging controls must be positive")
+        if self.conditional_bandwidth is not None and self.conditional_bandwidth<=0:
+            raise ValueError("conditional_bandwidth must be positive")
+
+
+@dataclass(frozen=True)
+class ModelFreeNonlocalTable:
+    """Matched local and complementary geometry sampled by contour position."""
+
+    state: FloatArray
+    local_features: FloatArray
+    nonlocal_features: FloatArray
+    weights: FloatArray
+    groups: IntArray
+    metadata: Mapping[str,object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        state=np.asarray(self.state,dtype=float)
+        local=np.asarray(self.local_features,dtype=float)
+        nonlocal_values=np.asarray(self.nonlocal_features,dtype=float)
+        weights=np.asarray(self.weights,dtype=float)
+        groups=np.asarray(self.groups,dtype=int)
+        n=len(state)
+        if (state.shape!=(n,3) or local.shape!=(n,2) or nonlocal_values.ndim!=2 or
+                nonlocal_values.shape[0]!=n or weights.shape!=(n,) or
+                groups.shape!=(n,) or n==0):
+            raise ValueError("model-free feature arrays must be nonempty and aligned")
+        if (np.any(~np.isfinite(state)) or np.any(~np.isfinite(local)) or
+                np.any(~np.isfinite(nonlocal_values)) or np.any(~np.isfinite(weights)) or
+                np.any(weights<0) or np.sum(weights)<=0):
+            raise ValueError("model-free feature arrays and weights must be finite")
+        object.__setattr__(self,"state",state)
+        object.__setattr__(self,"local_features",local)
+        object.__setattr__(self,"nonlocal_features",nonlocal_values)
+        object.__setattr__(self,"weights",weights/np.sum(weights))
+        object.__setattr__(self,"groups",groups)
+
+
+@dataclass(frozen=True)
 class DependenceResult:
     cv_r2: FloatArray
     mean_r2: float
@@ -489,6 +597,82 @@ class ConditionalYukawaFamily:
 
 
 @dataclass(frozen=True)
+class InteractionPathPoint:
+    """All positive finite-cutoff Yukawa solutions for one salt condition.
+
+    The dimensionless reporting scale is the zero-salt ``k_ref``:
+    ``g_over_kref=g/k_ref``, ``d_kref=D*k_ref``,
+    ``delta_c2_kref=Delta c2*k_ref``, and
+    ``delta_c4_kref3=Delta c4*k_ref**3``.
+    """
+
+    concentration_mM: float
+    delta_c2_kref: float
+    delta_c4_kref3: float
+    k_eff_over_kref: float
+    ell_kref: float
+    g_over_kref_roots: FloatArray
+    d_kref_roots: FloatArray
+    status: str
+    maximum_reconstruction_residual: float
+
+    def __post_init__(self) -> None:
+        strengths=np.asarray(self.g_over_kref_roots,dtype=float)
+        ranges=np.asarray(self.d_kref_roots,dtype=float)
+        if strengths.ndim!=1 or ranges.shape!=strengths.shape:
+            raise ValueError("interaction-path roots must be aligned 1D arrays")
+        if np.any(~np.isfinite(strengths)) or np.any(~np.isfinite(ranges)):
+            raise ValueError("interaction-path roots must be finite")
+        if np.any(strengths<=0) or np.any(ranges<=0):
+            raise ValueError("interaction-path roots must be positive")
+        expected={0:"no_physical_solution",1:"unique_solution"}.get(
+            len(strengths),"multiple_solutions")
+        if self.status not in {expected,"reference"}:
+            raise ValueError("interaction-path status does not match its roots")
+        object.__setattr__(self,"g_over_kref_roots",strengths)
+        object.__setattr__(self,"d_kref_roots",ranges)
+
+    @property
+    def root_count(self) -> int:
+        return len(self.d_kref_roots)
+
+
+@dataclass(frozen=True)
+class InteractionPathResult:
+    """Salt-ordered conditional path for one assumed zero-salt interaction."""
+
+    reference_concentration_mM: float
+    reference_k_eff: float
+    reference_g0_over_kref: float
+    reference_d0_kref: float
+    reference_a0_kref: float
+    reference_b0_kref3: float
+    cutoff_mode: str
+    d_kref_search_bounds: tuple[float,float]
+    points: tuple[InteractionPathPoint,...]
+
+    @property
+    def concentration_mM(self) -> FloatArray:
+        return np.asarray([point.concentration_mM for point in self.points])
+
+    @property
+    def unique_g_over_kref(self) -> FloatArray:
+        return np.asarray([
+            point.g_over_kref_roots[0] if point.root_count==1 else np.nan
+            for point in self.points])
+
+    @property
+    def unique_d_kref(self) -> FloatArray:
+        return np.asarray([
+            point.d_kref_roots[0] if point.root_count==1 else np.nan
+            for point in self.points])
+
+    @property
+    def unique_solution_mask(self) -> NDArray[np.bool_]:
+        return np.asarray([point.root_count==1 for point in self.points])
+
+
+@dataclass(frozen=True)
 class FlexibleDensityRatioResult:
     parameters: FloatArray
     coordinate_center: FloatArray
@@ -637,6 +821,9 @@ class MaximumEntropyResult:
     target_keep: NDArray[np.bool_]
     target_moments: FloatArray
     fitted_moments: FloatArray
+    unpenalized_objective: float = np.nan
+    regularization_objective: float = 0.0
+    total_objective: float = np.nan
 
     @property
     def standard_errors(self) -> FloatArray:
@@ -657,6 +844,52 @@ class MaximumEntropyResult:
         if len(self.coefficients)!=2:
             raise AttributeError("delta_c4_kref3 is defined only for the linked fit")
         return float(self.coefficients[1])
+
+
+@dataclass(frozen=True)
+class ConditionalAverageDiagnostics:
+    """Support and precision diagnostics for empirical conditioning on X."""
+
+    effective_neighbors: FloatArray
+    support_distance: FloatArray
+    conditional_variance: FloatArray
+    supported: NDArray[np.bool_]
+    poor_support_fraction: float
+
+
+@dataclass(frozen=True)
+class ModelFreeNonlocalResult:
+    """Joint local/nonlocal fit without an assumed analytic interaction form.
+
+    ``model_free`` means interaction-form-independent, not assumption-free.
+    The radial coefficients multiply the compact basis stored in
+    ``radial_basis`` and ``beta_delta_free_energy_*`` is derived afterward by
+    conditional marginalization over the sampled complementary geometry.
+    """
+
+    delta_c2_kref: float
+    delta_c4_kref3: float
+    nonlocal_coefficients: FloatArray
+    radial_basis: RadialHatBasis
+    reference_table: ModelFreeNonlocalTable
+    target_table: ModelFreeNonlocalTable
+    joint_fit: MaximumEntropyResult
+    beta_delta_free_energy_on_reference: FloatArray
+    beta_delta_free_energy_on_target: FloatArray
+    corrected_reference_weights: FloatArray
+    conditional_log_normalizer: float
+    reference_conditional_diagnostics: ConditionalAverageDiagnostics
+    target_conditional_diagnostics: ConditionalAverageDiagnostics
+    joint_feature_rank: int
+    joint_feature_singular_values: FloatArray
+    joint_feature_condition_number: float
+    local_nonlocal_correlations: FloatArray
+    nonlocal_orthogonal_variance_fraction: float
+    effective_sample_fraction: float
+    regularization_strength: float
+    smoothness_penalty: float
+    success: bool
+    message: str
 
 
 @dataclass(frozen=True)
@@ -1684,6 +1917,90 @@ def nonlocal_change_cell_hamiltonian(trace: ContourTrace,
     return nonlocal_energy_table(trace,change,zero,config)
 
 
+def make_model_free_radial_basis(config: NonlocalConfig,
+        model_free_config: ModelFreeNonlocalConfig|None=None) -> RadialHatBasis:
+    """Create the common physical radial basis used by both trajectory states."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    r_min=config.chord_floor if controls.r_min is None else controls.r_min
+    r_max=config.max_contour_separation if controls.r_max is None else controls.r_max
+    return RadialHatBasis.from_range(float(r_min),float(r_max),controls.basis_count)
+
+
+def build_model_free_nonlocal_table(trace: ContourTrace, k_ref: float,
+        radial_basis: RadialHatBasis, config: NonlocalConfig,
+        cell_length: float|None=None) -> ModelFreeNonlocalTable:
+    """Build geometry-only ``[K2,K4,Y]`` features at traced contour positions.
+
+    Points are sampled uniformly along the stored arclength-resampled
+    trajectories.  These weights are deliberately separate from the Kac--Rice
+    weights used by ``LocalGeometrySample``.  The radial coordinate is physical
+    and the caller must pass the same ``radial_basis`` to both states.
+    """
+    if not np.isfinite(k_ref) or k_ref<=0:
+        raise ValueError("k_ref must be finite and positive")
+    local_length=1/k_ref if cell_length is None else float(cell_length)
+    if not np.isclose(config.local_cutoff,local_length,rtol=1e-10,atol=1e-12):
+        raise ValueError("nonlocal cutoff and local expansion range must agree")
+    spacing=trace.physical_spacing
+    minimum=max(1,int(np.ceil(config.local_cutoff/spacing)))
+    maximum=int(np.floor(config.max_contour_separation/spacing))
+    if maximum<minimum:
+        raise ValueError("trace spacing does not resolve the requested nonlocal range")
+    states_physical=trace_local_state(trace,normalize=False)
+    candidates=sum(max(0,len(cell)-2*minimum) for cell in trace.points)
+    probability=min(1.0,config.max_points/max(candidates,1))
+    rng=np.random.default_rng(config.random_seed)
+    states=[]; local_features=[]; nonlocal_features=[]; groups=[]
+    for group,(points,state) in enumerate(zip(trace.points,states_physical)):
+        if len(points)<=2*minimum:
+            continue
+        centers=np.arange(minimum,len(points)-minimum)
+        centers=centers[rng.random(len(centers))<probability]
+        if len(centers)==0:
+            continue
+        y_values=np.zeros((len(centers),len(radial_basis.centers)),dtype=float)
+        for row,center in enumerate(centers):
+            local_max=min(maximum,center,len(points)-1-center)
+            if local_max<minimum:
+                continue
+            lags=np.arange(minimum,local_max+1)
+            neighbors=np.concatenate((center-lags,center+lags))
+            chord=np.maximum(
+                np.linalg.norm(points[neighbors]-points[center],axis=1),
+                config.chord_floor)
+            separation=np.tile(lags*spacing,2)
+            basis_difference=(radial_basis.evaluate(chord)-
+                              radial_basis.evaluate(separation))
+            y_values[row]=local_length*0.5*spacing*np.sum(basis_difference,axis=0)
+        local_state=state[centers]
+        normalized=local_state/np.array([k_ref,k_ref**2,k_ref**2])
+        fourth=local_fourth_order_density(
+            local_state[:,0],local_state[:,1],local_state[:,2])
+        factor=local_length*k_ref
+        local=np.column_stack((factor*local_state[:,0]**2/k_ref**2,
+                               factor*fourth/k_ref**4))
+        states.append(normalized); local_features.append(local)
+        nonlocal_features.append(y_values)
+        groups.append(np.full(len(centers),group,dtype=int))
+    if not states:
+        raise RuntimeError("no traced points satisfy the model-free nonlocal lag window")
+    state_values=np.vstack(states)
+    weights=np.full(len(state_values),1/len(state_values),dtype=float)
+    metadata={
+        "sampling_measure":"uniform arclength contour-position sampling",
+        "reporting_k_ref":float(k_ref),
+        "local_cutoff":float(config.local_cutoff),
+        "maximum_contour_separation":float(config.max_contour_separation),
+        "trace_spacing":float(spacing),
+        "radial_basis":"piecewise_linear_hat",
+        "radial_basis_centers":radial_basis.centers.tolist(),
+        "radial_basis_width":float(radial_basis.width),
+    }
+    return ModelFreeNonlocalTable(
+        state_values,np.vstack(local_features),np.vstack(nonlocal_features),
+        weights,np.concatenate(groups),metadata)
+
+
 def invariant_coordinates(state: ArrayLike, center: ArrayLike|None=None,
                           scale: ArrayLike|None=None) -> tuple[FloatArray,FloatArray,FloatArray]:
     values=np.asarray(state,dtype=float)
@@ -1951,7 +2268,8 @@ def _maximum_entropy_fit(reference_features: FloatArray,
         reference_mask: NDArray[np.bool_]|None=None,
         target_mask: NDArray[np.bool_]|None=None,
         initial: ArrayLike|None=None,
-        reference_beta_delta_f_nl: ArrayLike|None=None) -> MaximumEntropyResult:
+        reference_beta_delta_f_nl: ArrayLike|None=None,
+        physical_penalty_matrix: ArrayLike|None=None) -> MaximumEntropyResult:
     """Fit P/P0 proportional to exp(-theta.features) by moment matching."""
     xref=np.asarray(reference_features,dtype=float)
     xtarget=np.asarray(target_features,dtype=float)
@@ -1983,6 +2301,18 @@ def _maximum_entropy_fit(reference_features: FloatArray,
         wref[:,None]*centered_for_scale**2,axis=0))
     feature_scale=np.maximum(feature_scale,
         np.sqrt(np.finfo(float).eps)*np.maximum(np.abs(feature_center),1.0))
+    if physical_penalty_matrix is None:
+        penalty_z=np.zeros((xref.shape[1],xref.shape[1]),dtype=float)
+    else:
+        penalty=np.asarray(physical_penalty_matrix,dtype=float)
+        if (penalty.shape!=(xref.shape[1],xref.shape[1]) or
+                np.any(~np.isfinite(penalty)) or
+                not np.allclose(penalty,penalty.T,rtol=1e-10,atol=1e-12)):
+            raise ValueError("physical_penalty_matrix must be a finite symmetric feature matrix")
+        if np.min(np.linalg.eigvalsh(penalty))<-1e-10:
+            raise ValueError("physical_penalty_matrix must be positive semidefinite")
+        inverse_scale=np.diag(1/feature_scale)
+        penalty_z=inverse_scale@penalty@inverse_scale
     zref=(xref_kept-feature_center)/feature_scale
     ztarget=(xtarget_kept-feature_center)/feature_scale
     target_mean_z=np.sum(wtarget[:,None]*ztarget,axis=0)
@@ -2000,9 +2330,10 @@ def _maximum_entropy_fit(reference_features: FloatArray,
 
     def objective(parameters_z: FloatArray) -> tuple[float,FloatArray]:
         log_weight=log_reference-zref@parameters_z
-        value=float(logsumexp(log_weight)+target_mean_z@parameters_z)
+        value=float(logsumexp(log_weight)+target_mean_z@parameters_z+
+                    0.5*parameters_z@penalty_z@parameters_z)
         _,mean=distribution(parameters_z)
-        return value,target_mean_z-mean
+        return value,target_mean_z-mean+penalty_z@parameters_z
 
     start=np.zeros(xref.shape[1]) if initial is None else np.asarray(initial,dtype=float)
     if start.shape!=(xref.shape[1],):
@@ -2027,7 +2358,8 @@ def _maximum_entropy_fit(reference_features: FloatArray,
             "maximum-entropy covariance is nonfinite; reduce feature outliers "
             "or compare better-overlapped ensembles")
     n_reference=1/np.sum(tilted**2); n_target=1/np.sum(wtarget**2)
-    inverse=np.linalg.pinv(hessian)
+    penalized_hessian=hessian+penalty_z
+    inverse=np.linalg.pinv(penalized_hessian)
     covariance_z=inverse@(hessian/n_reference+target_covariance/n_target)@inverse
     inverse_scale=np.diag(1/feature_scale)
     covariance=inverse_scale@covariance_z@inverse_scale
@@ -2040,9 +2372,14 @@ def _maximum_entropy_fit(reference_features: FloatArray,
     target_mass=float(np.sum(wtarget_all[support_target])/np.sum(wtarget_all))
     target_mean=feature_center+feature_scale*target_mean_z
     fitted_mean=feature_center+feature_scale*fitted_mean_z
-    return MaximumEntropyResult(coefficients,covariance,float(objective(coefficients_z)[0]),
+    unpenalized=float(logsumexp(log_reference-zref@coefficients_z)+
+                      target_mean_z@coefficients_z)
+    regularization=float(0.5*coefficients_z@penalty_z@coefficients_z)
+    total=unpenalized+regularization
+    return MaximumEntropyResult(coefficients,covariance,total,
         success,message,target_mass,
-        effective_fraction,bounds,keep_ref,keep_target,target_mean,fitted_mean)
+        effective_fraction,bounds,keep_ref,keep_target,target_mean,fitted_mean,
+        unpenalized,regularization,total)
 
 
 def fit_linked_maximum_entropy(reference: LocalGeometrySample,
@@ -2059,6 +2396,225 @@ def fit_linked_maximum_entropy(reference: LocalGeometrySample,
         local_cell_features(target,k_ref,cell_length),
         reference.weights,target.weights,support_quantiles,
         reference_mask,target_mask,initial,reference_beta_delta_f_nl)
+
+
+def _model_free_penalty_matrix(feature_count: int,
+        ridge: float, smoothness: float) -> FloatArray:
+    if feature_count<4:
+        raise ValueError("joint model-free fit requires at least two radial features")
+    count=feature_count-2
+    penalty=np.zeros((feature_count,feature_count),dtype=float)
+    radial=2*ridge*np.eye(count)
+    if count>=3 and smoothness>0:
+        difference=np.zeros((count-2,count),dtype=float)
+        rows=np.arange(count-2)
+        difference[rows,rows]=1
+        difference[rows,rows+1]=-2
+        difference[rows,rows+2]=1
+        radial+=2*smoothness*(difference.T@difference)
+    penalty[2:,2:]=radial
+    return penalty
+
+
+def fit_joint_local_nonlocal_maximum_entropy(
+        reference: ModelFreeNonlocalTable,
+        target: ModelFreeNonlocalTable,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        initial: ArrayLike|None=None) -> MaximumEntropyResult:
+    """Fit ``Delta c2, Delta c4`` and all radial coefficients together."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    if reference.nonlocal_features.shape[1]!=target.nonlocal_features.shape[1]:
+        raise ValueError("reference and target tables must use the same radial basis")
+    reference_features=np.column_stack(
+        (reference.local_features,reference.nonlocal_features))
+    target_features=np.column_stack((target.local_features,target.nonlocal_features))
+    penalty=_model_free_penalty_matrix(
+        reference_features.shape[1],controls.nonlocal_ridge,
+        controls.nonlocal_smoothness)
+    return _maximum_entropy_fit(
+        reference_features,target_features,reference.weights,target.weights,
+        controls.support_quantiles,initial=initial,
+        physical_penalty_matrix=penalty)
+
+
+def model_free_joint_reweighted_weights(table: ModelFreeNonlocalTable,
+        result: MaximumEntropyResult,
+        mask: NDArray[np.bool_]|None=None) -> FloatArray:
+    """Return joint ``P_target/P_reference`` weights on a model-free table."""
+    features=np.column_stack((table.local_features,table.nonlocal_features))
+    if features.shape[1]!=len(result.coefficients):
+        raise ValueError("joint fit and feature table are incompatible")
+    keep=np.all((features>=result.feature_bounds[:,0])&
+                (features<=result.feature_bounds[:,1]),axis=1)
+    if mask is not None:
+        keep&=np.asarray(mask,dtype=bool)
+    if not np.any(keep):
+        raise ValueError("no model-free samples remain inside joint support")
+    output=np.zeros(len(features),dtype=float)
+    log_weight=(np.log(np.maximum(table.weights[keep],np.finfo(float).tiny))-
+                features[keep]@result.coefficients)
+    output[keep]=np.exp(log_weight-logsumexp(log_weight))
+    return output
+
+
+def _conditional_nonlocal_average(reference_state: FloatArray,
+        reference_weights: FloatArray, reference_log_weight: FloatArray,
+        query_state: FloatArray, neighbors: int,
+        bandwidth: float|None) -> tuple[FloatArray,FloatArray,FloatArray,FloatArray]:
+    """Weighted kNN estimate of ``-log E[exp(log_weight)|X]``."""
+    xref=np.asarray(reference_state,dtype=float)
+    xquery=np.asarray(query_state,dtype=float)
+    q=np.asarray(reference_weights,dtype=float)
+    log_values=np.asarray(reference_log_weight,dtype=float)
+    if (xref.ndim!=2 or xref.shape[1]!=3 or xquery.ndim!=2 or
+            xquery.shape[1]!=3 or q.shape!=(len(xref),) or
+            log_values.shape!=(len(xref),)):
+        raise ValueError("conditional-average arrays are not aligned")
+    q=q/np.sum(q)
+    center=np.sum(q[:,None]*xref,axis=0)
+    scale=np.sqrt(np.sum(q[:,None]*(xref-center)**2,axis=0))
+    scale=np.maximum(scale,1e-8)
+    zref=(xref-center)/scale; zquery=(xquery-center)/scale
+    count=min(max(2,int(neighbors)),len(zref))
+    distances,indices=cKDTree(zref).query(zquery,k=count)
+    if count==1:
+        distances=distances[:,None]; indices=indices[:,None]
+    if bandwidth is None:
+        local_bandwidth=np.maximum(distances[:,-1],1e-6)
+    else:
+        local_bandwidth=np.full(len(zquery),float(bandwidth))
+    kernel_log=-0.5*(distances/local_bandwidth[:,None])**2
+    neighbor_log_q=np.log(np.maximum(q[indices],np.finfo(float).tiny))
+    denominator=logsumexp(neighbor_log_q+kernel_log,axis=1)
+    log_mean=logsumexp(
+        neighbor_log_q+kernel_log+log_values[indices],axis=1)-denominator
+    local_probability=np.exp(
+        neighbor_log_q+kernel_log-denominator[:,None])
+    effective=1/np.sum(local_probability**2,axis=1)
+    log_second=logsumexp(
+        neighbor_log_q+kernel_log+2*log_values[indices],axis=1)-denominator
+    mean=np.exp(np.clip(log_mean,-350,350))
+    second=np.exp(np.clip(log_second,-350,700))
+    variance=np.maximum(second-mean**2,0.0)
+    return -log_mean,effective,distances[:,-1],variance
+
+
+def conditional_model_free_energy(reference: ModelFreeNonlocalTable,
+        nonlocal_coefficients: ArrayLike, query_state: ArrayLike,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        support_radius: float|None=None
+        ) -> tuple[FloatArray,ConditionalAverageDiagnostics]:
+    """Derive ``beta Delta F_nl(X)`` by marginalizing the fitted Y weight."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    coefficients=np.asarray(nonlocal_coefficients,dtype=float)
+    if coefficients.shape!=(reference.nonlocal_features.shape[1],):
+        raise ValueError("one nonlocal coefficient is required per radial feature")
+    raw,effective,distance,variance=_conditional_nonlocal_average(
+        reference.state,reference.weights,
+        -(reference.nonlocal_features@coefficients),
+        np.asarray(query_state,dtype=float),controls.conditional_neighbors,
+        controls.conditional_bandwidth)
+    if support_radius is None:
+        support_radius=float(weighted_quantile(
+            distance,(0.0,0.995),np.full(len(distance),1/len(distance)))[1])
+    supported=(distance<=support_radius)&(
+        effective>=controls.conditional_min_effective_count)
+    diagnostics=ConditionalAverageDiagnostics(
+        effective,distance,variance,supported,float(1-np.mean(supported)))
+    return raw,diagnostics
+
+
+def _model_free_identifiability(table: ModelFreeNonlocalTable
+        ) -> tuple[int,FloatArray,float,FloatArray,float]:
+    features=np.column_stack((table.local_features,table.nonlocal_features))
+    weights=table.weights/np.sum(table.weights)
+    mean=np.sum(weights[:,None]*features,axis=0)
+    scale=np.sqrt(np.sum(weights[:,None]*(features-mean)**2,axis=0))
+    scale=np.maximum(scale,1e-12)
+    standardized=(features-mean)/scale
+    weighted=standardized*np.sqrt(weights[:,None])
+    singular=np.linalg.svd(weighted,compute_uv=False)
+    tolerance=max(weighted.shape)*np.finfo(float).eps*singular[0]
+    rank=int(np.count_nonzero(singular>tolerance))
+    condition=float(np.inf if singular[-1]<=tolerance else singular[0]/singular[-1])
+    correlation=weighted_correlation_matrix(features,weights)[0:2,2:]
+    local=np.column_stack((np.ones(len(features)),table.local_features))
+    root=np.sqrt(weights)[:,None]
+    coefficients=np.linalg.lstsq(root*local,root*table.nonlocal_features,rcond=None)[0]
+    residual=table.nonlocal_features-local@coefficients
+    centered_y=table.nonlocal_features-np.sum(
+        weights[:,None]*table.nonlocal_features,axis=0)
+    total=float(np.sum(weights[:,None]*centered_y**2))
+    orthogonal=float(np.sum(weights[:,None]*residual**2)/total) if total>0 else 0.0
+    return rank,singular,condition,correlation,orthogonal
+
+
+def fit_model_free_nonlocal_correction(reference_trace: ContourTrace,
+        target_trace: ContourTrace, k_ref: float, config: NonlocalConfig,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        cell_length: float|None=None) -> ModelFreeNonlocalResult:
+    """Fit the interaction-form-independent joint local/nonlocal model."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    radial_basis=make_model_free_radial_basis(config,controls)
+    reference=build_model_free_nonlocal_table(
+        reference_trace,k_ref,radial_basis,config,cell_length)
+    target=build_model_free_nonlocal_table(
+        target_trace,k_ref,radial_basis,config,cell_length)
+    joint=fit_joint_local_nonlocal_maximum_entropy(reference,target,controls)
+    coefficients=np.asarray(joint.coefficients,dtype=float)
+    radial_coefficients=coefficients[2:]
+    raw_reference,reference_diagnostics=conditional_model_free_energy(
+        reference,radial_coefficients,reference.state,controls)
+    support_radius=float(weighted_quantile(
+        reference_diagnostics.support_distance,(0.0,0.995),reference.weights)[1])
+    raw_reference,reference_diagnostics=conditional_model_free_energy(
+        reference,radial_coefficients,reference.state,controls,support_radius)
+    raw_target,target_diagnostics=conditional_model_free_energy(
+        reference,radial_coefficients,target.state,controls,support_radius)
+    reference_supported=reference_diagnostics.supported
+    if not np.any(reference_supported):
+        raise RuntimeError("conditional model-free estimate has no supported reference samples")
+    log_normalizer=logsumexp(
+        np.log(np.maximum(reference.weights[reference_supported],np.finfo(float).tiny))-
+        raw_reference[reference_supported])-logsumexp(
+        np.log(np.maximum(reference.weights[reference_supported],np.finfo(float).tiny)))
+    beta_reference=raw_reference+log_normalizer
+    beta_target=raw_target+log_normalizer
+    corrected=np.zeros(len(reference.weights),dtype=float)
+    joint_supported=(reference_supported&joint.reference_keep)
+    if not np.any(joint_supported):
+        raise RuntimeError("no reference samples remain in both joint and conditional support")
+    log_weight=(np.log(np.maximum(reference.weights[joint_supported],np.finfo(float).tiny))-
+                reference.local_features[joint_supported]@coefficients[:2]-
+                beta_reference[joint_supported])
+    corrected[joint_supported]=np.exp(log_weight-logsumexp(log_weight))
+    rank,singular,condition,correlation,orthogonal=_model_free_identifiability(reference)
+    message=joint.message
+    if orthogonal<0.05:
+        message+=("; local/nonlocal decomposition is poorly identifiable: "
+                  "less than 5% of Y variance is orthogonal to K2,K4")
+    success=bool(joint.success and target_diagnostics.poor_support_fraction<0.5 and
+                 rank==len(coefficients) and orthogonal>=0.05)
+    return ModelFreeNonlocalResult(
+        float(coefficients[0]),float(coefficients[1]),radial_coefficients,
+        radial_basis,reference,target,joint,beta_reference,beta_target,corrected,
+        float(log_normalizer),reference_diagnostics,target_diagnostics,rank,singular,condition,
+        correlation,orthogonal,effective_sample_fraction(corrected),
+        controls.nonlocal_ridge,controls.nonlocal_smoothness,success,message)
+
+
+def evaluate_model_free_marginal_free_energy(result: ModelFreeNonlocalResult,
+        state: ArrayLike,
+        model_free_config: ModelFreeNonlocalConfig|None=None
+        ) -> tuple[FloatArray,ConditionalAverageDiagnostics]:
+    """Evaluate the centered derived marginal correction at normalized X."""
+    support_radius=float(weighted_quantile(
+        result.reference_conditional_diagnostics.support_distance,
+        (0.0,0.995),result.reference_table.weights)[1])
+    raw,diagnostics=conditional_model_free_energy(
+        result.reference_table,result.nonlocal_coefficients,state,
+        model_free_config,support_radius)
+    return raw+result.conditional_log_normalizer,diagnostics
 
 
 def fit_independent_maximum_entropy(reference: LocalGeometrySample,
@@ -2911,6 +3467,167 @@ def relative_yukawa_parameters(delta_c2_kref: ArrayLike,
     return np.asarray(g/float(g0)),np.asarray(d/float(d0))
 
 
+def _positive_yukawa_roots(target_a_kref: float, target_b_kref3: float,
+        ell_kref: float, d_kref_bounds: tuple[float,float],
+        root_scan_points: int, root_tolerance: float) -> FloatArray:
+    """Find every resolved positive range root on one explicit log interval."""
+    lower,upper=(float(value) for value in d_kref_bounds)
+    if (not np.isfinite(lower) or not np.isfinite(upper) or
+            lower<=0 or upper<=lower):
+        raise ValueError("d_kref_bounds must be finite, positive, and ordered")
+    if root_scan_points<33 or root_tolerance<=0:
+        raise ValueError("root_scan_points must be at least 33 and tolerance positive")
+    if target_a_kref<=0 or target_b_kref3<=0 or ell_kref<=0:
+        return np.empty(0,dtype=float)
+
+    def residual(log_d: float) -> float:
+        distance=float(np.exp(log_d))
+        f2,f4=yukawa_cutoff_factors(ell_kref/distance)
+        fourth=float(f4)
+        if not np.isfinite(fourth) or fourth<=np.finfo(float).tiny:
+            return np.nan
+        return (target_b_kref3*float(f2)/(8*distance**2*fourth)
+                -target_a_kref)
+
+    log_grid=np.linspace(np.log(lower),np.log(upper),root_scan_points)
+    values=np.asarray([residual(value) for value in log_grid])
+    scale=max(abs(target_a_kref),abs(target_b_kref3),1.0)
+    candidates=[]
+    close=np.flatnonzero(np.isfinite(values)&(np.abs(values)<=root_tolerance*scale))
+    candidates.extend(log_grid[index] for index in close)
+    for index in range(len(log_grid)-1):
+        left,right=values[index:index+2]
+        if not np.isfinite(left) or not np.isfinite(right) or left*right>=0:
+            continue
+        candidates.append(brentq(
+            residual,log_grid[index],log_grid[index+1],
+            xtol=root_tolerance,rtol=max(root_tolerance,4*np.finfo(float).eps),
+            maxiter=200))
+    if not candidates:
+        return np.empty(0,dtype=float)
+    roots=[]
+    for value in sorted(float(np.exp(candidate)) for candidate in candidates):
+        if not roots or not np.isclose(value,roots[-1],rtol=1e-7,atol=0.0):
+            roots.append(value)
+    return np.asarray(roots,dtype=float)
+
+
+def interaction_path_from_reference(g0_over_kref: float, d0_kref: float,
+        concentration_mM: ArrayLike, delta_c2_kref: ArrayLike,
+        delta_c4_kref3: ArrayLike, k_eff: ArrayLike,
+        reference_concentration_mM: float=0.0,
+        local_expansion_range_multiplier: float=1.0,
+        cutoff_mode: str="finite_cutoff",
+        d_kref_bounds: tuple[float,float]=(1e-3,100.0),
+        root_scan_points: int=4097, root_tolerance: float=1e-10,
+        reconstruction_tolerance: float=1e-8) -> InteractionPathResult:
+    """Construct a finite-cutoff ``(g,D)`` salt path from relative coefficients.
+
+    The fitted coefficient changes remain independent of the assumed reference.
+    Only this downstream mapping uses ``g0/k_ref`` and ``D0*k_ref``, where
+    ``k_ref`` is the fitted effective wavevector at the reference condition.
+    Every resolved positive finite-cutoff root inside ``d_kref_bounds`` is
+    retained. ``cutoff_mode='short_range'`` instead sets ``f2=f4=1`` and
+    solves analytically; it is a separately labelled diagnostic valid when
+    the interaction range is small compared with the local cutoff.
+    """
+    salts,delta2,delta4,wavevectors=(np.asarray(value,dtype=float) for value in (
+        concentration_mM,delta_c2_kref,delta_c4_kref3,k_eff))
+    if (salts.ndim!=1 or len(salts)==0 or any(
+            value.shape!=salts.shape for value in (delta2,delta4,wavevectors))):
+        raise ValueError("salt, coefficient, and k_eff arrays must be aligned 1D arrays")
+    if (np.any(~np.isfinite(salts)) or np.any(~np.isfinite(delta2)) or
+            np.any(~np.isfinite(delta4)) or np.any(~np.isfinite(wavevectors)) or
+            np.any(wavevectors<=0)):
+        raise ValueError("path inputs must be finite with positive k_eff")
+    if (not np.isfinite(g0_over_kref) or not np.isfinite(d0_kref) or
+            g0_over_kref<=0 or d0_kref<=0 or
+            not np.isfinite(local_expansion_range_multiplier) or
+            local_expansion_range_multiplier<=0 or reconstruction_tolerance<=0):
+        raise ValueError("reference interaction and numerical scales must be positive")
+    if cutoff_mode not in {"finite_cutoff","short_range"}:
+        raise ValueError("cutoff_mode must be 'finite_cutoff' or 'short_range'")
+    reference_indices=np.flatnonzero(np.isclose(
+        salts,reference_concentration_mM,rtol=0.0,atol=1e-12))
+    if len(reference_indices)!=1:
+        raise ValueError("exactly one reference concentration must be present")
+    reference_index=int(reference_indices[0])
+    if (abs(delta2[reference_index])>reconstruction_tolerance or
+            abs(delta4[reference_index])>reconstruction_tolerance):
+        raise ValueError("reference-condition coefficient changes must be zero")
+    order=np.argsort(salts)
+    salts,delta2,delta4,wavevectors=(value[order] for value in
+        (salts,delta2,delta4,wavevectors))
+    reference_index=int(np.flatnonzero(np.isclose(
+        salts,reference_concentration_mM,rtol=0.0,atol=1e-12))[0])
+    reference_k_eff=float(wavevectors[reference_index])
+    ell0_kref=float(local_expansion_range_multiplier)
+    if cutoff_mode=="finite_cutoff":
+        a0,b0=yukawa_dimensionless_coefficients(
+            g0_over_kref,d0_kref,ell0_kref)
+    else:
+        a0=g0_over_kref*d0_kref**2/8
+        b0=g0_over_kref*d0_kref**4
+    a0=float(a0); b0=float(b0)
+    points=[]
+    for salt,change2,change4,condition_k_eff in zip(
+            salts,delta2,delta4,wavevectors):
+        ell_kref=float(
+            local_expansion_range_multiplier*reference_k_eff/condition_k_eff)
+        if np.isclose(salt,reference_concentration_mM,rtol=0.0,atol=1e-12):
+            strengths=np.asarray([g0_over_kref],dtype=float)
+            ranges=np.asarray([d0_kref],dtype=float)
+            status="reference"
+            maximum_residual=0.0
+        else:
+            target_a=a0+float(change2); target_b=b0+float(change4)
+            if cutoff_mode=="finite_cutoff":
+                ranges=_positive_yukawa_roots(
+                    target_a,target_b,ell_kref,d_kref_bounds,
+                    root_scan_points,root_tolerance)
+            elif target_a>0 and target_b>0:
+                ranges=np.asarray([np.sqrt(target_b/(8*target_a))])
+            else:
+                ranges=np.empty(0,dtype=float)
+            strengths=[]; accepted_ranges=[]; residuals=[]
+            for distance in ranges:
+                if cutoff_mode=="finite_cutoff":
+                    _,f4=yukawa_cutoff_factors(ell_kref/distance)
+                    fourth=float(f4)
+                    if fourth<=0:
+                        continue
+                    strength=target_b/(distance**4*fourth)
+                    reconstructed_a,reconstructed_b=yukawa_dimensionless_coefficients(
+                        strength,distance,ell_kref)
+                else:
+                    strength=target_b/distance**4
+                    reconstructed_a=strength*distance**2/8
+                    reconstructed_b=strength*distance**4
+                if not np.isfinite(strength) or strength<=0:
+                    continue
+                errors=np.abs(np.asarray([
+                    float(reconstructed_a)-a0-float(change2),
+                    float(reconstructed_b)-b0-float(change4)]))
+                scale=np.maximum(np.abs(np.asarray([change2,change4])),1.0)
+                if np.max(errors/scale)>reconstruction_tolerance:
+                    continue
+                strengths.append(strength); accepted_ranges.append(distance)
+                residuals.append(float(np.max(errors)))
+            strengths=np.asarray(strengths,dtype=float)
+            ranges=np.asarray(accepted_ranges,dtype=float)
+            status={0:"no_physical_solution",1:"unique_solution"}.get(
+                len(ranges),"multiple_solutions")
+            maximum_residual=max(residuals) if residuals else np.nan
+        points.append(InteractionPathPoint(
+            float(salt),float(change2),float(change4),
+            float(condition_k_eff/reference_k_eff),ell_kref,
+            strengths,ranges,status,float(maximum_residual)))
+    return InteractionPathResult(
+        float(reference_concentration_mM),reference_k_eff,
+        float(g0_over_kref),float(d0_kref),a0,b0,
+        cutoff_mode,tuple(float(value) for value in d_kref_bounds),tuple(points))
+
+
 def short_range_relative_yukawa_parameters(delta_c2_kref: ArrayLike,
         delta_c4_kref3: ArrayLike, a0_kref: float,
         c4_0_kref3: float) -> tuple[FloatArray,FloatArray]:
@@ -3272,6 +3989,62 @@ def fit_nonlocal_corrected_maximum_entropy(trace: ContourTrace,
         physical,selected,np.asarray(ranges),np.asarray(strengths),condition,table,
         dependence,required,model,corrected_fit,beta_delta_f,corrected_base,
         np.asarray(history),converged)
+
+
+def fit_nonlocal_correction(reference_trace: ContourTrace,
+        reference_sample: LocalGeometrySample, target_sample: LocalGeometrySample,
+        k_ref: float, initial_delta_c2_kref: float,
+        initial_delta_c4_kref3: float, config: NonlocalConfig,
+        cell_length: float|None=None, nonlocal_method: str="yukawa",
+        target_trace: ContourTrace|None=None,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        **yukawa_options: object
+        ) -> NonlocalMaximumEntropyResult|ModelFreeNonlocalResult:
+    """Dispatch without changing the established Yukawa implementation.
+
+    The default path forwards the original arguments directly to
+    ``fit_nonlocal_corrected_maximum_entropy``.  ``model_free`` requires the
+    independently traced target state and performs one joint ``[K2,K4,Y]``
+    fit; the local sample arguments and initial coefficients remain in the
+    signature only so callers can switch methods without restructuring code.
+    """
+    method=str(nonlocal_method).lower()
+    if method=="yukawa":
+        return fit_nonlocal_corrected_maximum_entropy(
+            reference_trace,reference_sample,target_sample,k_ref,
+            initial_delta_c2_kref,initial_delta_c4_kref3,config,
+            cell_length=cell_length,**yukawa_options)
+    if method=="model_free":
+        if target_trace is None:
+            raise ValueError(
+                "target_trace is required when nonlocal_method='model_free'")
+        if yukawa_options:
+            unexpected=", ".join(sorted(yukawa_options))
+            raise ValueError(
+                f"Yukawa-only options are not accepted by model_free: {unexpected}")
+        return fit_model_free_nonlocal_correction(
+            reference_trace,target_trace,k_ref,config,model_free_config,
+            cell_length)
+    raise ValueError("nonlocal_method must be 'yukawa' or 'model_free'")
+
+
+def compare_nonlocal_corrections(
+        yukawa: NonlocalMaximumEntropyResult,
+        model_free: ModelFreeNonlocalResult) -> dict[str,object]:
+    """Compact same-pair comparison without conflating the result types."""
+    return {
+        "yukawa_delta_c2_kref":float(yukawa.corrected_fit.coefficients[0]),
+        "yukawa_delta_c4_kref3":float(yukawa.corrected_fit.coefficients[1]),
+        "yukawa_effective_fraction":float(
+            yukawa.corrected_fit.reference_effective_fraction),
+        "model_free_delta_c2_kref":model_free.delta_c2_kref,
+        "model_free_delta_c4_kref3":model_free.delta_c4_kref3,
+        "model_free_effective_fraction":model_free.effective_sample_fraction,
+        "model_free_condition_number":model_free.joint_feature_condition_number,
+        "model_free_orthogonal_y_fraction":model_free.nonlocal_orthogonal_variance_fraction,
+        "model_free_target_poor_support_fraction":(
+            model_free.target_conditional_diagnostics.poor_support_fraction),
+    }
 
 
 def fit_relative_nonlocal_correction(trace: ContourTrace,
