@@ -32,6 +32,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy.fft import irfft, next_fast_len, rfft
 from scipy.interpolate import CubicSpline
 from scipy.linalg import expm
 from scipy.optimize import brentq, minimize
@@ -90,7 +91,7 @@ class InteractionComparisonPair:
 
 @dataclass(frozen=True)
 class LocalGeometrySample:
-    """Coarea-weighted samples of X=(kappa,kappa_prime,kappa*tau)."""
+    """Coarea-weighted local geometry with optional tangent orientation P2."""
 
     kappa: FloatArray
     kappa_prime: FloatArray
@@ -99,6 +100,7 @@ class LocalGeometrySample:
     k_eff: float
     stable_fraction: float = 1.0
     mean_jacobian_dimensionless: float = np.nan
+    tangent_p2: FloatArray | None = None
 
     def __post_init__(self) -> None:
         arrays = tuple(np.asarray(value, dtype=float) for value in (
@@ -117,6 +119,15 @@ class LocalGeometrySample:
         object.__setattr__(self, "kappa_prime", arrays[1])
         object.__setattr__(self, "kappa_tau", arrays[2])
         object.__setattr__(self, "weights", arrays[3] / np.sum(arrays[3]))
+        if self.tangent_p2 is not None:
+            tangent_p2 = np.asarray(self.tangent_p2, dtype=float)
+            if (tangent_p2.ndim != 1 or len(tangent_p2) != size or
+                    np.any(~np.isfinite(tangent_p2))):
+                raise ValueError("tangent_p2 must be a finite 1D array aligned with samples")
+            tolerance = 1e-12
+            if np.any(tangent_p2 < -0.5-tolerance) or np.any(tangent_p2 > 1+tolerance):
+                raise ValueError("tangent_p2 must lie in [-0.5,1]")
+            object.__setattr__(self, "tangent_p2", np.clip(tangent_p2, -0.5, 1.0))
 
     @property
     def state(self) -> FloatArray:
@@ -131,6 +142,7 @@ class LocalGeometrySample:
 class TraceConfig:
     grid_size: int = 64
     num_blocks: int = 1
+    block_overlap: int = 0
     num_modes: int = 256
     trace_k0: float = 5.0
     random_seed: int = 894894
@@ -140,6 +152,8 @@ class TraceConfig:
     def __post_init__(self) -> None:
         if self.grid_size < 8 or self.num_blocks < 1 or self.num_modes < 8:
             raise ValueError("trace counts are too small")
+        if self.block_overlap < 0 or self.block_overlap >= self.grid_size:
+            raise ValueError("block_overlap must lie in [0, grid_size)")
         if self.trace_k0 <= 0 or self.seed_spacing <= 0 or self.q_spacing <= 0:
             raise ValueError("trace scales must be positive")
 
@@ -170,6 +184,419 @@ class ContourTrace:
     @property
     def physical_spacing(self) -> float:
         return self.q_spacing / self.k_eff
+
+
+@dataclass(frozen=True)
+class TangentTrace:
+    """Uniform-arclength contour coordinates and unit tangents only."""
+
+    points: tuple[FloatArray, ...]
+    tangents: tuple[FloatArray, ...]
+    k_eff: float
+    q_spacing: float
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.points or len(self.points) != len(self.tangents):
+            raise ValueError("trace points and tangents must be nonempty and aligned")
+        for points, tangents in zip(self.points, self.tangents):
+            points = np.asarray(points, dtype=float)
+            tangents = np.asarray(tangents, dtype=float)
+            if points.ndim != 2 or points.shape[1] != 3 or tangents.shape != points.shape:
+                raise ValueError("trace arrays must have aligned shape (n,3)")
+            if len(points) == 0 or np.any(~np.isfinite(points)) or np.any(~np.isfinite(tangents)):
+                raise ValueError("trace arrays must be nonempty and finite")
+        if self.k_eff <= 0 or self.q_spacing <= 0:
+            raise ValueError("trace k_eff and q_spacing must be positive")
+
+    @property
+    def physical_spacing(self) -> float:
+        return self.q_spacing / self.k_eff
+
+
+def contour_tangent_correlation(trace: ContourTrace | TangentTrace,
+        max_separation: float | None = None,
+        minimum_pairs: int = 1) -> Mapping[str, FloatArray | IntArray]:
+    """Return the signed tangent correlation at same-contour arclength lags.
+
+    ``trace`` must be uniformly sampled in physical arclength, as produced by
+    :func:`build_isotropic_trace` or :func:`transform_contour_trace`.  Pairs
+    never cross contour boundaries, and no periodic closure is imposed.  The
+    result contains physical separation, dimensionless separation ``s*k_eff``,
+    the pair-weighted mean tangent dot product, and the contributing pair count.
+    """
+    if isinstance(minimum_pairs, bool) or int(minimum_pairs) != minimum_pairs:
+        raise ValueError("minimum_pairs must be a positive integer")
+    minimum_pairs = int(minimum_pairs)
+    if minimum_pairs < 1:
+        raise ValueError("minimum_pairs must be a positive integer")
+    if max_separation is not None:
+        max_separation = float(max_separation)
+        if not np.isfinite(max_separation) or max_separation < 0:
+            raise ValueError("max_separation must be finite and nonnegative")
+
+    unit_tangents = []
+    for tangent in trace.tangents:
+        values = np.asarray(tangent, dtype=float)
+        norms = np.linalg.norm(values, axis=1)
+        if np.any(~np.isfinite(norms)) or np.any(norms <= 0):
+            raise ValueError("trace tangents must be finite and nonzero")
+        unit_tangents.append(values / norms[:, None])
+
+    available_lag = max(len(values)-1 for values in unit_tangents)
+    if max_separation is None:
+        maximum_lag = available_lag
+    else:
+        maximum_lag = min(
+            available_lag,
+            int(np.floor(max_separation / trace.physical_spacing + 1e-12)),
+        )
+
+    total = np.zeros(maximum_lag+1, dtype=float)
+    pair_count = np.zeros(maximum_lag+1, dtype=np.int64)
+    for tangent in unit_tangents:
+        local_maximum_lag = min(maximum_lag, len(tangent)-1)
+        transform_length = next_fast_len(2*len(tangent)-1)
+        spectrum = rfft(tangent, n=transform_length, axis=0)
+        autocorrelation = irfft(
+            np.sum(spectrum.conjugate()*spectrum, axis=1),
+            n=transform_length,
+        )[:local_maximum_lag+1]
+        total[:local_maximum_lag+1] += autocorrelation
+        pair_count[:local_maximum_lag+1] += (
+            len(tangent)-np.arange(local_maximum_lag+1)
+        )
+    correlation = np.divide(
+        total, pair_count, out=np.full_like(total, np.nan), where=pair_count > 0
+    )
+
+    keep = pair_count >= minimum_pairs
+    if not np.any(keep):
+        raise RuntimeError("no arclength lag has the requested minimum pair count")
+    lags = np.arange(maximum_lag+1, dtype=float)[keep]
+    separation = lags * trace.physical_spacing
+    return {
+        "separation": separation,
+        "separation_k_eff": separation * trace.k_eff,
+        "correlation": correlation[keep],
+        "pair_count": pair_count[keep],
+    }
+
+
+def multiscale_contour_tangent_correlation(
+        trace: ContourTrace | TangentTrace,
+        max_separation: float | None = None,
+        linear_max_separation: float = 20.0,
+        lags_per_decade: int = 12,
+        max_pairs_per_lag: int | None = None,
+        minimum_available_pairs: int = 1,
+        ) -> Mapping[str, FloatArray | IntArray]:
+    """Estimate dense-short and logarithmically spaced long correlation lags.
+
+    Tangents remain evaluated on the original fine contour sampling.  All
+    short lags are retained linearly and longer lags are logarithmically
+    spaced.  With the default ``max_pairs_per_lag=None``, FFT
+    autocorrelations use every valid same-contour pair before the lag grid is
+    thinned; this is both statistically complete and efficient for long
+    contours.  A positive cap instead selects that many origins
+    systematically at each retained lag for memory-constrained applications.
+    """
+    if max_separation is not None:
+        max_separation = float(max_separation)
+        if not np.isfinite(max_separation) or max_separation < 0:
+            raise ValueError("max_separation must be finite and nonnegative")
+    linear_max_separation = float(linear_max_separation)
+    if not np.isfinite(linear_max_separation) or linear_max_separation < 0:
+        raise ValueError(
+            "linear_max_separation must be finite and nonnegative"
+        )
+    for value, name in ((lags_per_decade, "lags_per_decade"),
+                        (minimum_available_pairs, "minimum_available_pairs")):
+        if isinstance(value, bool) or int(value) != value or int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if (max_pairs_per_lag is not None
+            and (isinstance(max_pairs_per_lag, bool)
+                 or int(max_pairs_per_lag) != max_pairs_per_lag
+                 or int(max_pairs_per_lag) < 1)):
+        raise ValueError("max_pairs_per_lag must be None or a positive integer")
+    lags_per_decade = int(lags_per_decade)
+    if max_pairs_per_lag is not None:
+        max_pairs_per_lag = int(max_pairs_per_lag)
+    minimum_available_pairs = int(minimum_available_pairs)
+
+    if max_pairs_per_lag is None:
+        exact = contour_tangent_correlation(
+            trace,
+            max_separation=max_separation,
+            minimum_pairs=minimum_available_pairs,
+        )
+        exact_lags = np.rint(
+            exact["separation"]/trace.physical_spacing
+        ).astype(np.int64)
+        maximum_lag = int(exact_lags[-1])
+        linear_maximum_lag = min(
+            maximum_lag,
+            int(np.floor(
+                linear_max_separation/trace.physical_spacing + 1e-12
+            )),
+        )
+        lag_parts = [np.arange(linear_maximum_lag+1, dtype=np.int64)]
+        logarithmic_start = linear_maximum_lag+1
+        if logarithmic_start <= maximum_lag:
+            decades = np.log10(maximum_lag/logarithmic_start)
+            count = max(2, int(np.ceil(decades*lags_per_decade))+1)
+            lag_parts.append(np.unique(np.rint(np.geomspace(
+                logarithmic_start, maximum_lag, count
+            )).astype(np.int64)))
+        retained_lags = np.unique(np.concatenate(lag_parts))
+        position = np.searchsorted(exact_lags, retained_lags)
+        pair_count = np.asarray(exact["pair_count"])[position]
+        return {
+            "separation": np.asarray(exact["separation"])[position],
+            "separation_k_eff": np.asarray(
+                exact["separation_k_eff"]
+            )[position],
+            "correlation": np.asarray(exact["correlation"])[position],
+            "pair_count": pair_count,
+            "available_pair_count": pair_count.copy(),
+        }
+
+    unit_tangents = []
+    for tangent in trace.tangents:
+        values = np.asarray(tangent, dtype=float)
+        norm = np.linalg.norm(values, axis=1)
+        if np.any(~np.isfinite(norm)) or np.any(norm <= 0):
+            raise ValueError("trace tangents must be finite and nonzero")
+        unit_tangents.append(values/norm[:, None])
+    packed_tangents = np.concatenate(unit_tangents, axis=0)
+    contour_offsets = np.concatenate((
+        np.zeros(1, dtype=np.int64),
+        np.cumsum(
+            [len(values) for values in unit_tangents], dtype=np.int64
+        )[:-1],
+    ))
+    available_lag = max(len(values)-1 for values in unit_tangents)
+    if max_separation is None:
+        maximum_lag = available_lag
+    else:
+        maximum_lag = min(
+            available_lag,
+            int(np.floor(max_separation/trace.physical_spacing + 1e-12)),
+        )
+    linear_maximum_lag = min(
+        maximum_lag,
+        int(np.floor(
+            linear_max_separation/trace.physical_spacing + 1e-12
+        )),
+    )
+    lag_parts = [np.arange(linear_maximum_lag+1, dtype=np.int64)]
+    logarithmic_start = linear_maximum_lag+1
+    if logarithmic_start <= maximum_lag:
+        decades = np.log10(maximum_lag/logarithmic_start)
+        count = max(2, int(np.ceil(decades*lags_per_decade))+1)
+        lag_parts.append(np.unique(np.rint(np.geomspace(
+            logarithmic_start, maximum_lag, count
+        )).astype(np.int64)))
+    candidate_lags = np.unique(np.concatenate(lag_parts))
+
+    retained_lags = []
+    correlation = []
+    evaluated_count = []
+    available_count = []
+    lengths = np.asarray([len(values) for values in unit_tangents], dtype=np.int64)
+    for lag in candidate_lags:
+        local_available = np.maximum(lengths-lag, 0)
+        total_available = int(np.sum(local_available))
+        if total_available < minimum_available_pairs:
+            continue
+        count = min(total_available, max_pairs_per_lag)
+        if count == total_available:
+            packed_index = np.arange(total_available, dtype=np.int64)
+        else:
+            packed_index = np.floor(
+                (np.arange(count, dtype=float)+0.5)*total_available/count
+            ).astype(np.int64)
+        cumulative = np.cumsum(local_available)
+        contour_index = np.searchsorted(cumulative, packed_index, side="right")
+        previous = np.where(
+            contour_index > 0, cumulative[contour_index-1], 0
+        )
+        local_index = packed_index-previous
+        packed_origin = contour_offsets[contour_index]+local_index
+        dot_sum = float(np.sum(np.einsum(
+            "ij,ij->i",
+            packed_tangents[packed_origin],
+            packed_tangents[packed_origin+lag],
+        )))
+        retained_lags.append(lag)
+        correlation.append(dot_sum/count)
+        evaluated_count.append(count)
+        available_count.append(total_available)
+    if not retained_lags:
+        raise RuntimeError("no arclength lag has the requested available pairs")
+    retained_lags = np.asarray(retained_lags, dtype=float)
+    separation = retained_lags*trace.physical_spacing
+    return {
+        "separation": separation,
+        "separation_k_eff": separation*trace.k_eff,
+        "correlation": np.asarray(correlation),
+        "pair_count": np.asarray(evaluated_count, dtype=np.int64),
+        "available_pair_count": np.asarray(available_count, dtype=np.int64),
+    }
+
+
+def log_binned_replicate_correlation(separation: ArrayLike,
+        correlation_by_replicate: ArrayLike, pair_count_by_replicate: ArrayLike,
+        *, bins_per_decade: int = 12,
+        separation_range: tuple[float, float] | None = None
+        ) -> Mapping[str, FloatArray | IntArray]:
+    """Pool nearby lags while retaining independent-replicate uncertainty.
+
+    Correlations within each logarithmic bin are weighted by their contributing
+    same-contour pair counts.  Replicates are binned separately before their
+    mean and standard error are calculated, so the many tangent pairs in one
+    random-wave field are not treated as independent realizations.
+    """
+    x = np.asarray(separation, dtype=float)
+    values = np.asarray(correlation_by_replicate, dtype=float)
+    weights = np.asarray(pair_count_by_replicate, dtype=float)
+    if x.ndim != 1 or len(x) < 2 or np.any(~np.isfinite(x)):
+        raise ValueError("separation must be a finite 1D array")
+    if values.ndim != 2 or values.shape[1] != len(x):
+        raise ValueError(
+            "correlation_by_replicate must have shape (replicate, separation)"
+        )
+    if weights.ndim == 1:
+        weights = np.broadcast_to(weights, values.shape)
+    if weights.shape != values.shape:
+        raise ValueError("pair counts must be aligned with correlations")
+    if np.any(~np.isfinite(weights)) or np.any(weights < 0):
+        raise ValueError("pair counts must be finite and nonnegative")
+    if (isinstance(bins_per_decade, bool)
+            or int(bins_per_decade) != bins_per_decade
+            or int(bins_per_decade) < 1):
+        raise ValueError("bins_per_decade must be a positive integer")
+    bins_per_decade = int(bins_per_decade)
+    positive = x > 0
+    if separation_range is None:
+        if not np.any(positive):
+            raise ValueError("at least one separation must be positive")
+        lower = float(np.min(x[positive]))
+        upper = float(np.max(x[positive]))
+    else:
+        lower, upper = map(float, separation_range)
+        if (not np.isfinite(lower) or not np.isfinite(upper)
+                or lower <= 0 or upper <= lower):
+            raise ValueError("separation_range must be finite, positive, and ordered")
+    lower_log = np.floor(bins_per_decade*np.log10(lower))/bins_per_decade
+    upper_log = np.ceil(bins_per_decade*np.log10(upper))/bins_per_decade
+    edge_count = max(2, int(round(
+        (upper_log-lower_log)*bins_per_decade
+    ))+1)
+    edges = np.logspace(lower_log, upper_log, edge_count)
+
+    binned_values = []
+    binned_weights = []
+    centres = []
+    for bin_index, (left, right) in enumerate(zip(edges[:-1], edges[1:])):
+        if bin_index == len(edges)-2:
+            keep = positive & (x >= max(left, lower)) & (x <= min(right, upper))
+        else:
+            keep = positive & (x >= max(left, lower)) & (x < min(right, upper))
+        if not np.any(keep):
+            continue
+        local_values = values[:, keep]
+        local_weights = weights[:, keep]
+        usable = np.isfinite(local_values) & (local_weights > 0)
+        weighted_sum = np.sum(
+            np.where(usable, local_values*local_weights, 0.0), axis=1
+        )
+        weight_sum = np.sum(np.where(usable, local_weights, 0.0), axis=1)
+        replicate_value = np.divide(
+            weighted_sum, weight_sum,
+            out=np.full(values.shape[0], np.nan), where=weight_sum > 0,
+        )
+        total_lag_weight = np.sum(local_weights, axis=0)
+        if np.sum(total_lag_weight) <= 0:
+            continue
+        centre = np.exp(np.average(np.log(x[keep]), weights=total_lag_weight))
+        centres.append(centre)
+        binned_values.append(replicate_value)
+        binned_weights.append(weight_sum)
+    if not binned_values:
+        raise RuntimeError("no populated logarithmic correlation bin")
+
+    by_replicate = np.stack(binned_values, axis=1)
+    weight_by_replicate = np.stack(binned_weights, axis=1)
+    replicate_count = np.sum(np.isfinite(by_replicate), axis=0).astype(np.int64)
+    mean = np.nanmean(by_replicate, axis=0)
+    standard_error = np.full_like(mean, np.nan)
+    multiple = replicate_count > 1
+    standard_error[multiple] = (
+        np.nanstd(by_replicate[:, multiple], axis=0, ddof=1)
+        / np.sqrt(replicate_count[multiple])
+    )
+    return {
+        "separation": np.asarray(centres),
+        "correlation": mean,
+        "standard_error": standard_error,
+        "correlation_by_replicate": by_replicate,
+        "pair_count": np.sum(weight_by_replicate, axis=0).astype(np.int64),
+        "replicate_count": replicate_count,
+    }
+
+
+def local_power_law_exponent(coordinate: ArrayLike, value: ArrayLike,
+        log_half_window: float = 0.3, minimum_points: int = 9) -> FloatArray:
+    """Estimate ``-d log(value)/d log(coordinate)`` by local linear fits.
+
+    Nonpositive or nonfinite samples are omitted rather than transformed.  A
+    logarithmic coordinate window gives comparable slope resolution across
+    decades; estimates without enough neighbors are returned as ``nan``.
+    """
+    x=np.asarray(coordinate,dtype=float); y=np.asarray(value,dtype=float)
+    if x.ndim!=1 or y.shape!=x.shape or len(x)<2:
+        raise ValueError("coordinate and value must be aligned 1D arrays")
+    if not np.isfinite(log_half_window) or log_half_window<=0:
+        raise ValueError("log_half_window must be finite and positive")
+    if isinstance(minimum_points,bool) or int(minimum_points)!=minimum_points:
+        raise ValueError("minimum_points must be an integer")
+    minimum_points=int(minimum_points)
+    if minimum_points<3:
+        raise ValueError("minimum_points must be at least three")
+    valid=np.isfinite(x)&np.isfinite(y)&(x>0)&(y>0)
+    if np.any(np.diff(x[valid])<=0):
+        raise ValueError("positive finite coordinates must be strictly increasing")
+    output=np.full(len(x),np.nan,dtype=float)
+    indices=np.flatnonzero(valid)
+    log_x=np.log(x[valid]); log_y=np.log(y[valid])
+    for local_index,global_index in enumerate(indices):
+        keep=np.abs(log_x-log_x[local_index])<=log_half_window
+        if np.count_nonzero(keep)>=minimum_points:
+            output[global_index]=-np.polyfit(log_x[keep],log_y[keep],1)[0]
+    return output
+
+
+def first_exponent_crossover(coordinate: ArrayLike, exponent: ArrayLike,
+        target: float, minimum_coordinate: float = 0.0) -> float:
+    """Interpolate the first upward crossing of a target local exponent."""
+    x=np.asarray(coordinate,dtype=float); beta=np.asarray(exponent,dtype=float)
+    if x.ndim!=1 or beta.shape!=x.shape:
+        raise ValueError("coordinate and exponent must be aligned 1D arrays")
+    if not np.isfinite(target) or not np.isfinite(minimum_coordinate):
+        raise ValueError("target and minimum_coordinate must be finite")
+    valid=np.isfinite(x)&np.isfinite(beta)&(x>max(0.0,minimum_coordinate))
+    indices=np.flatnonzero(valid)
+    if len(indices)<2:
+        return np.nan
+    for first,second in zip(indices[:-1],indices[1:]):
+        if second!=first+1:
+            continue
+        lower=beta[first]-target; upper=beta[second]-target
+        if lower<=0<upper:
+            fraction=-lower/(upper-lower)
+            return float(np.exp(np.log(x[first])+fraction*(np.log(x[second])-np.log(x[first]))))
+    return np.nan
 
 
 @dataclass(frozen=True)
@@ -909,7 +1336,7 @@ NOTE_FUNCTION_MAP = {
     "section_3_nonlocal_dependence": "absolute_nonlocal_energy_density, relative_nonlocal_cell_hamiltonian, svd_retained_variance, assess_nonlocal_dependence",
     "section_4_conditional_nonlocal_free_energy": "fit_conditional_nonlocal_weight, fit_direct_nonlocal_change_correction",
     "section_5_zero_salt_reweighting": "fit_linked_maximum_entropy, fit_independent_maximum_entropy, fit_local_cell_reweighting, fit_contour_reweighting",
-    "section_6_numerical_procedure": "build_isotropic_trace, run_trace_convergence_sweep",
+    "section_6_numerical_procedure": "build_isotropic_trace, contour_tangent_correlation, run_trace_convergence_sweep",
     "section_7_yukawa_parameters": "yukawa_cutoff_factors, solve_yukawa_change, yukawa_change_uncertainty",
     "isosurface_section_4_absolute_coefficients": "fit_absolute_local_free_energy, fit_density_of_states_corrected_free_energy, yukawa_parameter_curve",
     "isosurface_section_5_numerical_procedure": "sample_local_geometry_series, fit_absolute_local_free_energy, fit_density_of_states_corrected_free_energy, yukawa_parameter_curve",
@@ -1198,7 +1625,8 @@ def anisotropic_curve_jet(tangent: ArrayLike, r2: ArrayLike, r3: ArrayLike,
 def conditional_line_geometry(k_eff: float, r_sigma_k: float,
                               standard_normals: ArrayLike,
                               aniso: bool=False,
-                              H: ArrayLike|None=None) -> LocalGeometrySample:
+                              H: ArrayLike|None=None,
+                              alignment_axis: int=2) -> LocalGeometrySample:
     normals = np.asarray(standard_normals, dtype=float)
     expected = 2*len(NONZERO_INDICES)
     if normals.ndim != 2 or normals.shape[1] != expected:
@@ -1237,6 +1665,10 @@ def conditional_line_geometry(k_eff: float, r_sigma_k: float,
         jac=jac*line_factor
     elif H is not None:
         raise ValueError("H must be omitted when aniso=False")
+    if alignment_axis not in (0,1,2):
+        raise ValueError("alignment_axis must be 0, 1, or 2")
+    tangent_projection = tangent[:,alignment_axis]
+    tangent_p2 = 0.5*(3*tangent_projection**2-1)
     kappa0 = np.linalg.norm(r2,axis=1)
     normal_frame = np.zeros_like(r2)
     regular = kappa0 > 1e-10
@@ -1245,19 +1677,21 @@ def conditional_line_geometry(k_eff: float, r_sigma_k: float,
     return LocalGeometrySample(k_eff*kappa0,
         k_eff**2*np.einsum("ni,ni->n",normal_frame,r3),
         k_eff**2*np.einsum("ni,ni->n",binormal,r3), jac, k_eff,
-        float(np.mean(stable)), float(np.mean(jac)))
+        float(np.mean(stable)), float(np.mean(jac)), tangent_p2)
 
 
 def sample_local_geometry_series(spectra: Sequence[FitSpectrum], sample_power: int = 15,
                                  seed: int = 73129, aniso: bool=False,
-                                 H_by_concentration: Mapping[float,ArrayLike]|None=None
+                                 H_by_concentration: Mapping[float,ArrayLike]|None=None,
+                                 alignment_axis: int=2,
                                  ) -> dict[float, LocalGeometrySample]:
     normals = sobol_standard_normals(sample_power,seed)
     if not aniso:
         if H_by_concentration is not None:
             raise ValueError("H_by_concentration must be omitted when aniso=False")
         return {row.concentration_mM: conditional_line_geometry(
-            row.k_eff,row.r_sigma_k,normals) for row in spectra}
+            row.k_eff,row.r_sigma_k,normals,alignment_axis=alignment_axis)
+            for row in spectra}
     if H_by_concentration is None:
         raise ValueError("H_by_concentration is required when aniso=True")
     missing=[row.concentration_mM for row in spectra
@@ -1265,7 +1699,8 @@ def sample_local_geometry_series(spectra: Sequence[FitSpectrum], sample_power: i
     if missing:
         raise ValueError(f"missing H tensors for concentrations {missing}")
     return {row.concentration_mM: conditional_line_geometry(
-        row.k_eff,row.r_sigma_k,normals,True,H_by_concentration[row.concentration_mM])
+        row.k_eff,row.r_sigma_k,normals,True,H_by_concentration[row.concentration_mM],
+        alignment_axis)
         for row in spectra}
 
 
@@ -1585,6 +2020,59 @@ def unpacked_cells(points: ArrayLike, offsets: ArrayLike) -> tuple[FloatArray,..
     return tuple(values[bounds[i]:bounds[i+1]] for i in range(len(bounds)-1))
 
 
+def save_tangent_trace_cache(path: Path, trace: TangentTrace,
+        config: TraceConfig, spectrum: FitSpectrum) -> None:
+    """Save the lightweight trace used only for tangent correlations."""
+    points, offsets = packed_cells(trace.points)
+    tangents, _ = packed_cells(trace.tangents)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path, points=points, tangents=tangents, offsets=offsets,
+        trace_k_eff=trace.k_eff, q_spacing=trace.q_spacing,
+        grid_size=config.grid_size, num_blocks=config.num_blocks,
+        block_overlap=config.block_overlap, num_modes=config.num_modes,
+        trace_k0=config.trace_k0, random_seed=config.random_seed,
+        seed_spacing=config.seed_spacing,
+        spectrum_concentration_mM=spectrum.concentration_mM,
+        spectrum_k_eff=spectrum.k_eff,
+        spectrum_r_sigma_k=spectrum.r_sigma_k,
+    )
+
+
+def load_tangent_trace_cache(path: Path, config: TraceConfig,
+        spectrum: FitSpectrum) -> TangentTrace | None:
+    """Load a compatible lightweight trace, or return ``None``."""
+    if not Path(path).exists():
+        return None
+    with np.load(path, allow_pickle=False) as saved:
+        matches = (
+            int(saved["grid_size"]) == config.grid_size
+            and int(saved["num_blocks"]) == config.num_blocks
+            and int(saved["block_overlap"]) == config.block_overlap
+            and int(saved["num_modes"]) == config.num_modes
+            and np.isclose(float(saved["trace_k0"]), config.trace_k0)
+            and int(saved["random_seed"]) == config.random_seed
+            and np.isclose(float(saved["seed_spacing"]), config.seed_spacing)
+            and np.isclose(float(saved["q_spacing"]), config.q_spacing)
+            and np.isclose(float(saved["spectrum_concentration_mM"]), spectrum.concentration_mM)
+            and np.isclose(float(saved["spectrum_k_eff"]), spectrum.k_eff)
+            and np.isclose(float(saved["spectrum_r_sigma_k"]), spectrum.r_sigma_k)
+        )
+        if not matches:
+            return None
+        offsets = np.asarray(saved["offsets"], dtype=int)
+        return TangentTrace(
+            unpacked_cells(saved["points"], offsets),
+            unpacked_cells(saved["tangents"], offsets),
+            float(saved["trace_k_eff"]), float(saved["q_spacing"]),
+            {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+             "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+             "random_seed": config.random_seed,
+             "concentration_mM": spectrum.concentration_mM,
+             "r_sigma_k": spectrum.r_sigma_k},
+        )
+
+
 def save_trace_cache(path: Path, trace: ContourTrace, config: TraceConfig,
                      spectrum: FitSpectrum|None=None) -> None:
     points, offsets = packed_cells(trace.points)
@@ -1596,8 +2084,11 @@ def save_trace_cache(path: Path, trace: ContourTrace, config: TraceConfig,
     hencky=np.asarray(trace.metadata.get("hencky_tensor",np.full((3,3),np.nan)),dtype=float)
     np.savez_compressed(path,points=points,tangents=tangents,r2=r2,r3=r3,offsets=offsets,
         trace_k_eff=trace.k_eff,q_spacing=trace.q_spacing,grid_size=config.grid_size,
-        num_blocks=config.num_blocks,num_modes=config.num_modes,trace_k0=config.trace_k0,
+        num_blocks=config.num_blocks,block_overlap=config.block_overlap,
+        num_modes=config.num_modes,trace_k0=config.trace_k0,
         random_seed=config.random_seed,seed_spacing=config.seed_spacing,
+        raw_trace_k_eff=float(trace.metadata.get("raw_trace_k_eff",np.nan)),
+        physical_length_scale=float(trace.metadata.get("physical_length_scale",np.nan)),
         anisotropic_geometry=anisotropic,hencky_tensor=hencky,
         spectrum_concentration_mM=np.nan if spectrum is None else spectrum.concentration_mM,
         spectrum_k_eff=np.nan if spectrum is None else spectrum.k_eff,
@@ -1609,8 +2100,11 @@ def load_trace_cache(path: Path, config: TraceConfig,
     if not Path(path).exists():
         return None
     with np.load(path,allow_pickle=False) as saved:
+        saved_overlap=(int(saved["block_overlap"])
+                       if "block_overlap" in saved.files else 0)
         matches = (int(saved["grid_size"])==config.grid_size and
             int(saved["num_blocks"])==config.num_blocks and
+            saved_overlap==config.block_overlap and
             int(saved["num_modes"])==config.num_modes and
             np.isclose(float(saved["trace_k0"]),config.trace_k0) and
             int(saved["random_seed"])==config.random_seed and
@@ -1629,7 +2123,13 @@ def load_trace_cache(path: Path, config: TraceConfig,
             return None
         offsets = np.asarray(saved["offsets"],dtype=int)
         metadata={"grid_size":config.grid_size,"num_modes":config.num_modes,
+                  "num_blocks":config.num_blocks,"block_overlap":config.block_overlap,
                   "random_seed":config.random_seed}
+        if "raw_trace_k_eff" in saved.files and np.isfinite(saved["raw_trace_k_eff"]):
+            metadata["raw_trace_k_eff"]=float(saved["raw_trace_k_eff"])
+        if ("physical_length_scale" in saved.files and
+                np.isfinite(saved["physical_length_scale"])):
+            metadata["physical_length_scale"]=float(saved["physical_length_scale"])
         if "anisotropic_geometry" in saved.files and bool(saved["anisotropic_geometry"]):
             metadata["anisotropic_geometry"]=True
             metadata["hencky_tensor"]=np.asarray(saved["hencky_tensor"],dtype=float).tolist()
@@ -1656,18 +2156,54 @@ def resample_contour_by_arclength(points: ArrayLike, spacing: float) -> FloatArr
                             for axis in range(3)])
 
 
+def resample_polyline_by_arclength(points: ArrayLike, spacing: float) -> FloatArray:
+    """Linearly resample a polyline at uniform arclength spacing."""
+    coordinates = np.asarray(points, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 3 or len(coordinates) < 2:
+        raise ValueError("points must have shape (n>=2,3)")
+    if not np.isfinite(spacing) or spacing <= 0:
+        raise ValueError("spacing must be finite and positive")
+    lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+    coordinates = coordinates[np.concatenate(([True], lengths > 1e-12))]
+    if len(coordinates) < 2:
+        raise ValueError("too few distinct points")
+    arclength = np.concatenate(([0.0], np.cumsum(
+        np.linalg.norm(np.diff(coordinates, axis=0), axis=1))))
+    sample_s = np.arange(0.0, arclength[-1], spacing)
+    if len(sample_s) < 3:
+        raise ValueError("contour is too short")
+    return np.column_stack([
+        np.interp(sample_s, arclength, coordinates[:, axis]) for axis in range(3)
+    ])
+
+
 def transform_contour_trace(trace: ContourTrace, H: ArrayLike,
                             spacing: float|None=None) -> ContourTrace:
-    """Affine-map a trace and rebuild its jet on physical-arclength samples."""
+    """Affine-map a trace and resample its exact jet at uniform arclength.
+
+    The input already carries analytic second and third arclength derivatives.
+    Transforming those derivatives with :func:`anisotropic_curve_jet` avoids the
+    severe endpoint artifacts produced by differentiating a natural cubic
+    spline.  The transformed jet is then linearly interpolated onto uniform
+    physical-arclength positions and its Frenet constraints are restored.
+    """
     tensor=validate_hencky_tensor(H); F=hencky_stretch_tensor(tensor)
     physical_spacing=trace.physical_spacing if spacing is None else float(spacing)
     if not np.isfinite(physical_spacing) or physical_spacing<=0:
         raise ValueError("spacing must be finite and positive")
     output_points=[]; output_tangent=[]; output_r2=[]; output_r3=[]
-    for points in trace.points:
+    for points,tangent,r2,r3 in zip(
+            trace.points,trace.tangents,trace.r2,trace.r3):
         transformed=np.asarray(points,dtype=float)@F.T
+        transformed_tangent,transformed_r2,transformed_r3,_=(
+            anisotropic_curve_jet(tangent,r2,r3,tensor)
+        )
         segments=np.linalg.norm(np.diff(transformed,axis=0),axis=1)
-        transformed=transformed[np.concatenate(([True],segments>1e-12))]
+        keep=np.concatenate(([True],segments>1e-12))
+        transformed=transformed[keep]
+        transformed_tangent=transformed_tangent[keep]
+        transformed_r2=transformed_r2[keep]
+        transformed_r3=transformed_r3[keep]
         if len(transformed)<4:
             continue
         source_s=np.concatenate(([0.0],np.cumsum(
@@ -1675,15 +2211,23 @@ def transform_contour_trace(trace: ContourTrace, H: ArrayLike,
         sample_s=np.arange(0.0,source_s[-1],physical_spacing)
         if len(sample_s)<4:
             continue
-        splines=[CubicSpline(source_s,transformed[:,axis],bc_type="natural")
-                 for axis in range(3)]
-        sampled=np.column_stack([spline(sample_s) for spline in splines])
-        first=np.column_stack([spline(sample_s,1) for spline in splines])
-        second=np.column_stack([spline(sample_s,2) for spline in splines])
-        third=np.column_stack([spline(sample_s,3) for spline in splines])
-        tangent,r2,r3,_=arclength_curve_jet(first,second,third)
-        output_points.append(sampled); output_tangent.append(tangent)
-        output_r2.append(r2); output_r3.append(r3)
+        def interpolate(values):
+            return np.column_stack([
+                np.interp(sample_s,source_s,values[:,axis]) for axis in range(3)
+            ])
+        sampled=interpolate(transformed)
+        sampled_tangent=interpolate(transformed_tangent)
+        sampled_tangent/=np.linalg.norm(sampled_tangent,axis=1)[:,None]
+        sampled_r2=interpolate(transformed_r2)
+        sampled_r2-=sampled_tangent*np.einsum(
+            "ni,ni->n",sampled_tangent,sampled_r2)[:,None]
+        sampled_r3=interpolate(transformed_r3)
+        sampled_r3+=sampled_tangent*(
+            -np.einsum("ni,ni->n",sampled_r2,sampled_r2)
+            -np.einsum("ni,ni->n",sampled_tangent,sampled_r3)
+        )[:,None]
+        output_points.append(sampled); output_tangent.append(sampled_tangent)
+        output_r2.append(sampled_r2); output_r3.append(sampled_r3)
     if not output_points:
         raise RuntimeError("no transformed contour is long enough to retain")
     metadata=dict(trace.metadata)
@@ -1692,6 +2236,50 @@ def transform_contour_trace(trace: ContourTrace, H: ArrayLike,
                      "stretch_tensor":F.tolist()})
     return ContourTrace(tuple(output_points),tuple(output_tangent),tuple(output_r2),
         tuple(output_r3),trace.k_eff,physical_spacing*trace.k_eff,metadata)
+
+
+def transform_tangent_trace(trace: TangentTrace, H: ArrayLike,
+        spacing: float | None = None) -> TangentTrace:
+    """Affine-map a lightweight trace and restore uniform physical arclength."""
+    tensor = validate_hencky_tensor(H)
+    F = hencky_stretch_tensor(tensor)
+    physical_spacing = trace.physical_spacing if spacing is None else float(spacing)
+    if not np.isfinite(physical_spacing) or physical_spacing <= 0:
+        raise ValueError("spacing must be finite and positive")
+    output_points = []
+    output_tangents = []
+    for points, source_tangent in zip(trace.points, trace.tangents):
+        transformed = np.asarray(points, dtype=float) @ F.T
+        transformed_tangent = np.asarray(source_tangent, dtype=float) @ F.T
+        segments = np.linalg.norm(np.diff(transformed, axis=0), axis=1)
+        keep = np.concatenate(([True], segments > 1e-12))
+        transformed = transformed[keep]
+        transformed_tangent = transformed_tangent[keep]
+        if len(transformed) < 4:
+            continue
+        source_s = np.concatenate(([0.0], np.cumsum(
+            np.linalg.norm(np.diff(transformed, axis=0), axis=1))))
+        sample_s = np.arange(0.0, source_s[-1], physical_spacing)
+        if len(sample_s) < 4:
+            continue
+        sampled = np.column_stack([
+            np.interp(sample_s, source_s, transformed[:, axis]) for axis in range(3)
+        ])
+        tangent = np.column_stack([
+            np.interp(sample_s, source_s, transformed_tangent[:, axis])
+            for axis in range(3)
+        ])
+        tangent /= np.linalg.norm(tangent, axis=1)[:, None]
+        output_points.append(sampled)
+        output_tangents.append(tangent)
+    if not output_points:
+        raise RuntimeError("no transformed contour is long enough to retain")
+    metadata = dict(trace.metadata)
+    metadata.update({"anisotropic_geometry": True,
+                     "hencky_tensor": tensor.tolist(),
+                     "stretch_tensor": F.tolist()})
+    return TangentTrace(tuple(output_points), tuple(output_tangents), trace.k_eff,
+                        physical_spacing*trace.k_eff, metadata)
 
 
 def trace_local_state(trace: ContourTrace, normalize: bool = False) -> tuple[FloatArray,...]:
@@ -1708,6 +2296,93 @@ def trace_local_state(trace: ContourTrace, normalize: bool = False) -> tuple[Flo
             state=state/np.array([trace.k_eff,trace.k_eff**2,trace.k_eff**2])
         states.append(state)
     return tuple(states)
+
+
+def contour_local_geometry_autocorrelation(
+        trace: ContourTrace,
+        max_separation: float | None = None,
+        minimum_pairs: int = 1,
+        ) -> Mapping[str, FloatArray | IntArray | tuple[str, ...]]:
+    """Return centered autocorrelations of local geometry along each contour.
+
+    The three columns are ``(kappa, kappa_prime, kappa_tau)``.  For each
+    quantity ``X``, this evaluates
+
+    ``C_X(s) = <delta X(u) delta X(u+s)> / <delta X**2>``
+
+    using every valid pair at a common physical-arclength lag.  Pairs never
+    cross contour boundaries and no periodic closure is imposed.  The mean and
+    zero-lag variance are pooled over all retained contour points, so every
+    reported correlation is exactly one at zero separation (up to roundoff).
+    FFT convolution keeps evaluation practical for finely sampled traces.
+    """
+    if isinstance(minimum_pairs, bool) or int(minimum_pairs) != minimum_pairs:
+        raise ValueError("minimum_pairs must be a positive integer")
+    minimum_pairs = int(minimum_pairs)
+    if minimum_pairs < 1:
+        raise ValueError("minimum_pairs must be a positive integer")
+    if max_separation is not None:
+        max_separation = float(max_separation)
+        if not np.isfinite(max_separation) or max_separation < 0:
+            raise ValueError("max_separation must be finite and nonnegative")
+
+    states = trace_local_state(trace, normalize=False)
+    if any(np.any(~np.isfinite(state)) for state in states):
+        raise ValueError("trace local geometry must be finite")
+    packed = np.concatenate(states, axis=0)
+    mean = np.mean(packed, axis=0)
+    centered_states = tuple(state-mean for state in states)
+
+    available_lag = max(len(state)-1 for state in centered_states)
+    if max_separation is None:
+        maximum_lag = available_lag
+    else:
+        maximum_lag = min(
+            available_lag,
+            int(np.floor(max_separation/trace.physical_spacing + 1e-12)),
+        )
+
+    covariance_sum = np.zeros((maximum_lag+1, 3), dtype=float)
+    pair_count = np.zeros(maximum_lag+1, dtype=np.int64)
+    for state in centered_states:
+        local_maximum_lag = min(maximum_lag, len(state)-1)
+        transform_length = next_fast_len(2*len(state)-1)
+        spectrum = rfft(state, n=transform_length, axis=0)
+        autocovariance = irfft(
+            spectrum.conjugate()*spectrum,
+            n=transform_length,
+            axis=0,
+        )[:local_maximum_lag+1]
+        covariance_sum[:local_maximum_lag+1] += autocovariance
+        pair_count[:local_maximum_lag+1] += (
+            len(state)-np.arange(local_maximum_lag+1)
+        )
+
+    variance = covariance_sum[0]/pair_count[0]
+    if np.any(~np.isfinite(variance)) or np.any(variance <= 0):
+        raise ValueError("each local geometry quantity must have positive variance")
+    covariance = np.divide(
+        covariance_sum,
+        pair_count[:, None],
+        out=np.full_like(covariance_sum, np.nan),
+        where=pair_count[:, None] > 0,
+    )
+    correlation = covariance/variance
+
+    keep = pair_count >= minimum_pairs
+    if not np.any(keep):
+        raise RuntimeError("no arclength lag has the requested minimum pair count")
+    lags = np.arange(maximum_lag+1, dtype=float)[keep]
+    separation = lags*trace.physical_spacing
+    return {
+        "variable_names": ("kappa", "kappa_prime", "kappa_tau"),
+        "separation": separation,
+        "separation_k_eff": separation*trace.k_eff,
+        "correlation": correlation[keep],
+        "pair_count": pair_count[keep],
+        "mean": mean,
+        "variance": variance,
+    }
 
 
 def trace_local_state_blocks(trace: ContourTrace, block_length: float
@@ -1745,13 +2420,652 @@ def _load_module_from_path(name: str, path: Path):
     return module
 
 
+def _fast_segment_paths(poly) -> tuple[FloatArray, ...]:
+    """Connect a segment graph, resolving even-degree cells by smooth pairing.
+
+    Marching-vortex cells with four or six pierced faces are represented as a
+    star through the cell centre.  They are numerical topology ambiguities, not
+    physical line branches.  Pairing the most nearly opposite incident rays
+    continues each line through such a cell instead of terminating every path
+    there.  Odd-degree vertices remain unpaired and therefore act as endpoints.
+    """
+    if poly.n_points == 0 or poly.n_lines == 0:
+        return ()
+    raw_points = np.asarray(poly.points, dtype=float)
+    lines = np.asarray(poly.lines, dtype=np.int64).reshape(-1, 3)
+    if np.any(lines[:, 0] != 2):
+        raise ValueError("fast path connection requires two-point line cells")
+    points, inverse = np.unique(raw_points, axis=0, return_inverse=True)
+    edges = np.sort(inverse[lines[:, 1:]], axis=1)
+    edges = np.unique(edges[edges[:, 0] != edges[:, 1]], axis=0)
+    adjacency = [[] for _ in range(len(points))]
+    for first, second in edges:
+        adjacency[first].append(int(second))
+        adjacency[second].append(int(first))
+    continuation: dict[tuple[int, int], int] = {}
+
+    def smooth_pairs(node: int, neighbors: list[int]) -> list[tuple[int, int]]:
+        direction = points[neighbors]-points[node]
+        direction /= np.linalg.norm(direction, axis=1)[:, None]
+        cost = direction@direction.T
+
+        def best_pairing(indices: tuple[int, ...]):
+            if not indices:
+                return 0.0, []
+            first = indices[0]
+            best_cost = np.inf
+            best_pairs: list[tuple[int, int]] = []
+            for offset in range(1, len(indices)):
+                second = indices[offset]
+                remaining = indices[1:offset]+indices[offset+1:]
+                following_cost, following_pairs = best_pairing(remaining)
+                candidate_cost = cost[first, second]+following_cost
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_pairs = [(neighbors[first], neighbors[second])]+following_pairs
+            return best_cost, best_pairs
+
+        return best_pairing(tuple(range(len(neighbors))))[1]
+
+    for node, neighbors in enumerate(adjacency):
+        if len(neighbors) == 2:
+            pairs = [(neighbors[0], neighbors[1])]
+        elif len(neighbors) > 2 and len(neighbors) % 2 == 0:
+            pairs = smooth_pairs(node, neighbors)
+        else:
+            pairs = []
+        for first, second in pairs:
+            continuation[(node, first)] = second
+            continuation[(node, second)] = first
+    visited: set[tuple[int, int]] = set()
+    paths = []
+
+    def walk(first: int, second: int) -> list[int]:
+        path = [first, second]
+        visited.add((min(first, second), max(first, second)))
+        previous, current = first, second
+        while True:
+            following = continuation.get((current, previous))
+            if following is None:
+                break
+            edge = (min(current, following), max(current, following))
+            if edge in visited:
+                break
+            visited.add(edge)
+            path.append(following)
+            previous, current = current, following
+        return path
+
+    for node, neighbors in enumerate(adjacency):
+        if neighbors and all((node, neighbor) in continuation for neighbor in neighbors):
+            continue
+        for neighbor in neighbors:
+            edge = (min(node, neighbor), max(node, neighbor))
+            if edge not in visited:
+                paths.append(points[walk(node, neighbor)])
+    for first, second in edges:
+        edge = (int(first), int(second))
+        if edge not in visited:
+            paths.append(points[walk(*edge)])
+    return tuple(path for path in paths if len(path) >= 2)
+
+
+def build_fast_isotropic_tangent_trace(project_root: Path,
+        spectrum: FitSpectrum, config: TraceConfig) -> TangentTrace:
+    """Build a C_t-only trace from all grid-resolved intersection polylines.
+
+    This intentionally leaves :func:`build_isotropic_trace` and
+    :func:`build_isotropic_tangent_trace` unchanged.  It generates only the two
+    level-set fields, avoids analytic zero-set projection, resolves ambiguous
+    even-degree cells by their smoothest through-pairing, uses linear arclength
+    interpolation, and obtains unit tangents from centered finite differences.
+    """
+    rwn = _import_project_module(project_root, "rw_line_network")
+    rwn.GRID_SIZE = config.grid_size
+    rwn.NUM_BLOCK = config.num_blocks
+    rwn.BLOCK_OVERLAP = config.block_overlap
+    rwn.RANDOM_SEED = config.random_seed
+    rwn.NUM_MODES = (config.num_modes,)*3
+    rwn.K_DISTRIBUTION = "gamma_radial"
+    rwn.K0 = (config.trace_k0,)*3
+    rwn.r_SIGMA_K = (spectrum.r_sigma_k,)*3
+    rwn.SHARED_K_VECTORS = False
+    rwn.COUPLE_PHI2_PHI3 = False
+    rwn.USE_VORTEX_TRACING = True
+    rwn.VORTEX_FACE_PREFILTER = True
+    rwn.SMOOTH_VORTEX_LINES = False
+
+    rng = np.random.default_rng(config.random_seed)
+    ksets = rwn.make_field_k_sets(
+        rwn.NUM_MODES, rwn.K_DISTRIBUTION, rng, shared_k_vectors=False
+    )
+    mean_k2 = 0.5*(
+        np.mean(np.einsum("ni,ni->n", ksets.phi1, ksets.phi1))
+        + np.mean(np.einsum("ni,ni->n", ksets.phi2, ksets.phi2))
+    )
+    trace_k_eff = (2*np.pi/config.grid_size)*np.sqrt(mean_k2)
+    phi1 = rwn.build_random_wave_field(
+        config.grid_size, ksets.phi1, rng, num_block=config.num_blocks,
+        block_overlap=config.block_overlap,
+    )
+    phi2 = rwn.build_random_wave_field(
+        config.grid_size, ksets.phi2, rng, num_block=config.num_blocks,
+        block_overlap=config.block_overlap,
+    )
+    segment_polydata = rwn.trace_vortex_segments(phi1, phi2)
+    spacing = config.q_spacing/trace_k_eff
+    sampled_paths = []
+    sampled_tangents = []
+    for path in _fast_segment_paths(segment_polydata):
+        try:
+            sampled = resample_polyline_by_arclength(path, spacing)
+        except ValueError:
+            continue
+        derivative = np.gradient(sampled, spacing, axis=0, edge_order=2)
+        norms = np.linalg.norm(derivative, axis=1)
+        if np.any(norms <= 1e-12):
+            continue
+        sampled_paths.append(sampled)
+        sampled_tangents.append(derivative/norms[:, None])
+    if not sampled_paths:
+        raise RuntimeError("no traced contour is long enough to retain")
+    length_scale = trace_k_eff/spectrum.k_eff
+    return TangentTrace(
+        tuple(path*length_scale for path in sampled_paths),
+        tuple(sampled_tangents), spectrum.k_eff, config.q_spacing,
+        {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+         "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+         "random_seed": config.random_seed,
+         "concentration_mM": spectrum.concentration_mM,
+         "r_sigma_k": spectrum.r_sigma_k,
+         "raw_trace_k_eff": float(trace_k_eff),
+         "physical_length_scale": float(length_scale),
+         "trace_method": "fast_grid_polyline"},
+    )
+
+
+# EXPERIMENTAL / NOT USED BY TESTS OR DEMOS: retained for a later decision.
+# Long-contour convergence must be checked in mode count and independent
+# random-wave realizations before interpreting an asymptotic slope.
+def build_continued_isotropic_tangent_trace(project_root: Path,
+        spectrum: FitSpectrum, config: TraceConfig, *, contour_count: int = 8,
+        contour_length_k_eff: float = 3000.0,
+        projection_iterations: int = 7,
+        projection_tolerance: float = 1e-8,
+        integration_method: str = "midpoint",
+        max_step_subdivisions: int = 3) -> TangentTrace:
+    """Trace fixed-length zero-set contours beyond the seed-grid boundary.
+
+    The finite grid is used only to locate starting points on intersections of
+    the two random-wave fields.  From each selected seed, the same analytically
+    defined fields are followed by integrating the unit
+    tangent ``cross(grad(phi1), grad(phi2))``.  Newton corrections after every
+    step keep the coordinates on ``phi1 = phi2 = 0``.  The analytic random-wave
+    sum is defined outside the seed grid, so an open contour's length is
+    prescribed by ``contour_length_k_eff`` rather than by a box boundary.
+    Closed contours are detected on return to their seed and truncated to half
+    a circuit so large-lag pairs cannot wrap around the loop.
+
+    ``integration_method='midpoint'`` is the efficient production default;
+    ``'rk4'`` is retained as a higher-order convergence check.  Newton
+    projection stops early once ``projection_tolerance`` is reached and a
+    contour is rejected if any retained step fails that tolerance.
+
+    ``q_spacing`` remains the dimensionless arclength increment
+    ``k_eff * ds``.  This function is intended for long-range tangent
+    correlations; unlike :func:`build_isotropic_trace`, it does not calculate
+    second or third contour derivatives.
+    """
+    if isinstance(contour_count, bool) or int(contour_count) != contour_count:
+        raise ValueError("contour_count must be a positive integer")
+    contour_count = int(contour_count)
+    if contour_count < 1:
+        raise ValueError("contour_count must be a positive integer")
+    contour_length_k_eff = float(contour_length_k_eff)
+    if (not np.isfinite(contour_length_k_eff)
+            or contour_length_k_eff < 2.0*config.q_spacing):
+        raise ValueError(
+            "contour_length_k_eff must span at least two q_spacing intervals"
+        )
+    if (isinstance(projection_iterations, bool)
+            or int(projection_iterations) != projection_iterations
+            or int(projection_iterations) < 1):
+        raise ValueError("projection_iterations must be a positive integer")
+    projection_iterations = int(projection_iterations)
+    projection_tolerance = float(projection_tolerance)
+    if not np.isfinite(projection_tolerance) or projection_tolerance <= 0:
+        raise ValueError("projection_tolerance must be finite and positive")
+    if integration_method not in {"midpoint", "rk4"}:
+        raise ValueError("integration_method must be 'midpoint' or 'rk4'")
+    if (isinstance(max_step_subdivisions, bool)
+            or int(max_step_subdivisions) != max_step_subdivisions
+            or not 0 <= int(max_step_subdivisions) <= 8):
+        raise ValueError("max_step_subdivisions must be an integer in [0, 8]")
+    max_step_subdivisions = int(max_step_subdivisions)
+
+    rwn = _import_project_module(project_root, "rw_line_network")
+    rwn.GRID_SIZE = config.grid_size
+    rwn.NUM_BLOCK = config.num_blocks
+    rwn.BLOCK_OVERLAP = config.block_overlap
+    rwn.RANDOM_SEED = config.random_seed
+    rwn.NUM_MODES = (config.num_modes,)*3
+    rwn.K_DISTRIBUTION = "gamma_radial"
+    rwn.K0 = (config.trace_k0,)*3
+    rwn.r_SIGMA_K = (spectrum.r_sigma_k,)*3
+    rwn.SHARED_K_VECTORS = False
+    rwn.COUPLE_PHI2_PHI3 = False
+    rwn.USE_VORTEX_TRACING = True
+    rwn.VORTEX_FACE_PREFILTER = True
+    rwn.SMOOTH_VORTEX_LINES = False
+
+    rng = np.random.default_rng(config.random_seed)
+    ksets = rwn.make_field_k_sets(
+        rwn.NUM_MODES, rwn.K_DISTRIBUTION, rng, shared_k_vectors=False
+    )
+    mean_k2 = 0.5*(
+        np.mean(np.einsum("ni,ni->n", ksets.phi1, ksets.phi1))
+        + np.mean(np.einsum("ni,ni->n", ksets.phi2, ksets.phi2))
+    )
+    trace_k_eff = (2*np.pi/config.grid_size)*np.sqrt(mean_k2)
+    coefficients1 = rwn.make_wave_coefficients(ksets.phi1, rng)
+    coefficients2 = rwn.make_wave_coefficients(ksets.phi2, rng)
+    q1 = (2*np.pi/config.grid_size)*coefficients1.k_vectors
+    q2 = (2*np.pi/config.grid_size)*coefficients2.k_vectors
+
+    def value_gradient(points, coefficients, q_vectors):
+        phase = points@q_vectors.T + coefficients.phases
+        cosine = np.cos(phase)*coefficients.amplitudes
+        sine = np.sin(phase)*coefficients.amplitudes
+        return np.sum(cosine, axis=1), (-sine)@q_vectors
+
+    projection_calls = 0
+    projection_iteration_total = 0
+
+    def project(points):
+        nonlocal projection_calls, projection_iteration_total
+        projection_calls += 1
+        output = np.asarray(points, dtype=float).copy()
+        valid = np.ones(len(output), dtype=bool)
+        iterations_used = 0
+        for _ in range(projection_iterations):
+            f1, g1 = value_gradient(output, coefficients1, q1)
+            f2, g2 = value_gradient(output, coefficients2, q2)
+            converged = np.maximum(np.abs(f1), np.abs(f2)) <= projection_tolerance
+            active = valid & ~converged
+            if not np.any(active):
+                break
+            a11 = np.einsum("ij,ij->i", g1, g1)
+            a12 = np.einsum("ij,ij->i", g1, g2)
+            a22 = np.einsum("ij,ij->i", g2, g2)
+            determinant = a11*a22-a12*a12
+            safe = (
+                active
+                & np.isfinite(determinant)
+                & (np.abs(determinant) > 1e-14*np.maximum(a11*a22, 1.0))
+            )
+            valid[active & ~safe] = False
+            c1 = np.zeros_like(f1)
+            c2 = np.zeros_like(f2)
+            c1[safe] = (
+                -f1[safe]*a22[safe] + f2[safe]*a12[safe]
+            )/determinant[safe]
+            c2[safe] = (
+                -f2[safe]*a11[safe] + f1[safe]*a12[safe]
+            )/determinant[safe]
+            output[safe] += c1[safe, None]*g1[safe] + c2[safe, None]*g2[safe]
+            iterations_used += 1
+        projection_iteration_total += iterations_used
+        f1, _ = value_gradient(output, coefficients1, q1)
+        f2, _ = value_gradient(output, coefficients2, q2)
+        residual = np.maximum(np.abs(f1), np.abs(f2))
+        valid &= np.isfinite(residual) & (residual <= projection_tolerance)
+        return output, valid
+
+    def oriented_tangent(points, reference=None):
+        _, g1 = value_gradient(points, coefficients1, q1)
+        _, g2 = value_gradient(points, coefficients2, q2)
+        tangent = np.cross(g1, g2)
+        norm = np.linalg.norm(tangent, axis=1)
+        valid = np.isfinite(norm) & (norm > 1e-12)
+        tangent[valid] /= norm[valid, None]
+        tangent[~valid] = 0.0
+        if reference is not None:
+            reverse = np.einsum("ij,ij->i", tangent, reference) < 0.0
+            tangent[reverse] *= -1.0
+        return tangent, valid
+
+    subdivision_recovery_count = 0
+
+    def advance(points, tangents, step, direction):
+        if integration_method == "midpoint":
+            midpoint, midpoint_projected = project(
+                points + 0.5*step*direction*tangents
+            )
+            midpoint_tangent, midpoint_good = oriented_tangent(
+                midpoint, tangents
+            )
+            updated_points, projected = project(
+                points + step*direction*midpoint_tangent
+            )
+            updated_tangent, good = oriented_tangent(
+                updated_points, midpoint_tangent
+            )
+            valid = midpoint_projected & midpoint_good & projected & good
+        else:
+            k1 = direction*tangents
+            point2, projected2 = project(points + 0.5*step*k1)
+            tangent2, good2 = oriented_tangent(point2, tangents)
+            k2 = direction*tangent2
+            point3, projected3 = project(points + 0.5*step*k2)
+            tangent3, good3 = oriented_tangent(point3, tangent2)
+            k3 = direction*tangent3
+            point4, projected4 = project(points + step*k3)
+            tangent4, good4 = oriented_tangent(point4, tangent3)
+            k4 = direction*tangent4
+            trial = points + (step/6.0)*(k1 + 2.0*k2 + 2.0*k3 + k4)
+            updated_points, projected = project(trial)
+            updated_tangent, good = oriented_tangent(
+                updated_points, tangents
+            )
+            valid = (
+                projected2 & good2 & projected3 & good3
+                & projected4 & good4 & projected & good
+            )
+        return updated_points, updated_tangent, valid
+
+    def advance_subdivided(point, tangent, step, direction, levels):
+        nonlocal subdivision_recovery_count
+        updated_point, updated_tangent, valid = advance(
+            point[None, :], tangent[None, :], step, direction
+        )
+        if valid[0]:
+            return updated_point[0], updated_tangent[0], True
+        if levels == 0:
+            return point, tangent, False
+        midpoint, midpoint_tangent, first_valid = advance_subdivided(
+            point, tangent, 0.5*step, direction, levels-1
+        )
+        if not first_valid:
+            return point, tangent, False
+        endpoint, endpoint_tangent, second_valid = advance_subdivided(
+            midpoint, midpoint_tangent, 0.5*step, direction, levels-1
+        )
+        if second_valid:
+            subdivision_recovery_count += 1
+        return endpoint, endpoint_tangent, second_valid
+
+    def integrate(seeds, initial_tangent, step_count, direction):
+        point_history = np.empty((step_count+1, len(seeds), 3), dtype=float)
+        tangent_history = np.empty_like(point_history)
+        point_history[0] = seeds
+        tangent_history[0] = initial_tangent
+        points = seeds.copy()
+        tangent = initial_tangent.copy()
+        failure_step = np.full(len(seeds), -1, dtype=np.int64)
+        closure_step = np.full(len(seeds), -1, dtype=np.int64)
+        step = config.q_spacing/trace_k_eff
+        minimum_return_step = max(8, int(np.ceil(4.0/config.q_spacing)))
+        for index in range(1, step_count+1):
+            active = (failure_step < 0) & (closure_step < 0)
+            active_index = np.flatnonzero(active)
+            if not len(active_index):
+                point_history[index:] = points
+                tangent_history[index:] = tangent
+                break
+            local_points = points[active_index]
+            local_tangent = tangent[active_index]
+            updated_points, updated_tangent, local_valid = advance(
+                local_points, local_tangent, step, direction
+            )
+            for local_index in np.flatnonzero(~local_valid):
+                recovered_point, recovered_tangent, recovered = advance_subdivided(
+                    local_points[local_index], local_tangent[local_index],
+                    step, direction, max_step_subdivisions,
+                )
+                if recovered:
+                    updated_points[local_index] = recovered_point
+                    updated_tangent[local_index] = recovered_tangent
+                    local_valid[local_index] = True
+            points[active_index] = updated_points
+            tangent[active_index] = updated_tangent
+            failure_step[active_index[~local_valid]] = index
+            point_history[index] = points
+            tangent_history[index] = tangent
+            if index >= minimum_return_step:
+                returned = (
+                    active
+                    & (closure_step < 0)
+                    & (np.linalg.norm(points-seeds, axis=1) < 0.5*step)
+                    & (np.einsum("ij,ij->i", tangent, initial_tangent) > 0.8)
+                )
+                closure_step[returned] = index
+        return point_history, tangent_history, failure_step, closure_step
+
+    if config.num_blocks == 1:
+        phi1 = rwn.build_random_wave_field_from_coefficients(
+            config.grid_size, coefficients1
+        )
+        phi2 = rwn.build_random_wave_field_from_coefficients(
+            config.grid_size, coefficients2
+        )
+    else:
+        phi1 = rwn.build_random_wave_field_blockwise(
+            config.grid_size, config.num_blocks, config.block_overlap,
+            coefficients1,
+        )
+        phi2 = rwn.build_random_wave_field_blockwise(
+            config.grid_size, config.num_blocks, config.block_overlap,
+            coefficients2,
+        )
+    segment_polydata = rwn.trace_vortex_segments(phi1, phi2)
+    paths = _fast_segment_paths(segment_polydata)
+    if not paths:
+        raise RuntimeError("the seed grid contains no traced zero-set contour")
+
+    candidate_seeds = np.asarray([path[len(path)//2] for path in paths])
+    candidate_seeds, projected = project(candidate_seeds)
+    candidate_tangents, nonsingular = oriented_tangent(candidate_seeds)
+    usable = projected & nonsingular & np.all(np.isfinite(candidate_seeds), axis=1)
+    candidate_seeds = candidate_seeds[usable]
+    candidate_tangents = candidate_tangents[usable]
+    if len(candidate_seeds) < contour_count:
+        raise RuntimeError(
+            f"only {len(candidate_seeds)} usable seeds are available; "
+            f"requested {contour_count} contours"
+        )
+
+    # Deterministic farthest-point sampling reduces the chance that two grid
+    # fragments seed the same analytically continued contour.
+    centre = 0.5*(np.min(candidate_seeds, axis=0)+np.max(candidate_seeds, axis=0))
+    selected = [int(np.argmax(np.linalg.norm(candidate_seeds-centre, axis=1)))]
+    nearest_squared = np.sum(
+        (candidate_seeds-candidate_seeds[selected[0]])**2, axis=1
+    )
+    while len(selected) < contour_count:
+        nearest_squared[selected] = -1.0
+        following = int(np.argmax(nearest_squared))
+        selected.append(following)
+        separation_squared = np.sum(
+            (candidate_seeds-candidate_seeds[following])**2, axis=1
+        )
+        nearest_squared = np.minimum(nearest_squared, separation_squared)
+    seeds = candidate_seeds[selected]
+    seed_tangents = candidate_tangents[selected]
+
+    total_intervals = int(np.ceil(
+        contour_length_k_eff/config.q_spacing - 1e-12
+    ))
+    point_history, tangent_history, failure_step, closure_step = integrate(
+        seeds, seed_tangents, total_intervals, 1.0
+    )
+
+    points_by_contour_grid = []
+    tangents_by_contour = []
+    closed_contour_count = 0
+    truncated_contour_count = 0
+    for index in range(len(seeds)):
+        stop = total_intervals+1
+        if failure_step[index] >= 0:
+            stop = min(stop, int(failure_step[index]))
+            truncated_contour_count += 1
+        if closure_step[index] >= 0:
+            # A closed curve is periodic.  Retaining at most half a circuit
+            # prevents large lags from wrapping back to small separations.
+            stop = min(stop, max(3, int(closure_step[index]//2+1)))
+            closed_contour_count += 1
+        if stop >= 3:
+            points_by_contour_grid.append(point_history[:stop, index])
+            tangents_by_contour.append(tangent_history[:stop, index])
+    if not points_by_contour_grid:
+        raise RuntimeError("all continued contours failed before three samples")
+    packed_points = np.concatenate(points_by_contour_grid, axis=0)
+    f1, _ = value_gradient(packed_points, coefficients1, q1)
+    f2, _ = value_gradient(packed_points, coefficients2, q2)
+    maximum_residual = float(np.max(np.maximum(np.abs(f1), np.abs(f2))))
+    length_scale = trace_k_eff/spectrum.k_eff
+    points_by_contour = tuple(
+        points*length_scale for points in points_by_contour_grid
+    )
+    tangents_by_contour = tuple(tangents_by_contour)
+    actual_lengths_k_eff = tuple(
+        (len(points)-1)*config.q_spacing for points in points_by_contour
+    )
+    return TangentTrace(
+        points_by_contour, tangents_by_contour,
+        spectrum.k_eff, config.q_spacing,
+        {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+         "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+         "random_seed": config.random_seed,
+         "concentration_mM": spectrum.concentration_mM,
+         "r_sigma_k": spectrum.r_sigma_k,
+         "raw_trace_k_eff": float(trace_k_eff),
+         "physical_length_scale": float(length_scale),
+         "trace_method": "analytic_zero_set_continuation",
+         "requested_contour_count": contour_count,
+         "retained_contour_count": len(points_by_contour),
+         "target_contour_length_k_eff": total_intervals*config.q_spacing,
+         "actual_contour_lengths_k_eff": actual_lengths_k_eff,
+         "closed_contour_count": closed_contour_count,
+         "truncated_contour_count": truncated_contour_count,
+         "subdivision_recovery_count": subdivision_recovery_count,
+         "projection_iterations": projection_iterations,
+         "projection_tolerance": projection_tolerance,
+         "mean_projection_iterations": (
+             projection_iteration_total/max(projection_calls, 1)
+         ),
+         "integration_method": integration_method,
+         "max_step_subdivisions": max_step_subdivisions,
+         "maximum_zero_set_residual": maximum_residual},
+    )
+
+
+def build_isotropic_tangent_trace(project_root: Path, spectrum: FitSpectrum,
+        config: TraceConfig) -> TangentTrace:
+    """Trace only coordinates and tangents for fast ``C_t(s)`` evaluation."""
+    rwn = _import_project_module(project_root, "rw_line_network")
+    scattering = _load_module_from_path(
+        "rw_line_scattering_ca_tangent",
+        Path(project_root)/"rw_line_scattering.py",
+    )
+    rwn.GRID_SIZE = config.grid_size
+    rwn.NUM_BLOCK = config.num_blocks
+    rwn.BLOCK_OVERLAP = config.block_overlap
+    rwn.RANDOM_SEED = config.random_seed
+    rwn.NUM_MODES = (config.num_modes,)*3
+    rwn.K_DISTRIBUTION = "gamma_radial"
+    rwn.K0 = (config.trace_k0,)*3
+    rwn.r_SIGMA_K = (spectrum.r_sigma_k,)*3
+    rwn.SHARED_K_VECTORS = False
+    rwn.COUPLE_PHI2_PHI3 = False
+    rwn.USE_VORTEX_TRACING = True
+    rwn.VORTEX_FACE_PREFILTER = True
+    rwn.SMOOTH_VORTEX_LINES = False
+
+    rng = np.random.default_rng(config.random_seed)
+    ksets = rwn.make_field_k_sets(
+        rwn.NUM_MODES, rwn.K_DISTRIBUTION, rng, shared_k_vectors=False
+    )
+    mean_k2 = 0.5*(
+        np.mean(np.einsum("ni,ni->n", ksets.phi1, ksets.phi1))
+        + np.mean(np.einsum("ni,ni->n", ksets.phi2, ksets.phi2))
+    )
+    trace_k_eff = (2*np.pi/config.grid_size)*np.sqrt(mean_k2)
+    coefficients1 = rwn.make_wave_coefficients(ksets.phi1, rng)
+    coefficients2 = rwn.make_wave_coefficients(ksets.phi2, rng)
+
+    def value_gradient(points, coefficients):
+        q = (2*np.pi/config.grid_size)*coefficients.k_vectors
+        phase = points@q.T + coefficients.phases
+        cosine = np.cos(phase)*coefficients.amplitudes
+        sine = np.sin(phase)*coefficients.amplitudes
+        return np.sum(cosine, axis=1), (-sine)@q
+
+    def project(points, iterations):
+        output = points.copy()
+        for _ in range(iterations):
+            f1, g1 = value_gradient(output, coefficients1)
+            f2, g2 = value_gradient(output, coefficients2)
+            a11 = np.einsum("ij,ij->i", g1, g1)
+            a12 = np.einsum("ij,ij->i", g1, g2)
+            a22 = np.einsum("ij,ij->i", g2, g2)
+            determinant = a11*a22-a12*a12
+            safe = np.abs(determinant) > 1e-14*np.maximum(a11*a22, 1.0)
+            c1 = np.zeros_like(f1)
+            c2 = np.zeros_like(f2)
+            c1[safe] = (-f1[safe]*a22[safe]+f2[safe]*a12[safe])/determinant[safe]
+            c2[safe] = (-f2[safe]*a11[safe]+f1[safe]*a12[safe])/determinant[safe]
+            output[safe] += c1[safe, None]*g1[safe]+c2[safe, None]*g2[safe]
+        return output
+
+    phi1, phi2, _ = scattering._build_fields()
+    connected = rwn.smooth_vortex_polydata(rwn.trace_vortex_segments(phi1, phi2))
+    cells = [np.asarray(cell, dtype=float) for cell in scattering._line_cells(connected)
+             if len(cell) >= 2]
+    coarse = []
+    for cell in cells:
+        sampled = scattering._sample_line_cell_by_arclength(cell, config.seed_spacing)
+        if len(sampled) > 3:
+            coarse.append(sampled[:-1])
+    coarse_points, coarse_offsets = packed_cells(coarse)
+    projected = unpacked_cells(project(coarse_points, 3), coarse_offsets)
+    fine = []
+    for points in projected:
+        try:
+            sampled = resample_contour_by_arclength(
+                points, config.q_spacing/trace_k_eff
+            )
+        except ValueError:
+            continue
+        if len(sampled) >= 8:
+            fine.append(sampled)
+    fine_points, fine_offsets = packed_cells(fine)
+    fine_points = project(fine_points, 2)
+    _, g1 = value_gradient(fine_points, coefficients1)
+    _, g2 = value_gradient(fine_points, coefficients2)
+    tangents = np.cross(g1, g2)
+    tangents /= np.linalg.norm(tangents, axis=1)[:, None]
+    length_scale = trace_k_eff/spectrum.k_eff
+    return TangentTrace(
+        unpacked_cells(fine_points*length_scale, fine_offsets),
+        unpacked_cells(tangents, fine_offsets), spectrum.k_eff, config.q_spacing,
+        {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+         "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+         "random_seed": config.random_seed,
+         "concentration_mM": spectrum.concentration_mM,
+         "r_sigma_k": spectrum.r_sigma_k,
+         "raw_trace_k_eff": float(trace_k_eff),
+         "physical_length_scale": float(length_scale)},
+    )
+
+
 def build_isotropic_trace(project_root: Path, spectrum: FitSpectrum,
                           config: TraceConfig) -> ContourTrace:
     """Run the expensive production trace; never called at import or in fast tests."""
     rwn=_import_project_module(project_root,"rw_line_network")
     scattering=_load_module_from_path("rw_line_scattering_ca_interaction",
                                       Path(project_root)/"rw_line_scattering.py")
-    rwn.GRID_SIZE=config.grid_size; rwn.NUM_BLOCK=config.num_blocks; rwn.BLOCK_OVERLAP=0
+    rwn.GRID_SIZE=config.grid_size; rwn.NUM_BLOCK=config.num_blocks
+    rwn.BLOCK_OVERLAP=config.block_overlap
     rwn.RANDOM_SEED=config.random_seed; rwn.NUM_MODES=(config.num_modes,)*3
     rwn.K_DISTRIBUTION="gamma_radial"; rwn.K0=(config.trace_k0,)*3
     rwn.r_SIGMA_K=(spectrum.r_sigma_k,)*3; rwn.SHARED_K_VECTORS=False
@@ -1834,7 +3148,9 @@ def build_isotropic_trace(project_root: Path, spectrum: FitSpectrum,
     physical_r3=r3/length_scale**2
     return ContourTrace(unpacked_cells(physical_points,fine_offsets),unpacked_cells(tangent,fine_offsets),
         unpacked_cells(physical_r2,fine_offsets),unpacked_cells(physical_r3,fine_offsets),spectrum.k_eff,config.q_spacing,
-        {"grid_size":config.grid_size,"num_modes":config.num_modes,"random_seed":config.random_seed,
+        {"grid_size":config.grid_size,"num_blocks":config.num_blocks,
+         "block_overlap":config.block_overlap,"num_modes":config.num_modes,
+         "random_seed":config.random_seed,
          "concentration_mM":spectrum.concentration_mM,"r_sigma_k":spectrum.r_sigma_k,
          "raw_trace_k_eff":float(trace_k_eff),"physical_length_scale":float(length_scale)})
 
@@ -3018,6 +4334,9 @@ def combine_local_geometry_samples(samples: Sequence[LocalGeometrySample]) -> Lo
     k_eff=samples[0].k_eff
     if any(not np.isclose(sample.k_eff,k_eff) for sample in samples):
         raise ValueError("all pooled samples must share k_eff")
+    have_tangent_p2=[sample.tangent_p2 is not None for sample in samples]
+    if any(have_tangent_p2) and not all(have_tangent_p2):
+        raise ValueError("pooled samples must consistently include tangent_p2")
     count=len(samples)
     return LocalGeometrySample(
         np.concatenate([sample.kappa for sample in samples]),
@@ -3027,6 +4346,8 @@ def combine_local_geometry_samples(samples: Sequence[LocalGeometrySample]) -> Lo
         k_eff,
         float(np.mean([sample.stable_fraction for sample in samples])),
         float(np.mean([sample.mean_jacobian_dimensionless for sample in samples])),
+        (np.concatenate([sample.tangent_p2 for sample in samples])
+         if all(have_tangent_p2) else None),
     )
 
 

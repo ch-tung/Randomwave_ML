@@ -1,4 +1,4 @@
-concentration_mM,k_ref_A^-1,anisotropic_geometry,requested_sample_count,retained_stable_sample_count,stable_fraction,mean_kappa_over_kref,std_kappa_over_kref,mean_kappa_prime_over_kref2,std_kappa_prime_over_kref2,mean_kappa_tau_over_kref2,std_kappa_tau_over_kref2
+concentration_mM,k_eff_0_A^-1,anisotropic_geometry,requested_sample_count,retained_stable_sample_count,stable_fraction,mean_kappa_over_k_eff_0,std_kappa_over_k_eff_0,mean_kappa_prime_over_k_eff_0_squared,std_kappa_prime_over_k_eff_0_squared,mean_kappa_tau_over_k_eff_0_squared,std_kappa_tau_over_k_eff_0_squared
 0.0,0.05231700796741847,True,262144,262144,1.0,0.5633429837228655,0.6000790490524115,0.003035121197234986,50.90430375258126,-0.00014616309603815677,0.8692782379845888
 1.0,0.05231700796741847,True,262144,262144,1.0,0.5684270732897398,0.6025734454214152,0.0020471530914583287,39.37896268678856,-0.00016061882328818772,0.8778493031478484
 10.0,0.05231700796741847,True,262144,262144,1.0,0.5449337679118563,0.6143637049449321,0.00012175405742325537,35.85503863068117,-0.000312540486665436,0.8533853459300782
