@@ -1,7 +1,8 @@
 """Reusable local-interaction inference tools for the Ca random-wave series.
 
-The scientific definitions follow ``../writings/note_interaction.tex``. This
-module has no import-time analysis or filesystem/plotting side effects.
+The scientific definitions follow ``../writings/note_interaction.tex`` and
+``../writings/note_interaction_isosurface.tex``. This module has no import-time
+analysis or filesystem/plotting side effects.
 
 The default ``local_cell_features`` path interprets one sampled local state over
 the local expansion range ``ell=1/k_ref``. The optional
@@ -9,6 +10,11 @@ the local expansion range ``ell=1/k_ref``. The optional
 note. Pair-potential strengths and distances must use the same physical length
 unit as the trace; integrating the pair kernel over both contour coordinates
 then gives a dimensionless ``beta*H``.
+
+The optional ``model_free`` nonlocal branch is interaction-form-independent:
+it expands the complementary traced geometry in a finite physical radial basis
+and jointly fits ``[K2,K4,Y]``.  The public dispatcher continues to default to
+the established Yukawa implementation.
 """
 
 from __future__ import annotations
@@ -26,10 +32,12 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy.fft import irfft, next_fast_len, rfft
 from scipy.interpolate import CubicSpline
 from scipy.linalg import expm
 from scipy.optimize import brentq, minimize
 from scipy.special import gammainc, gammaln, logsumexp
+from scipy.spatial import cKDTree
 from scipy.stats import gamma as gamma_distribution
 from scipy.stats import norm, qmc
 
@@ -83,7 +91,7 @@ class InteractionComparisonPair:
 
 @dataclass(frozen=True)
 class LocalGeometrySample:
-    """Coarea-weighted samples of X=(kappa,kappa_prime,kappa*tau)."""
+    """Coarea-weighted local geometry with optional tangent orientation P2."""
 
     kappa: FloatArray
     kappa_prime: FloatArray
@@ -92,6 +100,7 @@ class LocalGeometrySample:
     k_eff: float
     stable_fraction: float = 1.0
     mean_jacobian_dimensionless: float = np.nan
+    tangent_p2: FloatArray | None = None
 
     def __post_init__(self) -> None:
         arrays = tuple(np.asarray(value, dtype=float) for value in (
@@ -110,6 +119,15 @@ class LocalGeometrySample:
         object.__setattr__(self, "kappa_prime", arrays[1])
         object.__setattr__(self, "kappa_tau", arrays[2])
         object.__setattr__(self, "weights", arrays[3] / np.sum(arrays[3]))
+        if self.tangent_p2 is not None:
+            tangent_p2 = np.asarray(self.tangent_p2, dtype=float)
+            if (tangent_p2.ndim != 1 or len(tangent_p2) != size or
+                    np.any(~np.isfinite(tangent_p2))):
+                raise ValueError("tangent_p2 must be a finite 1D array aligned with samples")
+            tolerance = 1e-12
+            if np.any(tangent_p2 < -0.5-tolerance) or np.any(tangent_p2 > 1+tolerance):
+                raise ValueError("tangent_p2 must lie in [-0.5,1]")
+            object.__setattr__(self, "tangent_p2", np.clip(tangent_p2, -0.5, 1.0))
 
     @property
     def state(self) -> FloatArray:
@@ -124,6 +142,7 @@ class LocalGeometrySample:
 class TraceConfig:
     grid_size: int = 64
     num_blocks: int = 1
+    block_overlap: int = 0
     num_modes: int = 256
     trace_k0: float = 5.0
     random_seed: int = 894894
@@ -133,6 +152,8 @@ class TraceConfig:
     def __post_init__(self) -> None:
         if self.grid_size < 8 or self.num_blocks < 1 or self.num_modes < 8:
             raise ValueError("trace counts are too small")
+        if self.block_overlap < 0 or self.block_overlap >= self.grid_size:
+            raise ValueError("block_overlap must lie in [0, grid_size)")
         if self.trace_k0 <= 0 or self.seed_spacing <= 0 or self.q_spacing <= 0:
             raise ValueError("trace scales must be positive")
 
@@ -163,6 +184,419 @@ class ContourTrace:
     @property
     def physical_spacing(self) -> float:
         return self.q_spacing / self.k_eff
+
+
+@dataclass(frozen=True)
+class TangentTrace:
+    """Uniform-arclength contour coordinates and unit tangents only."""
+
+    points: tuple[FloatArray, ...]
+    tangents: tuple[FloatArray, ...]
+    k_eff: float
+    q_spacing: float
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.points or len(self.points) != len(self.tangents):
+            raise ValueError("trace points and tangents must be nonempty and aligned")
+        for points, tangents in zip(self.points, self.tangents):
+            points = np.asarray(points, dtype=float)
+            tangents = np.asarray(tangents, dtype=float)
+            if points.ndim != 2 or points.shape[1] != 3 or tangents.shape != points.shape:
+                raise ValueError("trace arrays must have aligned shape (n,3)")
+            if len(points) == 0 or np.any(~np.isfinite(points)) or np.any(~np.isfinite(tangents)):
+                raise ValueError("trace arrays must be nonempty and finite")
+        if self.k_eff <= 0 or self.q_spacing <= 0:
+            raise ValueError("trace k_eff and q_spacing must be positive")
+
+    @property
+    def physical_spacing(self) -> float:
+        return self.q_spacing / self.k_eff
+
+
+def contour_tangent_correlation(trace: ContourTrace | TangentTrace,
+        max_separation: float | None = None,
+        minimum_pairs: int = 1) -> Mapping[str, FloatArray | IntArray]:
+    """Return the signed tangent correlation at same-contour arclength lags.
+
+    ``trace`` must be uniformly sampled in physical arclength, as produced by
+    :func:`build_isotropic_trace` or :func:`transform_contour_trace`.  Pairs
+    never cross contour boundaries, and no periodic closure is imposed.  The
+    result contains physical separation, dimensionless separation ``s*k_eff``,
+    the pair-weighted mean tangent dot product, and the contributing pair count.
+    """
+    if isinstance(minimum_pairs, bool) or int(minimum_pairs) != minimum_pairs:
+        raise ValueError("minimum_pairs must be a positive integer")
+    minimum_pairs = int(minimum_pairs)
+    if minimum_pairs < 1:
+        raise ValueError("minimum_pairs must be a positive integer")
+    if max_separation is not None:
+        max_separation = float(max_separation)
+        if not np.isfinite(max_separation) or max_separation < 0:
+            raise ValueError("max_separation must be finite and nonnegative")
+
+    unit_tangents = []
+    for tangent in trace.tangents:
+        values = np.asarray(tangent, dtype=float)
+        norms = np.linalg.norm(values, axis=1)
+        if np.any(~np.isfinite(norms)) or np.any(norms <= 0):
+            raise ValueError("trace tangents must be finite and nonzero")
+        unit_tangents.append(values / norms[:, None])
+
+    available_lag = max(len(values)-1 for values in unit_tangents)
+    if max_separation is None:
+        maximum_lag = available_lag
+    else:
+        maximum_lag = min(
+            available_lag,
+            int(np.floor(max_separation / trace.physical_spacing + 1e-12)),
+        )
+
+    total = np.zeros(maximum_lag+1, dtype=float)
+    pair_count = np.zeros(maximum_lag+1, dtype=np.int64)
+    for tangent in unit_tangents:
+        local_maximum_lag = min(maximum_lag, len(tangent)-1)
+        transform_length = next_fast_len(2*len(tangent)-1)
+        spectrum = rfft(tangent, n=transform_length, axis=0)
+        autocorrelation = irfft(
+            np.sum(spectrum.conjugate()*spectrum, axis=1),
+            n=transform_length,
+        )[:local_maximum_lag+1]
+        total[:local_maximum_lag+1] += autocorrelation
+        pair_count[:local_maximum_lag+1] += (
+            len(tangent)-np.arange(local_maximum_lag+1)
+        )
+    correlation = np.divide(
+        total, pair_count, out=np.full_like(total, np.nan), where=pair_count > 0
+    )
+
+    keep = pair_count >= minimum_pairs
+    if not np.any(keep):
+        raise RuntimeError("no arclength lag has the requested minimum pair count")
+    lags = np.arange(maximum_lag+1, dtype=float)[keep]
+    separation = lags * trace.physical_spacing
+    return {
+        "separation": separation,
+        "separation_k_eff": separation * trace.k_eff,
+        "correlation": correlation[keep],
+        "pair_count": pair_count[keep],
+    }
+
+
+def multiscale_contour_tangent_correlation(
+        trace: ContourTrace | TangentTrace,
+        max_separation: float | None = None,
+        linear_max_separation: float = 20.0,
+        lags_per_decade: int = 12,
+        max_pairs_per_lag: int | None = None,
+        minimum_available_pairs: int = 1,
+        ) -> Mapping[str, FloatArray | IntArray]:
+    """Estimate dense-short and logarithmically spaced long correlation lags.
+
+    Tangents remain evaluated on the original fine contour sampling.  All
+    short lags are retained linearly and longer lags are logarithmically
+    spaced.  With the default ``max_pairs_per_lag=None``, FFT
+    autocorrelations use every valid same-contour pair before the lag grid is
+    thinned; this is both statistically complete and efficient for long
+    contours.  A positive cap instead selects that many origins
+    systematically at each retained lag for memory-constrained applications.
+    """
+    if max_separation is not None:
+        max_separation = float(max_separation)
+        if not np.isfinite(max_separation) or max_separation < 0:
+            raise ValueError("max_separation must be finite and nonnegative")
+    linear_max_separation = float(linear_max_separation)
+    if not np.isfinite(linear_max_separation) or linear_max_separation < 0:
+        raise ValueError(
+            "linear_max_separation must be finite and nonnegative"
+        )
+    for value, name in ((lags_per_decade, "lags_per_decade"),
+                        (minimum_available_pairs, "minimum_available_pairs")):
+        if isinstance(value, bool) or int(value) != value or int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if (max_pairs_per_lag is not None
+            and (isinstance(max_pairs_per_lag, bool)
+                 or int(max_pairs_per_lag) != max_pairs_per_lag
+                 or int(max_pairs_per_lag) < 1)):
+        raise ValueError("max_pairs_per_lag must be None or a positive integer")
+    lags_per_decade = int(lags_per_decade)
+    if max_pairs_per_lag is not None:
+        max_pairs_per_lag = int(max_pairs_per_lag)
+    minimum_available_pairs = int(minimum_available_pairs)
+
+    if max_pairs_per_lag is None:
+        exact = contour_tangent_correlation(
+            trace,
+            max_separation=max_separation,
+            minimum_pairs=minimum_available_pairs,
+        )
+        exact_lags = np.rint(
+            exact["separation"]/trace.physical_spacing
+        ).astype(np.int64)
+        maximum_lag = int(exact_lags[-1])
+        linear_maximum_lag = min(
+            maximum_lag,
+            int(np.floor(
+                linear_max_separation/trace.physical_spacing + 1e-12
+            )),
+        )
+        lag_parts = [np.arange(linear_maximum_lag+1, dtype=np.int64)]
+        logarithmic_start = linear_maximum_lag+1
+        if logarithmic_start <= maximum_lag:
+            decades = np.log10(maximum_lag/logarithmic_start)
+            count = max(2, int(np.ceil(decades*lags_per_decade))+1)
+            lag_parts.append(np.unique(np.rint(np.geomspace(
+                logarithmic_start, maximum_lag, count
+            )).astype(np.int64)))
+        retained_lags = np.unique(np.concatenate(lag_parts))
+        position = np.searchsorted(exact_lags, retained_lags)
+        pair_count = np.asarray(exact["pair_count"])[position]
+        return {
+            "separation": np.asarray(exact["separation"])[position],
+            "separation_k_eff": np.asarray(
+                exact["separation_k_eff"]
+            )[position],
+            "correlation": np.asarray(exact["correlation"])[position],
+            "pair_count": pair_count,
+            "available_pair_count": pair_count.copy(),
+        }
+
+    unit_tangents = []
+    for tangent in trace.tangents:
+        values = np.asarray(tangent, dtype=float)
+        norm = np.linalg.norm(values, axis=1)
+        if np.any(~np.isfinite(norm)) or np.any(norm <= 0):
+            raise ValueError("trace tangents must be finite and nonzero")
+        unit_tangents.append(values/norm[:, None])
+    packed_tangents = np.concatenate(unit_tangents, axis=0)
+    contour_offsets = np.concatenate((
+        np.zeros(1, dtype=np.int64),
+        np.cumsum(
+            [len(values) for values in unit_tangents], dtype=np.int64
+        )[:-1],
+    ))
+    available_lag = max(len(values)-1 for values in unit_tangents)
+    if max_separation is None:
+        maximum_lag = available_lag
+    else:
+        maximum_lag = min(
+            available_lag,
+            int(np.floor(max_separation/trace.physical_spacing + 1e-12)),
+        )
+    linear_maximum_lag = min(
+        maximum_lag,
+        int(np.floor(
+            linear_max_separation/trace.physical_spacing + 1e-12
+        )),
+    )
+    lag_parts = [np.arange(linear_maximum_lag+1, dtype=np.int64)]
+    logarithmic_start = linear_maximum_lag+1
+    if logarithmic_start <= maximum_lag:
+        decades = np.log10(maximum_lag/logarithmic_start)
+        count = max(2, int(np.ceil(decades*lags_per_decade))+1)
+        lag_parts.append(np.unique(np.rint(np.geomspace(
+            logarithmic_start, maximum_lag, count
+        )).astype(np.int64)))
+    candidate_lags = np.unique(np.concatenate(lag_parts))
+
+    retained_lags = []
+    correlation = []
+    evaluated_count = []
+    available_count = []
+    lengths = np.asarray([len(values) for values in unit_tangents], dtype=np.int64)
+    for lag in candidate_lags:
+        local_available = np.maximum(lengths-lag, 0)
+        total_available = int(np.sum(local_available))
+        if total_available < minimum_available_pairs:
+            continue
+        count = min(total_available, max_pairs_per_lag)
+        if count == total_available:
+            packed_index = np.arange(total_available, dtype=np.int64)
+        else:
+            packed_index = np.floor(
+                (np.arange(count, dtype=float)+0.5)*total_available/count
+            ).astype(np.int64)
+        cumulative = np.cumsum(local_available)
+        contour_index = np.searchsorted(cumulative, packed_index, side="right")
+        previous = np.where(
+            contour_index > 0, cumulative[contour_index-1], 0
+        )
+        local_index = packed_index-previous
+        packed_origin = contour_offsets[contour_index]+local_index
+        dot_sum = float(np.sum(np.einsum(
+            "ij,ij->i",
+            packed_tangents[packed_origin],
+            packed_tangents[packed_origin+lag],
+        )))
+        retained_lags.append(lag)
+        correlation.append(dot_sum/count)
+        evaluated_count.append(count)
+        available_count.append(total_available)
+    if not retained_lags:
+        raise RuntimeError("no arclength lag has the requested available pairs")
+    retained_lags = np.asarray(retained_lags, dtype=float)
+    separation = retained_lags*trace.physical_spacing
+    return {
+        "separation": separation,
+        "separation_k_eff": separation*trace.k_eff,
+        "correlation": np.asarray(correlation),
+        "pair_count": np.asarray(evaluated_count, dtype=np.int64),
+        "available_pair_count": np.asarray(available_count, dtype=np.int64),
+    }
+
+
+def log_binned_replicate_correlation(separation: ArrayLike,
+        correlation_by_replicate: ArrayLike, pair_count_by_replicate: ArrayLike,
+        *, bins_per_decade: int = 12,
+        separation_range: tuple[float, float] | None = None
+        ) -> Mapping[str, FloatArray | IntArray]:
+    """Pool nearby lags while retaining independent-replicate uncertainty.
+
+    Correlations within each logarithmic bin are weighted by their contributing
+    same-contour pair counts.  Replicates are binned separately before their
+    mean and standard error are calculated, so the many tangent pairs in one
+    random-wave field are not treated as independent realizations.
+    """
+    x = np.asarray(separation, dtype=float)
+    values = np.asarray(correlation_by_replicate, dtype=float)
+    weights = np.asarray(pair_count_by_replicate, dtype=float)
+    if x.ndim != 1 or len(x) < 2 or np.any(~np.isfinite(x)):
+        raise ValueError("separation must be a finite 1D array")
+    if values.ndim != 2 or values.shape[1] != len(x):
+        raise ValueError(
+            "correlation_by_replicate must have shape (replicate, separation)"
+        )
+    if weights.ndim == 1:
+        weights = np.broadcast_to(weights, values.shape)
+    if weights.shape != values.shape:
+        raise ValueError("pair counts must be aligned with correlations")
+    if np.any(~np.isfinite(weights)) or np.any(weights < 0):
+        raise ValueError("pair counts must be finite and nonnegative")
+    if (isinstance(bins_per_decade, bool)
+            or int(bins_per_decade) != bins_per_decade
+            or int(bins_per_decade) < 1):
+        raise ValueError("bins_per_decade must be a positive integer")
+    bins_per_decade = int(bins_per_decade)
+    positive = x > 0
+    if separation_range is None:
+        if not np.any(positive):
+            raise ValueError("at least one separation must be positive")
+        lower = float(np.min(x[positive]))
+        upper = float(np.max(x[positive]))
+    else:
+        lower, upper = map(float, separation_range)
+        if (not np.isfinite(lower) or not np.isfinite(upper)
+                or lower <= 0 or upper <= lower):
+            raise ValueError("separation_range must be finite, positive, and ordered")
+    lower_log = np.floor(bins_per_decade*np.log10(lower))/bins_per_decade
+    upper_log = np.ceil(bins_per_decade*np.log10(upper))/bins_per_decade
+    edge_count = max(2, int(round(
+        (upper_log-lower_log)*bins_per_decade
+    ))+1)
+    edges = np.logspace(lower_log, upper_log, edge_count)
+
+    binned_values = []
+    binned_weights = []
+    centres = []
+    for bin_index, (left, right) in enumerate(zip(edges[:-1], edges[1:])):
+        if bin_index == len(edges)-2:
+            keep = positive & (x >= max(left, lower)) & (x <= min(right, upper))
+        else:
+            keep = positive & (x >= max(left, lower)) & (x < min(right, upper))
+        if not np.any(keep):
+            continue
+        local_values = values[:, keep]
+        local_weights = weights[:, keep]
+        usable = np.isfinite(local_values) & (local_weights > 0)
+        weighted_sum = np.sum(
+            np.where(usable, local_values*local_weights, 0.0), axis=1
+        )
+        weight_sum = np.sum(np.where(usable, local_weights, 0.0), axis=1)
+        replicate_value = np.divide(
+            weighted_sum, weight_sum,
+            out=np.full(values.shape[0], np.nan), where=weight_sum > 0,
+        )
+        total_lag_weight = np.sum(local_weights, axis=0)
+        if np.sum(total_lag_weight) <= 0:
+            continue
+        centre = np.exp(np.average(np.log(x[keep]), weights=total_lag_weight))
+        centres.append(centre)
+        binned_values.append(replicate_value)
+        binned_weights.append(weight_sum)
+    if not binned_values:
+        raise RuntimeError("no populated logarithmic correlation bin")
+
+    by_replicate = np.stack(binned_values, axis=1)
+    weight_by_replicate = np.stack(binned_weights, axis=1)
+    replicate_count = np.sum(np.isfinite(by_replicate), axis=0).astype(np.int64)
+    mean = np.nanmean(by_replicate, axis=0)
+    standard_error = np.full_like(mean, np.nan)
+    multiple = replicate_count > 1
+    standard_error[multiple] = (
+        np.nanstd(by_replicate[:, multiple], axis=0, ddof=1)
+        / np.sqrt(replicate_count[multiple])
+    )
+    return {
+        "separation": np.asarray(centres),
+        "correlation": mean,
+        "standard_error": standard_error,
+        "correlation_by_replicate": by_replicate,
+        "pair_count": np.sum(weight_by_replicate, axis=0).astype(np.int64),
+        "replicate_count": replicate_count,
+    }
+
+
+def local_power_law_exponent(coordinate: ArrayLike, value: ArrayLike,
+        log_half_window: float = 0.3, minimum_points: int = 9) -> FloatArray:
+    """Estimate ``-d log(value)/d log(coordinate)`` by local linear fits.
+
+    Nonpositive or nonfinite samples are omitted rather than transformed.  A
+    logarithmic coordinate window gives comparable slope resolution across
+    decades; estimates without enough neighbors are returned as ``nan``.
+    """
+    x=np.asarray(coordinate,dtype=float); y=np.asarray(value,dtype=float)
+    if x.ndim!=1 or y.shape!=x.shape or len(x)<2:
+        raise ValueError("coordinate and value must be aligned 1D arrays")
+    if not np.isfinite(log_half_window) or log_half_window<=0:
+        raise ValueError("log_half_window must be finite and positive")
+    if isinstance(minimum_points,bool) or int(minimum_points)!=minimum_points:
+        raise ValueError("minimum_points must be an integer")
+    minimum_points=int(minimum_points)
+    if minimum_points<3:
+        raise ValueError("minimum_points must be at least three")
+    valid=np.isfinite(x)&np.isfinite(y)&(x>0)&(y>0)
+    if np.any(np.diff(x[valid])<=0):
+        raise ValueError("positive finite coordinates must be strictly increasing")
+    output=np.full(len(x),np.nan,dtype=float)
+    indices=np.flatnonzero(valid)
+    log_x=np.log(x[valid]); log_y=np.log(y[valid])
+    for local_index,global_index in enumerate(indices):
+        keep=np.abs(log_x-log_x[local_index])<=log_half_window
+        if np.count_nonzero(keep)>=minimum_points:
+            output[global_index]=-np.polyfit(log_x[keep],log_y[keep],1)[0]
+    return output
+
+
+def first_exponent_crossover(coordinate: ArrayLike, exponent: ArrayLike,
+        target: float, minimum_coordinate: float = 0.0) -> float:
+    """Interpolate the first upward crossing of a target local exponent."""
+    x=np.asarray(coordinate,dtype=float); beta=np.asarray(exponent,dtype=float)
+    if x.ndim!=1 or beta.shape!=x.shape:
+        raise ValueError("coordinate and exponent must be aligned 1D arrays")
+    if not np.isfinite(target) or not np.isfinite(minimum_coordinate):
+        raise ValueError("target and minimum_coordinate must be finite")
+    valid=np.isfinite(x)&np.isfinite(beta)&(x>max(0.0,minimum_coordinate))
+    indices=np.flatnonzero(valid)
+    if len(indices)<2:
+        return np.nan
+    for first,second in zip(indices[:-1],indices[1:]):
+        if second!=first+1:
+            continue
+        lower=beta[first]-target; upper=beta[second]-target
+        if lower<=0<upper:
+            fraction=-lower/(upper-lower)
+            return float(np.exp(np.log(x[first])+fraction*(np.log(x[second])-np.log(x[first]))))
+    return np.nan
 
 
 @dataclass(frozen=True)
@@ -200,6 +634,22 @@ class YukawaPotential:
         return -self.strength * exponential * (
             1.0 / (self.screening_length * values) + 1.0 / values**2
         )
+
+
+@dataclass(frozen=True)
+class YukawaParameterCurve:
+    """Finite-cutoff combinations compatible with one absolute ``c2,c4``.
+
+    Every field is dimensionless in one common reporting scale ``k_ref``:
+    ``g_over_kref=g/k_ref``, ``d_kref=D*k_ref``, and
+    ``lp0_kref=ell_p0*k_ref``. ``valid`` applies the repulsive-interaction
+    restrictions ``g>0``, ``D>0``, and ``ell_p0>0`` from the isosurface note.
+    """
+
+    g_over_kref: FloatArray
+    d_kref: FloatArray
+    lp0_kref: FloatArray
+    valid: NDArray[np.bool_]
 
 
 @dataclass(frozen=True)
@@ -318,6 +768,108 @@ class NonlocalTable:
         object.__setattr__(self, "state", state)
         object.__setattr__(self, "delta_energy", energy)
         object.__setattr__(self, "groups", groups)
+
+
+@dataclass(frozen=True)
+class RadialHatBasis:
+    """Compact piecewise-linear basis on one common physical radial axis."""
+
+    centers: FloatArray
+    width: float
+    r_min: float
+    r_max: float
+
+    def __post_init__(self) -> None:
+        centers=np.asarray(self.centers,dtype=float)
+        if (centers.ndim!=1 or len(centers)<2 or np.any(~np.isfinite(centers)) or
+                np.any(np.diff(centers)<=0)):
+            raise ValueError("radial basis centers must be finite and increasing")
+        if not np.isfinite(self.width) or self.width<=0:
+            raise ValueError("radial basis width must be finite and positive")
+        if not (0<=self.r_min<self.r_max):
+            raise ValueError("radial basis support must be finite and ordered")
+        object.__setattr__(self,"centers",centers)
+
+    @classmethod
+    def from_range(cls, r_min: float, r_max: float,
+                   count: int=8) -> "RadialHatBasis":
+        if count<2 or not np.isfinite(r_min+r_max) or not 0<=r_min<r_max:
+            raise ValueError("a positive radial range and at least two basis functions are required")
+        knots=np.linspace(r_min,r_max,count+2)
+        return cls(knots[1:-1],float(knots[1]-knots[0]),r_min,r_max)
+
+    def evaluate(self, distance: ArrayLike) -> FloatArray:
+        values=np.asarray(distance,dtype=float)
+        if np.any(~np.isfinite(values)) or np.any(values<0):
+            raise ValueError("radial distances must be finite and nonnegative")
+        evaluated=np.maximum(
+            1-np.abs(values[...,None]-self.centers)/self.width,0.0)
+        outside=(values<self.r_min)|(values>self.r_max)
+        return np.where(outside[...,None],0.0,evaluated)
+
+
+@dataclass(frozen=True)
+class ModelFreeNonlocalConfig:
+    """Controls for the interaction-form-independent nonlocal branch."""
+
+    basis_count: int = 8
+    r_min: float|None = None
+    r_max: float|None = None
+    nonlocal_ridge: float = 1e-4
+    nonlocal_smoothness: float = 1e-3
+    conditional_neighbors: int = 64
+    conditional_bandwidth: float|None = None
+    conditional_min_effective_count: float = 8.0
+    support_quantiles: tuple[float,float] = (0.002,0.998)
+
+    def __post_init__(self) -> None:
+        if self.basis_count<2:
+            raise ValueError("basis_count must be at least two")
+        if self.r_min is not None and (not np.isfinite(self.r_min) or self.r_min<0):
+            raise ValueError("r_min must be finite and nonnegative")
+        if self.r_max is not None and (not np.isfinite(self.r_max) or self.r_max<=0):
+            raise ValueError("r_max must be finite and positive")
+        if self.r_min is not None and self.r_max is not None and self.r_min>=self.r_max:
+            raise ValueError("r_min must be smaller than r_max")
+        if self.nonlocal_ridge<0 or self.nonlocal_smoothness<0:
+            raise ValueError("regularization strengths must be nonnegative")
+        if self.conditional_neighbors<2 or self.conditional_min_effective_count<=0:
+            raise ValueError("conditional averaging controls must be positive")
+        if self.conditional_bandwidth is not None and self.conditional_bandwidth<=0:
+            raise ValueError("conditional_bandwidth must be positive")
+
+
+@dataclass(frozen=True)
+class ModelFreeNonlocalTable:
+    """Matched local and complementary geometry sampled by contour position."""
+
+    state: FloatArray
+    local_features: FloatArray
+    nonlocal_features: FloatArray
+    weights: FloatArray
+    groups: IntArray
+    metadata: Mapping[str,object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        state=np.asarray(self.state,dtype=float)
+        local=np.asarray(self.local_features,dtype=float)
+        nonlocal_values=np.asarray(self.nonlocal_features,dtype=float)
+        weights=np.asarray(self.weights,dtype=float)
+        groups=np.asarray(self.groups,dtype=int)
+        n=len(state)
+        if (state.shape!=(n,3) or local.shape!=(n,2) or nonlocal_values.ndim!=2 or
+                nonlocal_values.shape[0]!=n or weights.shape!=(n,) or
+                groups.shape!=(n,) or n==0):
+            raise ValueError("model-free feature arrays must be nonempty and aligned")
+        if (np.any(~np.isfinite(state)) or np.any(~np.isfinite(local)) or
+                np.any(~np.isfinite(nonlocal_values)) or np.any(~np.isfinite(weights)) or
+                np.any(weights<0) or np.sum(weights)<=0):
+            raise ValueError("model-free feature arrays and weights must be finite")
+        object.__setattr__(self,"state",state)
+        object.__setattr__(self,"local_features",local)
+        object.__setattr__(self,"nonlocal_features",nonlocal_values)
+        object.__setattr__(self,"weights",weights/np.sum(weights))
+        object.__setattr__(self,"groups",groups)
 
 
 @dataclass(frozen=True)
@@ -472,6 +1024,82 @@ class ConditionalYukawaFamily:
 
 
 @dataclass(frozen=True)
+class InteractionPathPoint:
+    """All positive finite-cutoff Yukawa solutions for one salt condition.
+
+    The dimensionless reporting scale is the zero-salt ``k_ref``:
+    ``g_over_kref=g/k_ref``, ``d_kref=D*k_ref``,
+    ``delta_c2_kref=Delta c2*k_ref``, and
+    ``delta_c4_kref3=Delta c4*k_ref**3``.
+    """
+
+    concentration_mM: float
+    delta_c2_kref: float
+    delta_c4_kref3: float
+    k_eff_over_kref: float
+    ell_kref: float
+    g_over_kref_roots: FloatArray
+    d_kref_roots: FloatArray
+    status: str
+    maximum_reconstruction_residual: float
+
+    def __post_init__(self) -> None:
+        strengths=np.asarray(self.g_over_kref_roots,dtype=float)
+        ranges=np.asarray(self.d_kref_roots,dtype=float)
+        if strengths.ndim!=1 or ranges.shape!=strengths.shape:
+            raise ValueError("interaction-path roots must be aligned 1D arrays")
+        if np.any(~np.isfinite(strengths)) or np.any(~np.isfinite(ranges)):
+            raise ValueError("interaction-path roots must be finite")
+        if np.any(strengths<=0) or np.any(ranges<=0):
+            raise ValueError("interaction-path roots must be positive")
+        expected={0:"no_physical_solution",1:"unique_solution"}.get(
+            len(strengths),"multiple_solutions")
+        if self.status not in {expected,"reference"}:
+            raise ValueError("interaction-path status does not match its roots")
+        object.__setattr__(self,"g_over_kref_roots",strengths)
+        object.__setattr__(self,"d_kref_roots",ranges)
+
+    @property
+    def root_count(self) -> int:
+        return len(self.d_kref_roots)
+
+
+@dataclass(frozen=True)
+class InteractionPathResult:
+    """Salt-ordered conditional path for one assumed zero-salt interaction."""
+
+    reference_concentration_mM: float
+    reference_k_eff: float
+    reference_g0_over_kref: float
+    reference_d0_kref: float
+    reference_a0_kref: float
+    reference_b0_kref3: float
+    cutoff_mode: str
+    d_kref_search_bounds: tuple[float,float]
+    points: tuple[InteractionPathPoint,...]
+
+    @property
+    def concentration_mM(self) -> FloatArray:
+        return np.asarray([point.concentration_mM for point in self.points])
+
+    @property
+    def unique_g_over_kref(self) -> FloatArray:
+        return np.asarray([
+            point.g_over_kref_roots[0] if point.root_count==1 else np.nan
+            for point in self.points])
+
+    @property
+    def unique_d_kref(self) -> FloatArray:
+        return np.asarray([
+            point.d_kref_roots[0] if point.root_count==1 else np.nan
+            for point in self.points])
+
+    @property
+    def unique_solution_mask(self) -> NDArray[np.bool_]:
+        return np.asarray([point.root_count==1 for point in self.points])
+
+
+@dataclass(frozen=True)
 class FlexibleDensityRatioResult:
     parameters: FloatArray
     coordinate_center: FloatArray
@@ -503,6 +1131,75 @@ class LinkedCoefficientProjection:
     @property
     def standard_errors(self) -> FloatArray:
         return np.sqrt(np.maximum(np.diag(self.covariance),0.0))
+
+
+@dataclass(frozen=True)
+class AbsoluteLocalCoefficientFit:
+    """Absolute ``c2,c4`` from the empirical free energy of one condition."""
+
+    c2_kref: float
+    c4_kref3: float
+    covariance: FloatArray
+    intercept: float
+    r_squared: float
+    occupied_bins: int
+    probability_retained: float
+    histogram_bins: tuple[int,int,int]
+    feature2: FloatArray
+    feature4: FloatArray
+    observed_free_energy: FloatArray
+    fitted_free_energy: FloatArray
+    bin_probability: FloatArray
+
+    @property
+    def coefficients(self) -> FloatArray:
+        return np.array([self.c2_kref,self.c4_kref3],dtype=float)
+
+    @property
+    def standard_errors(self) -> FloatArray:
+        return np.sqrt(np.maximum(np.diag(self.covariance),0.0))
+
+
+@dataclass(frozen=True)
+class LinearFreeEnergyFit:
+    """Weighted linear fit of a free energy to the linked ``K2,K4`` basis."""
+
+    coefficients: FloatArray
+    covariance: FloatArray
+    intercept: float
+    r_squared: float
+    residual_rms: float
+    fitted: FloatArray
+    residuals: FloatArray
+
+    @property
+    def standard_errors(self) -> FloatArray:
+        return np.sqrt(np.maximum(np.diag(self.covariance),0.0))
+
+
+@dataclass(frozen=True)
+class GeometricDensityOfStatesFit:
+    """Direct and geometric-density-corrected absolute linked fits."""
+
+    direct: LinearFreeEnergyFit
+    corrected: LinearFreeEnergyFit
+    k2: FloatArray
+    k4: FloatArray
+    observed_probability: FloatArray
+    reference_probability: FloatArray
+    direct_free_energy: FloatArray
+    corrected_free_energy: FloatArray
+    observed_occupied: NDArray[np.bool_]
+    reference_occupied: NDArray[np.bool_]
+    overlap: NDArray[np.bool_]
+    observed_overlap_mass: float
+    reference_overlap_mass: float
+    observed_probability_retained: float
+    reference_probability_retained: float
+    observed_k2_k4_correlation: float
+    reference_k2_k4_correlation: float
+    histogram_bins: tuple[int,int]
+    feature_bounds: FloatArray
 
 
 @dataclass(frozen=True)
@@ -551,6 +1248,9 @@ class MaximumEntropyResult:
     target_keep: NDArray[np.bool_]
     target_moments: FloatArray
     fitted_moments: FloatArray
+    unpenalized_objective: float = np.nan
+    regularization_objective: float = 0.0
+    total_objective: float = np.nan
 
     @property
     def standard_errors(self) -> FloatArray:
@@ -574,6 +1274,52 @@ class MaximumEntropyResult:
 
 
 @dataclass(frozen=True)
+class ConditionalAverageDiagnostics:
+    """Support and precision diagnostics for empirical conditioning on X."""
+
+    effective_neighbors: FloatArray
+    support_distance: FloatArray
+    conditional_variance: FloatArray
+    supported: NDArray[np.bool_]
+    poor_support_fraction: float
+
+
+@dataclass(frozen=True)
+class ModelFreeNonlocalResult:
+    """Joint local/nonlocal fit without an assumed analytic interaction form.
+
+    ``model_free`` means interaction-form-independent, not assumption-free.
+    The radial coefficients multiply the compact basis stored in
+    ``radial_basis`` and ``beta_delta_free_energy_*`` is derived afterward by
+    conditional marginalization over the sampled complementary geometry.
+    """
+
+    delta_c2_kref: float
+    delta_c4_kref3: float
+    nonlocal_coefficients: FloatArray
+    radial_basis: RadialHatBasis
+    reference_table: ModelFreeNonlocalTable
+    target_table: ModelFreeNonlocalTable
+    joint_fit: MaximumEntropyResult
+    beta_delta_free_energy_on_reference: FloatArray
+    beta_delta_free_energy_on_target: FloatArray
+    corrected_reference_weights: FloatArray
+    conditional_log_normalizer: float
+    reference_conditional_diagnostics: ConditionalAverageDiagnostics
+    target_conditional_diagnostics: ConditionalAverageDiagnostics
+    joint_feature_rank: int
+    joint_feature_singular_values: FloatArray
+    joint_feature_condition_number: float
+    local_nonlocal_correlations: FloatArray
+    nonlocal_orthogonal_variance_fraction: float
+    effective_sample_fraction: float
+    regularization_strength: float
+    smoothness_penalty: float
+    success: bool
+    message: str
+
+
+@dataclass(frozen=True)
 class ContourHeldoutResult:
     """A feasible deterministic train/test split for contour validation."""
 
@@ -590,8 +1336,10 @@ NOTE_FUNCTION_MAP = {
     "section_3_nonlocal_dependence": "absolute_nonlocal_energy_density, relative_nonlocal_cell_hamiltonian, svd_retained_variance, assess_nonlocal_dependence",
     "section_4_conditional_nonlocal_free_energy": "fit_conditional_nonlocal_weight, fit_direct_nonlocal_change_correction",
     "section_5_zero_salt_reweighting": "fit_linked_maximum_entropy, fit_independent_maximum_entropy, fit_local_cell_reweighting, fit_contour_reweighting",
-    "section_6_numerical_procedure": "build_isotropic_trace, run_trace_convergence_sweep",
+    "section_6_numerical_procedure": "build_isotropic_trace, contour_tangent_correlation, run_trace_convergence_sweep",
     "section_7_yukawa_parameters": "yukawa_cutoff_factors, solve_yukawa_change, yukawa_change_uncertainty",
+    "isosurface_section_4_absolute_coefficients": "fit_absolute_local_free_energy, fit_density_of_states_corrected_free_energy, yukawa_parameter_curve",
+    "isosurface_section_5_numerical_procedure": "sample_local_geometry_series, fit_absolute_local_free_energy, fit_density_of_states_corrected_free_energy, yukawa_parameter_curve",
 }
 
 
@@ -877,7 +1625,8 @@ def anisotropic_curve_jet(tangent: ArrayLike, r2: ArrayLike, r3: ArrayLike,
 def conditional_line_geometry(k_eff: float, r_sigma_k: float,
                               standard_normals: ArrayLike,
                               aniso: bool=False,
-                              H: ArrayLike|None=None) -> LocalGeometrySample:
+                              H: ArrayLike|None=None,
+                              alignment_axis: int=2) -> LocalGeometrySample:
     normals = np.asarray(standard_normals, dtype=float)
     expected = 2*len(NONZERO_INDICES)
     if normals.ndim != 2 or normals.shape[1] != expected:
@@ -916,6 +1665,10 @@ def conditional_line_geometry(k_eff: float, r_sigma_k: float,
         jac=jac*line_factor
     elif H is not None:
         raise ValueError("H must be omitted when aniso=False")
+    if alignment_axis not in (0,1,2):
+        raise ValueError("alignment_axis must be 0, 1, or 2")
+    tangent_projection = tangent[:,alignment_axis]
+    tangent_p2 = 0.5*(3*tangent_projection**2-1)
     kappa0 = np.linalg.norm(r2,axis=1)
     normal_frame = np.zeros_like(r2)
     regular = kappa0 > 1e-10
@@ -924,19 +1677,21 @@ def conditional_line_geometry(k_eff: float, r_sigma_k: float,
     return LocalGeometrySample(k_eff*kappa0,
         k_eff**2*np.einsum("ni,ni->n",normal_frame,r3),
         k_eff**2*np.einsum("ni,ni->n",binormal,r3), jac, k_eff,
-        float(np.mean(stable)), float(np.mean(jac)))
+        float(np.mean(stable)), float(np.mean(jac)), tangent_p2)
 
 
 def sample_local_geometry_series(spectra: Sequence[FitSpectrum], sample_power: int = 15,
                                  seed: int = 73129, aniso: bool=False,
-                                 H_by_concentration: Mapping[float,ArrayLike]|None=None
+                                 H_by_concentration: Mapping[float,ArrayLike]|None=None,
+                                 alignment_axis: int=2,
                                  ) -> dict[float, LocalGeometrySample]:
     normals = sobol_standard_normals(sample_power,seed)
     if not aniso:
         if H_by_concentration is not None:
             raise ValueError("H_by_concentration must be omitted when aniso=False")
         return {row.concentration_mM: conditional_line_geometry(
-            row.k_eff,row.r_sigma_k,normals) for row in spectra}
+            row.k_eff,row.r_sigma_k,normals,alignment_axis=alignment_axis)
+            for row in spectra}
     if H_by_concentration is None:
         raise ValueError("H_by_concentration is required when aniso=True")
     missing=[row.concentration_mM for row in spectra
@@ -944,7 +1699,8 @@ def sample_local_geometry_series(spectra: Sequence[FitSpectrum], sample_power: i
     if missing:
         raise ValueError(f"missing H tensors for concentrations {missing}")
     return {row.concentration_mM: conditional_line_geometry(
-        row.k_eff,row.r_sigma_k,normals,True,H_by_concentration[row.concentration_mM])
+        row.k_eff,row.r_sigma_k,normals,True,H_by_concentration[row.concentration_mM],
+        alignment_axis)
         for row in spectra}
 
 
@@ -965,6 +1721,249 @@ def local_cell_features(sample: LocalGeometrySample, k_ref: float,
     factor = length*k_ref
     return np.column_stack((factor*sample.kappa**2/k_ref**2,
                             factor*sample.fourth_order_density/k_ref**4))
+
+
+def fit_absolute_local_free_energy(sample: LocalGeometrySample, k_ref: float,
+        cell_length: float|None=None, histogram_bins: int|tuple[int,int,int]=18,
+        support_quantiles: tuple[float,float]=(0.005,0.995),
+        minimum_relative_bin_mass: float=1e-6,
+        beta_f_nl: ArrayLike|None=None) -> AbsoluteLocalCoefficientFit:
+    """Fit absolute ``c2,c4`` to ``-log P(X)-beta*F_nl(X)``.
+
+    The density uses the fixed dimensionless Cartesian measure
+    ``d(kappa/k_ref) d(kappa_prime/k_ref**2) d(kappa*tau/k_ref**2)``.
+    Uniform bins over a weighted-quantile support estimate ``P(X)``. The fit
+    then uses the note's linked ``K2,K4`` expression without comparing against
+    another salt condition. ``beta_f_nl`` may supply a sample-aligned absolute
+    distant-interaction free energy; when omitted the fit is local-only.
+    """
+    if not np.isfinite(k_ref) or k_ref<=0:
+        raise ValueError("k_ref must be finite and positive")
+    length=1/k_ref if cell_length is None else float(cell_length)
+    if not np.isfinite(length) or length<=0:
+        raise ValueError("cell_length must be finite and positive")
+    if isinstance(histogram_bins,int):
+        bins=(histogram_bins,)*3
+    else:
+        bins=tuple(int(value) for value in histogram_bins)
+    if len(bins)!=3 or any(value<4 for value in bins):
+        raise ValueError("histogram_bins must contain three integers of at least four")
+    low,high=(float(value) for value in support_quantiles)
+    if not (0<=low<high<=1):
+        raise ValueError("support_quantiles must satisfy 0 <= low < high <= 1")
+    if not np.isfinite(minimum_relative_bin_mass) or not 0<=minimum_relative_bin_mass<1:
+        raise ValueError("minimum_relative_bin_mass must lie in [0,1)")
+    state=normalized_local_state(sample,k_ref)
+    weights=np.asarray(sample.weights,dtype=float)
+    bounds=np.vstack([weighted_quantile(state[:,axis],[low,high],weights)
+                      for axis in range(3)])
+    widths=bounds[:,1]-bounds[:,0]
+    if np.any(~np.isfinite(bounds)) or np.any(widths<=0):
+        raise ValueError("local-state support is degenerate")
+    # Ensure samples at an exact endpoint remain inside the histogram.
+    padding=np.maximum(widths*1e-12,np.finfo(float).eps)
+    histogram_range=[(bounds[axis,0]-padding[axis],
+                      bounds[axis,1]+padding[axis]) for axis in range(3)]
+    mass,edges=np.histogramdd(state,bins=bins,range=histogram_range,weights=weights)
+    retained=float(np.sum(mass))
+    if retained<=0:
+        raise RuntimeError("absolute free-energy histogram retained no probability")
+    maximum=float(np.max(mass))
+    occupied=mass>maximum*minimum_relative_bin_mass
+    if np.count_nonzero(occupied)<6:
+        raise RuntimeError("too few occupied bins for the absolute c2,c4 fit")
+    sample_features=local_cell_features(sample,k_ref,length)
+    feature2_mass=np.histogramdd(state,bins=bins,range=histogram_range,
+        weights=weights*sample_features[:,0])[0]
+    feature4_mass=np.histogramdd(state,bins=bins,range=histogram_range,
+        weights=weights*sample_features[:,1])[0]
+    feature2=np.zeros_like(mass); feature4=np.zeros_like(mass)
+    feature2[occupied]=feature2_mass[occupied]/mass[occupied]
+    feature4[occupied]=feature4_mass[occupied]/mass[occupied]
+    cell_volume=float(np.prod([edge[1]-edge[0] for edge in edges]))
+    response=-np.log(mass[occupied]/cell_volume)
+    if beta_f_nl is not None:
+        free=np.asarray(beta_f_nl,dtype=float)
+        if free.shape!=(len(sample.weights),) or np.any(~np.isfinite(free)):
+            raise ValueError("beta_f_nl must be finite and aligned with sample weights")
+        weighted_free=np.histogramdd(state,bins=bins,range=histogram_range,
+            weights=weights*free)[0]
+        response-=weighted_free[occupied]/mass[occupied]
+    design=np.column_stack((np.ones(np.count_nonzero(occupied)),
+                            feature2[occupied],feature4[occupied]))
+    regression_weights=mass[occupied]/np.sum(mass[occupied])
+    gram=design.T@(regression_weights[:,None]*design)
+    if np.linalg.matrix_rank(gram)<3:
+        raise RuntimeError("absolute free-energy features are rank deficient")
+    parameters=np.linalg.solve(gram,design.T@(regression_weights*response))
+    fitted=design@parameters
+    residual=response-fitted
+    centered=response-np.sum(regression_weights*response)
+    total=float(np.sum(regression_weights*centered**2))
+    residual_variance=float(np.sum(regression_weights*residual**2))
+    r_squared=np.nan if total<=np.finfo(float).eps else 1-residual_variance/total
+    effective_count=1/np.sum(regression_weights**2)
+    degrees=max(effective_count-design.shape[1],1.0)
+    covariance_full=np.linalg.inv(gram)*(residual_variance/degrees)
+    return AbsoluteLocalCoefficientFit(
+        float(parameters[1]),float(parameters[2]),covariance_full[1:,1:],
+        float(parameters[0]),float(r_squared),int(np.count_nonzero(occupied)),
+        retained,bins,np.asarray(feature2[occupied]),np.asarray(feature4[occupied]),
+        np.asarray(response),np.asarray(fitted),np.asarray(regression_weights))
+
+
+def _fit_linked_free_energy(features: FloatArray, response: FloatArray,
+        weights: FloatArray) -> LinearFreeEnergyFit:
+    values=np.asarray(features,dtype=float)
+    target=np.asarray(response,dtype=float)
+    local_weights=np.asarray(weights,dtype=float)
+    if (values.ndim!=2 or values.shape[1]!=2 or target.shape!=(len(values),) or
+            local_weights.shape!=(len(values),) or len(values)<4):
+        raise ValueError("linked free-energy inputs are not aligned")
+    if (np.any(~np.isfinite(values)) or np.any(~np.isfinite(target)) or
+            np.any(~np.isfinite(local_weights)) or np.any(local_weights<0) or
+            np.sum(local_weights)<=0):
+        raise ValueError("linked free-energy inputs must be finite with positive mass")
+    local_weights=local_weights/np.sum(local_weights)
+    design=np.column_stack((np.ones(len(values)),values))
+    gram=design.T@(local_weights[:,None]*design)
+    if np.linalg.matrix_rank(gram)<3:
+        raise RuntimeError("density-ratio linked features are rank deficient")
+    parameters=np.linalg.solve(gram,design.T@(local_weights*target))
+    fitted=design@parameters
+    residuals=target-fitted
+    centered=target-np.sum(local_weights*target)
+    total=float(np.sum(local_weights*centered**2))
+    residual_variance=float(np.sum(local_weights*residuals**2))
+    r_squared=np.nan if total<=np.finfo(float).eps else 1-residual_variance/total
+    effective_count=1/np.sum(local_weights**2)
+    degrees=max(effective_count-design.shape[1],1.0)
+    covariance=np.linalg.inv(gram)[1:,1:]*(residual_variance/degrees)
+    return LinearFreeEnergyFit(
+        np.asarray(parameters[1:]),np.asarray(covariance),float(parameters[0]),
+        float(r_squared),float(np.sqrt(residual_variance)),np.asarray(fitted),
+        np.asarray(residuals))
+
+
+def fit_density_of_states_corrected_free_energy(observed: LocalGeometrySample,
+        reference: LocalGeometrySample, k_ref: float,
+        cell_length: float|None=None, histogram_bins: int|tuple[int,int]=36,
+        support_quantiles: tuple[float,float]=(0.005,0.995),
+        minimum_bin_count: int=5, minimum_relative_bin_mass: float=1e-6,
+        minimum_overlap_mass: float=0.5,
+        observed_beta_f_nl: ArrayLike|None=None
+        ) -> GeometricDensityOfStatesFit:
+    """Fit ``-log(P_obs/Omega)`` on shared ``K2,K4`` bins.
+
+    ``reference`` defines the geometric density of states ``Omega`` and must be
+    generated independently from an explicitly stated base spectrum. Both
+    ensembles use their Kac--Rice weights stored in ``LocalGeometrySample``.
+    Bins failing the same count or relative-mass rule in either ensemble are
+    excluded. The returned direct fit uses ``-log(P_obs)`` on that identical
+    overlap, making the comparison with the corrected fit numerical rather
+    than a consequence of different support choices.
+    """
+    if not np.isfinite(k_ref) or k_ref<=0:
+        raise ValueError("k_ref must be finite and positive")
+    length=1/k_ref if cell_length is None else float(cell_length)
+    if not np.isfinite(length) or length<=0:
+        raise ValueError("cell_length must be finite and positive")
+    if isinstance(histogram_bins,int):
+        bins=(histogram_bins,histogram_bins)
+    else:
+        bins=tuple(int(value) for value in histogram_bins)
+    if len(bins)!=2 or any(value<4 for value in bins):
+        raise ValueError("histogram_bins must contain two integers of at least four")
+    low,high=(float(value) for value in support_quantiles)
+    if not (0<=low<high<=1):
+        raise ValueError("support_quantiles must satisfy 0 <= low < high <= 1")
+    if minimum_bin_count<1:
+        raise ValueError("minimum_bin_count must be positive")
+    if not np.isfinite(minimum_relative_bin_mass) or not 0<=minimum_relative_bin_mass<1:
+        raise ValueError("minimum_relative_bin_mass must lie in [0,1)")
+    if not np.isfinite(minimum_overlap_mass) or not 0<minimum_overlap_mass<=1:
+        raise ValueError("minimum_overlap_mass must lie in (0,1]")
+    observed_features=local_cell_features(observed,k_ref,length)
+    reference_features=local_cell_features(reference,k_ref,length)
+    observed_weights=np.asarray(observed.weights,dtype=float)
+    reference_weights=np.asarray(reference.weights,dtype=float)
+    observed_bounds=np.vstack([weighted_quantile(
+        observed_features[:,axis],[low,high],observed_weights) for axis in range(2)])
+    reference_bounds=np.vstack([weighted_quantile(
+        reference_features[:,axis],[low,high],reference_weights) for axis in range(2)])
+    bounds=np.column_stack((np.minimum(observed_bounds[:,0],reference_bounds[:,0]),
+                            np.maximum(observed_bounds[:,1],reference_bounds[:,1])))
+    widths=bounds[:,1]-bounds[:,0]
+    if np.any(~np.isfinite(bounds)) or np.any(widths<=0):
+        raise ValueError("combined K2,K4 support is degenerate")
+    padding=np.maximum(widths*1e-12,np.finfo(float).eps)
+    histogram_range=[(bounds[axis,0]-padding[axis],bounds[axis,1]+padding[axis])
+                     for axis in range(2)]
+    observed_mass,edge2,edge4=np.histogram2d(
+        observed_features[:,0],observed_features[:,1],bins=bins,
+        range=histogram_range,weights=observed_weights)
+    reference_mass=np.histogram2d(
+        reference_features[:,0],reference_features[:,1],bins=bins,
+        range=histogram_range,weights=reference_weights)[0]
+    observed_count=np.histogram2d(
+        observed_features[:,0],observed_features[:,1],bins=bins,
+        range=histogram_range)[0]
+    reference_count=np.histogram2d(
+        reference_features[:,0],reference_features[:,1],bins=bins,
+        range=histogram_range)[0]
+    observed_retained=float(np.sum(observed_mass))
+    reference_retained=float(np.sum(reference_mass))
+    if observed_retained<=0 or reference_retained<=0:
+        raise RuntimeError("shared K2,K4 histogram retained no probability")
+    observed_probability=observed_mass/observed_retained
+    reference_probability=reference_mass/reference_retained
+    observed_occupied=((observed_count>=minimum_bin_count)&
+        (observed_probability>=np.max(observed_probability)*minimum_relative_bin_mass))
+    reference_occupied=((reference_count>=minimum_bin_count)&
+        (reference_probability>=np.max(reference_probability)*minimum_relative_bin_mass))
+    overlap=observed_occupied&reference_occupied
+    if np.count_nonzero(overlap)<6:
+        raise RuntimeError("too few shared K2,K4 bins for density-of-states correction")
+    observed_overlap=float(np.sum(observed_probability[overlap]))
+    reference_overlap=float(np.sum(reference_probability[overlap]))
+    if min(observed_overlap,reference_overlap)<minimum_overlap_mass:
+        raise RuntimeError(
+            "insufficient observed/reference K2,K4 overlap for density ratio: "
+            f"observed={observed_overlap:.3f}, reference={reference_overlap:.3f}")
+    centers2=0.5*(edge2[:-1]+edge2[1:])
+    centers4=0.5*(edge4[:-1]+edge4[1:])
+    grid2,grid4=np.meshgrid(centers2,centers4,indexing="ij")
+    features=np.column_stack((grid2[overlap],grid4[overlap]))
+    direct_free=-np.log(observed_probability[overlap])
+    corrected_free=-np.log(
+        observed_probability[overlap]/reference_probability[overlap])
+    if observed_beta_f_nl is not None:
+        free=np.asarray(observed_beta_f_nl,dtype=float)
+        if free.shape!=(len(observed.weights),) or np.any(~np.isfinite(free)):
+            raise ValueError("observed_beta_f_nl must be finite and sample aligned")
+        free_mass=np.histogram2d(
+            observed_features[:,0],observed_features[:,1],bins=bins,
+            range=histogram_range,weights=observed_weights*free)[0]
+        binned_free=free_mass[overlap]/observed_mass[overlap]
+        direct_free-=binned_free
+        corrected_free-=binned_free
+    regression_weights=observed_probability[overlap]/observed_overlap
+    direct_fit=_fit_linked_free_energy(features,direct_free,regression_weights)
+    corrected_fit=_fit_linked_free_energy(features,corrected_free,regression_weights)
+    observed_correlation=float(weighted_correlation_matrix(
+        observed_features,observed_weights)[0,1])
+    reference_correlation=float(weighted_correlation_matrix(
+        reference_features,reference_weights)[0,1])
+    return GeometricDensityOfStatesFit(
+        direct_fit,corrected_fit,np.asarray(grid2),np.asarray(grid4),
+        np.asarray(observed_probability),np.asarray(reference_probability),
+        np.asarray(-np.log(np.maximum(observed_probability,np.finfo(float).tiny))),
+        np.asarray(-np.log(np.maximum(
+            observed_probability/np.maximum(reference_probability,np.finfo(float).tiny),
+            np.finfo(float).tiny))),np.asarray(observed_occupied),
+        np.asarray(reference_occupied),np.asarray(overlap),observed_overlap,
+        reference_overlap,observed_retained,reference_retained,
+        observed_correlation,reference_correlation,bins,np.asarray(bounds))
 
 
 def normalized_local_state(sample: LocalGeometrySample, k_ref: float) -> FloatArray:
@@ -1021,6 +2020,59 @@ def unpacked_cells(points: ArrayLike, offsets: ArrayLike) -> tuple[FloatArray,..
     return tuple(values[bounds[i]:bounds[i+1]] for i in range(len(bounds)-1))
 
 
+def save_tangent_trace_cache(path: Path, trace: TangentTrace,
+        config: TraceConfig, spectrum: FitSpectrum) -> None:
+    """Save the lightweight trace used only for tangent correlations."""
+    points, offsets = packed_cells(trace.points)
+    tangents, _ = packed_cells(trace.tangents)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path, points=points, tangents=tangents, offsets=offsets,
+        trace_k_eff=trace.k_eff, q_spacing=trace.q_spacing,
+        grid_size=config.grid_size, num_blocks=config.num_blocks,
+        block_overlap=config.block_overlap, num_modes=config.num_modes,
+        trace_k0=config.trace_k0, random_seed=config.random_seed,
+        seed_spacing=config.seed_spacing,
+        spectrum_concentration_mM=spectrum.concentration_mM,
+        spectrum_k_eff=spectrum.k_eff,
+        spectrum_r_sigma_k=spectrum.r_sigma_k,
+    )
+
+
+def load_tangent_trace_cache(path: Path, config: TraceConfig,
+        spectrum: FitSpectrum) -> TangentTrace | None:
+    """Load a compatible lightweight trace, or return ``None``."""
+    if not Path(path).exists():
+        return None
+    with np.load(path, allow_pickle=False) as saved:
+        matches = (
+            int(saved["grid_size"]) == config.grid_size
+            and int(saved["num_blocks"]) == config.num_blocks
+            and int(saved["block_overlap"]) == config.block_overlap
+            and int(saved["num_modes"]) == config.num_modes
+            and np.isclose(float(saved["trace_k0"]), config.trace_k0)
+            and int(saved["random_seed"]) == config.random_seed
+            and np.isclose(float(saved["seed_spacing"]), config.seed_spacing)
+            and np.isclose(float(saved["q_spacing"]), config.q_spacing)
+            and np.isclose(float(saved["spectrum_concentration_mM"]), spectrum.concentration_mM)
+            and np.isclose(float(saved["spectrum_k_eff"]), spectrum.k_eff)
+            and np.isclose(float(saved["spectrum_r_sigma_k"]), spectrum.r_sigma_k)
+        )
+        if not matches:
+            return None
+        offsets = np.asarray(saved["offsets"], dtype=int)
+        return TangentTrace(
+            unpacked_cells(saved["points"], offsets),
+            unpacked_cells(saved["tangents"], offsets),
+            float(saved["trace_k_eff"]), float(saved["q_spacing"]),
+            {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+             "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+             "random_seed": config.random_seed,
+             "concentration_mM": spectrum.concentration_mM,
+             "r_sigma_k": spectrum.r_sigma_k},
+        )
+
+
 def save_trace_cache(path: Path, trace: ContourTrace, config: TraceConfig,
                      spectrum: FitSpectrum|None=None) -> None:
     points, offsets = packed_cells(trace.points)
@@ -1032,8 +2084,11 @@ def save_trace_cache(path: Path, trace: ContourTrace, config: TraceConfig,
     hencky=np.asarray(trace.metadata.get("hencky_tensor",np.full((3,3),np.nan)),dtype=float)
     np.savez_compressed(path,points=points,tangents=tangents,r2=r2,r3=r3,offsets=offsets,
         trace_k_eff=trace.k_eff,q_spacing=trace.q_spacing,grid_size=config.grid_size,
-        num_blocks=config.num_blocks,num_modes=config.num_modes,trace_k0=config.trace_k0,
+        num_blocks=config.num_blocks,block_overlap=config.block_overlap,
+        num_modes=config.num_modes,trace_k0=config.trace_k0,
         random_seed=config.random_seed,seed_spacing=config.seed_spacing,
+        raw_trace_k_eff=float(trace.metadata.get("raw_trace_k_eff",np.nan)),
+        physical_length_scale=float(trace.metadata.get("physical_length_scale",np.nan)),
         anisotropic_geometry=anisotropic,hencky_tensor=hencky,
         spectrum_concentration_mM=np.nan if spectrum is None else spectrum.concentration_mM,
         spectrum_k_eff=np.nan if spectrum is None else spectrum.k_eff,
@@ -1045,8 +2100,11 @@ def load_trace_cache(path: Path, config: TraceConfig,
     if not Path(path).exists():
         return None
     with np.load(path,allow_pickle=False) as saved:
+        saved_overlap=(int(saved["block_overlap"])
+                       if "block_overlap" in saved.files else 0)
         matches = (int(saved["grid_size"])==config.grid_size and
             int(saved["num_blocks"])==config.num_blocks and
+            saved_overlap==config.block_overlap and
             int(saved["num_modes"])==config.num_modes and
             np.isclose(float(saved["trace_k0"]),config.trace_k0) and
             int(saved["random_seed"])==config.random_seed and
@@ -1065,7 +2123,13 @@ def load_trace_cache(path: Path, config: TraceConfig,
             return None
         offsets = np.asarray(saved["offsets"],dtype=int)
         metadata={"grid_size":config.grid_size,"num_modes":config.num_modes,
+                  "num_blocks":config.num_blocks,"block_overlap":config.block_overlap,
                   "random_seed":config.random_seed}
+        if "raw_trace_k_eff" in saved.files and np.isfinite(saved["raw_trace_k_eff"]):
+            metadata["raw_trace_k_eff"]=float(saved["raw_trace_k_eff"])
+        if ("physical_length_scale" in saved.files and
+                np.isfinite(saved["physical_length_scale"])):
+            metadata["physical_length_scale"]=float(saved["physical_length_scale"])
         if "anisotropic_geometry" in saved.files and bool(saved["anisotropic_geometry"]):
             metadata["anisotropic_geometry"]=True
             metadata["hencky_tensor"]=np.asarray(saved["hencky_tensor"],dtype=float).tolist()
@@ -1092,18 +2156,54 @@ def resample_contour_by_arclength(points: ArrayLike, spacing: float) -> FloatArr
                             for axis in range(3)])
 
 
+def resample_polyline_by_arclength(points: ArrayLike, spacing: float) -> FloatArray:
+    """Linearly resample a polyline at uniform arclength spacing."""
+    coordinates = np.asarray(points, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 3 or len(coordinates) < 2:
+        raise ValueError("points must have shape (n>=2,3)")
+    if not np.isfinite(spacing) or spacing <= 0:
+        raise ValueError("spacing must be finite and positive")
+    lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+    coordinates = coordinates[np.concatenate(([True], lengths > 1e-12))]
+    if len(coordinates) < 2:
+        raise ValueError("too few distinct points")
+    arclength = np.concatenate(([0.0], np.cumsum(
+        np.linalg.norm(np.diff(coordinates, axis=0), axis=1))))
+    sample_s = np.arange(0.0, arclength[-1], spacing)
+    if len(sample_s) < 3:
+        raise ValueError("contour is too short")
+    return np.column_stack([
+        np.interp(sample_s, arclength, coordinates[:, axis]) for axis in range(3)
+    ])
+
+
 def transform_contour_trace(trace: ContourTrace, H: ArrayLike,
                             spacing: float|None=None) -> ContourTrace:
-    """Affine-map a trace and rebuild its jet on physical-arclength samples."""
+    """Affine-map a trace and resample its exact jet at uniform arclength.
+
+    The input already carries analytic second and third arclength derivatives.
+    Transforming those derivatives with :func:`anisotropic_curve_jet` avoids the
+    severe endpoint artifacts produced by differentiating a natural cubic
+    spline.  The transformed jet is then linearly interpolated onto uniform
+    physical-arclength positions and its Frenet constraints are restored.
+    """
     tensor=validate_hencky_tensor(H); F=hencky_stretch_tensor(tensor)
     physical_spacing=trace.physical_spacing if spacing is None else float(spacing)
     if not np.isfinite(physical_spacing) or physical_spacing<=0:
         raise ValueError("spacing must be finite and positive")
     output_points=[]; output_tangent=[]; output_r2=[]; output_r3=[]
-    for points in trace.points:
+    for points,tangent,r2,r3 in zip(
+            trace.points,trace.tangents,trace.r2,trace.r3):
         transformed=np.asarray(points,dtype=float)@F.T
+        transformed_tangent,transformed_r2,transformed_r3,_=(
+            anisotropic_curve_jet(tangent,r2,r3,tensor)
+        )
         segments=np.linalg.norm(np.diff(transformed,axis=0),axis=1)
-        transformed=transformed[np.concatenate(([True],segments>1e-12))]
+        keep=np.concatenate(([True],segments>1e-12))
+        transformed=transformed[keep]
+        transformed_tangent=transformed_tangent[keep]
+        transformed_r2=transformed_r2[keep]
+        transformed_r3=transformed_r3[keep]
         if len(transformed)<4:
             continue
         source_s=np.concatenate(([0.0],np.cumsum(
@@ -1111,15 +2211,23 @@ def transform_contour_trace(trace: ContourTrace, H: ArrayLike,
         sample_s=np.arange(0.0,source_s[-1],physical_spacing)
         if len(sample_s)<4:
             continue
-        splines=[CubicSpline(source_s,transformed[:,axis],bc_type="natural")
-                 for axis in range(3)]
-        sampled=np.column_stack([spline(sample_s) for spline in splines])
-        first=np.column_stack([spline(sample_s,1) for spline in splines])
-        second=np.column_stack([spline(sample_s,2) for spline in splines])
-        third=np.column_stack([spline(sample_s,3) for spline in splines])
-        tangent,r2,r3,_=arclength_curve_jet(first,second,third)
-        output_points.append(sampled); output_tangent.append(tangent)
-        output_r2.append(r2); output_r3.append(r3)
+        def interpolate(values):
+            return np.column_stack([
+                np.interp(sample_s,source_s,values[:,axis]) for axis in range(3)
+            ])
+        sampled=interpolate(transformed)
+        sampled_tangent=interpolate(transformed_tangent)
+        sampled_tangent/=np.linalg.norm(sampled_tangent,axis=1)[:,None]
+        sampled_r2=interpolate(transformed_r2)
+        sampled_r2-=sampled_tangent*np.einsum(
+            "ni,ni->n",sampled_tangent,sampled_r2)[:,None]
+        sampled_r3=interpolate(transformed_r3)
+        sampled_r3+=sampled_tangent*(
+            -np.einsum("ni,ni->n",sampled_r2,sampled_r2)
+            -np.einsum("ni,ni->n",sampled_tangent,sampled_r3)
+        )[:,None]
+        output_points.append(sampled); output_tangent.append(sampled_tangent)
+        output_r2.append(sampled_r2); output_r3.append(sampled_r3)
     if not output_points:
         raise RuntimeError("no transformed contour is long enough to retain")
     metadata=dict(trace.metadata)
@@ -1128,6 +2236,50 @@ def transform_contour_trace(trace: ContourTrace, H: ArrayLike,
                      "stretch_tensor":F.tolist()})
     return ContourTrace(tuple(output_points),tuple(output_tangent),tuple(output_r2),
         tuple(output_r3),trace.k_eff,physical_spacing*trace.k_eff,metadata)
+
+
+def transform_tangent_trace(trace: TangentTrace, H: ArrayLike,
+        spacing: float | None = None) -> TangentTrace:
+    """Affine-map a lightweight trace and restore uniform physical arclength."""
+    tensor = validate_hencky_tensor(H)
+    F = hencky_stretch_tensor(tensor)
+    physical_spacing = trace.physical_spacing if spacing is None else float(spacing)
+    if not np.isfinite(physical_spacing) or physical_spacing <= 0:
+        raise ValueError("spacing must be finite and positive")
+    output_points = []
+    output_tangents = []
+    for points, source_tangent in zip(trace.points, trace.tangents):
+        transformed = np.asarray(points, dtype=float) @ F.T
+        transformed_tangent = np.asarray(source_tangent, dtype=float) @ F.T
+        segments = np.linalg.norm(np.diff(transformed, axis=0), axis=1)
+        keep = np.concatenate(([True], segments > 1e-12))
+        transformed = transformed[keep]
+        transformed_tangent = transformed_tangent[keep]
+        if len(transformed) < 4:
+            continue
+        source_s = np.concatenate(([0.0], np.cumsum(
+            np.linalg.norm(np.diff(transformed, axis=0), axis=1))))
+        sample_s = np.arange(0.0, source_s[-1], physical_spacing)
+        if len(sample_s) < 4:
+            continue
+        sampled = np.column_stack([
+            np.interp(sample_s, source_s, transformed[:, axis]) for axis in range(3)
+        ])
+        tangent = np.column_stack([
+            np.interp(sample_s, source_s, transformed_tangent[:, axis])
+            for axis in range(3)
+        ])
+        tangent /= np.linalg.norm(tangent, axis=1)[:, None]
+        output_points.append(sampled)
+        output_tangents.append(tangent)
+    if not output_points:
+        raise RuntimeError("no transformed contour is long enough to retain")
+    metadata = dict(trace.metadata)
+    metadata.update({"anisotropic_geometry": True,
+                     "hencky_tensor": tensor.tolist(),
+                     "stretch_tensor": F.tolist()})
+    return TangentTrace(tuple(output_points), tuple(output_tangents), trace.k_eff,
+                        physical_spacing*trace.k_eff, metadata)
 
 
 def trace_local_state(trace: ContourTrace, normalize: bool = False) -> tuple[FloatArray,...]:
@@ -1144,6 +2296,93 @@ def trace_local_state(trace: ContourTrace, normalize: bool = False) -> tuple[Flo
             state=state/np.array([trace.k_eff,trace.k_eff**2,trace.k_eff**2])
         states.append(state)
     return tuple(states)
+
+
+def contour_local_geometry_autocorrelation(
+        trace: ContourTrace,
+        max_separation: float | None = None,
+        minimum_pairs: int = 1,
+        ) -> Mapping[str, FloatArray | IntArray | tuple[str, ...]]:
+    """Return centered autocorrelations of local geometry along each contour.
+
+    The three columns are ``(kappa, kappa_prime, kappa_tau)``.  For each
+    quantity ``X``, this evaluates
+
+    ``C_X(s) = <delta X(u) delta X(u+s)> / <delta X**2>``
+
+    using every valid pair at a common physical-arclength lag.  Pairs never
+    cross contour boundaries and no periodic closure is imposed.  The mean and
+    zero-lag variance are pooled over all retained contour points, so every
+    reported correlation is exactly one at zero separation (up to roundoff).
+    FFT convolution keeps evaluation practical for finely sampled traces.
+    """
+    if isinstance(minimum_pairs, bool) or int(minimum_pairs) != minimum_pairs:
+        raise ValueError("minimum_pairs must be a positive integer")
+    minimum_pairs = int(minimum_pairs)
+    if minimum_pairs < 1:
+        raise ValueError("minimum_pairs must be a positive integer")
+    if max_separation is not None:
+        max_separation = float(max_separation)
+        if not np.isfinite(max_separation) or max_separation < 0:
+            raise ValueError("max_separation must be finite and nonnegative")
+
+    states = trace_local_state(trace, normalize=False)
+    if any(np.any(~np.isfinite(state)) for state in states):
+        raise ValueError("trace local geometry must be finite")
+    packed = np.concatenate(states, axis=0)
+    mean = np.mean(packed, axis=0)
+    centered_states = tuple(state-mean for state in states)
+
+    available_lag = max(len(state)-1 for state in centered_states)
+    if max_separation is None:
+        maximum_lag = available_lag
+    else:
+        maximum_lag = min(
+            available_lag,
+            int(np.floor(max_separation/trace.physical_spacing + 1e-12)),
+        )
+
+    covariance_sum = np.zeros((maximum_lag+1, 3), dtype=float)
+    pair_count = np.zeros(maximum_lag+1, dtype=np.int64)
+    for state in centered_states:
+        local_maximum_lag = min(maximum_lag, len(state)-1)
+        transform_length = next_fast_len(2*len(state)-1)
+        spectrum = rfft(state, n=transform_length, axis=0)
+        autocovariance = irfft(
+            spectrum.conjugate()*spectrum,
+            n=transform_length,
+            axis=0,
+        )[:local_maximum_lag+1]
+        covariance_sum[:local_maximum_lag+1] += autocovariance
+        pair_count[:local_maximum_lag+1] += (
+            len(state)-np.arange(local_maximum_lag+1)
+        )
+
+    variance = covariance_sum[0]/pair_count[0]
+    if np.any(~np.isfinite(variance)) or np.any(variance <= 0):
+        raise ValueError("each local geometry quantity must have positive variance")
+    covariance = np.divide(
+        covariance_sum,
+        pair_count[:, None],
+        out=np.full_like(covariance_sum, np.nan),
+        where=pair_count[:, None] > 0,
+    )
+    correlation = covariance/variance
+
+    keep = pair_count >= minimum_pairs
+    if not np.any(keep):
+        raise RuntimeError("no arclength lag has the requested minimum pair count")
+    lags = np.arange(maximum_lag+1, dtype=float)[keep]
+    separation = lags*trace.physical_spacing
+    return {
+        "variable_names": ("kappa", "kappa_prime", "kappa_tau"),
+        "separation": separation,
+        "separation_k_eff": separation*trace.k_eff,
+        "correlation": correlation[keep],
+        "pair_count": pair_count[keep],
+        "mean": mean,
+        "variance": variance,
+    }
 
 
 def trace_local_state_blocks(trace: ContourTrace, block_length: float
@@ -1181,13 +2420,652 @@ def _load_module_from_path(name: str, path: Path):
     return module
 
 
+def _fast_segment_paths(poly) -> tuple[FloatArray, ...]:
+    """Connect a segment graph, resolving even-degree cells by smooth pairing.
+
+    Marching-vortex cells with four or six pierced faces are represented as a
+    star through the cell centre.  They are numerical topology ambiguities, not
+    physical line branches.  Pairing the most nearly opposite incident rays
+    continues each line through such a cell instead of terminating every path
+    there.  Odd-degree vertices remain unpaired and therefore act as endpoints.
+    """
+    if poly.n_points == 0 or poly.n_lines == 0:
+        return ()
+    raw_points = np.asarray(poly.points, dtype=float)
+    lines = np.asarray(poly.lines, dtype=np.int64).reshape(-1, 3)
+    if np.any(lines[:, 0] != 2):
+        raise ValueError("fast path connection requires two-point line cells")
+    points, inverse = np.unique(raw_points, axis=0, return_inverse=True)
+    edges = np.sort(inverse[lines[:, 1:]], axis=1)
+    edges = np.unique(edges[edges[:, 0] != edges[:, 1]], axis=0)
+    adjacency = [[] for _ in range(len(points))]
+    for first, second in edges:
+        adjacency[first].append(int(second))
+        adjacency[second].append(int(first))
+    continuation: dict[tuple[int, int], int] = {}
+
+    def smooth_pairs(node: int, neighbors: list[int]) -> list[tuple[int, int]]:
+        direction = points[neighbors]-points[node]
+        direction /= np.linalg.norm(direction, axis=1)[:, None]
+        cost = direction@direction.T
+
+        def best_pairing(indices: tuple[int, ...]):
+            if not indices:
+                return 0.0, []
+            first = indices[0]
+            best_cost = np.inf
+            best_pairs: list[tuple[int, int]] = []
+            for offset in range(1, len(indices)):
+                second = indices[offset]
+                remaining = indices[1:offset]+indices[offset+1:]
+                following_cost, following_pairs = best_pairing(remaining)
+                candidate_cost = cost[first, second]+following_cost
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_pairs = [(neighbors[first], neighbors[second])]+following_pairs
+            return best_cost, best_pairs
+
+        return best_pairing(tuple(range(len(neighbors))))[1]
+
+    for node, neighbors in enumerate(adjacency):
+        if len(neighbors) == 2:
+            pairs = [(neighbors[0], neighbors[1])]
+        elif len(neighbors) > 2 and len(neighbors) % 2 == 0:
+            pairs = smooth_pairs(node, neighbors)
+        else:
+            pairs = []
+        for first, second in pairs:
+            continuation[(node, first)] = second
+            continuation[(node, second)] = first
+    visited: set[tuple[int, int]] = set()
+    paths = []
+
+    def walk(first: int, second: int) -> list[int]:
+        path = [first, second]
+        visited.add((min(first, second), max(first, second)))
+        previous, current = first, second
+        while True:
+            following = continuation.get((current, previous))
+            if following is None:
+                break
+            edge = (min(current, following), max(current, following))
+            if edge in visited:
+                break
+            visited.add(edge)
+            path.append(following)
+            previous, current = current, following
+        return path
+
+    for node, neighbors in enumerate(adjacency):
+        if neighbors and all((node, neighbor) in continuation for neighbor in neighbors):
+            continue
+        for neighbor in neighbors:
+            edge = (min(node, neighbor), max(node, neighbor))
+            if edge not in visited:
+                paths.append(points[walk(node, neighbor)])
+    for first, second in edges:
+        edge = (int(first), int(second))
+        if edge not in visited:
+            paths.append(points[walk(*edge)])
+    return tuple(path for path in paths if len(path) >= 2)
+
+
+def build_fast_isotropic_tangent_trace(project_root: Path,
+        spectrum: FitSpectrum, config: TraceConfig) -> TangentTrace:
+    """Build a C_t-only trace from all grid-resolved intersection polylines.
+
+    This intentionally leaves :func:`build_isotropic_trace` and
+    :func:`build_isotropic_tangent_trace` unchanged.  It generates only the two
+    level-set fields, avoids analytic zero-set projection, resolves ambiguous
+    even-degree cells by their smoothest through-pairing, uses linear arclength
+    interpolation, and obtains unit tangents from centered finite differences.
+    """
+    rwn = _import_project_module(project_root, "rw_line_network")
+    rwn.GRID_SIZE = config.grid_size
+    rwn.NUM_BLOCK = config.num_blocks
+    rwn.BLOCK_OVERLAP = config.block_overlap
+    rwn.RANDOM_SEED = config.random_seed
+    rwn.NUM_MODES = (config.num_modes,)*3
+    rwn.K_DISTRIBUTION = "gamma_radial"
+    rwn.K0 = (config.trace_k0,)*3
+    rwn.r_SIGMA_K = (spectrum.r_sigma_k,)*3
+    rwn.SHARED_K_VECTORS = False
+    rwn.COUPLE_PHI2_PHI3 = False
+    rwn.USE_VORTEX_TRACING = True
+    rwn.VORTEX_FACE_PREFILTER = True
+    rwn.SMOOTH_VORTEX_LINES = False
+
+    rng = np.random.default_rng(config.random_seed)
+    ksets = rwn.make_field_k_sets(
+        rwn.NUM_MODES, rwn.K_DISTRIBUTION, rng, shared_k_vectors=False
+    )
+    mean_k2 = 0.5*(
+        np.mean(np.einsum("ni,ni->n", ksets.phi1, ksets.phi1))
+        + np.mean(np.einsum("ni,ni->n", ksets.phi2, ksets.phi2))
+    )
+    trace_k_eff = (2*np.pi/config.grid_size)*np.sqrt(mean_k2)
+    phi1 = rwn.build_random_wave_field(
+        config.grid_size, ksets.phi1, rng, num_block=config.num_blocks,
+        block_overlap=config.block_overlap,
+    )
+    phi2 = rwn.build_random_wave_field(
+        config.grid_size, ksets.phi2, rng, num_block=config.num_blocks,
+        block_overlap=config.block_overlap,
+    )
+    segment_polydata = rwn.trace_vortex_segments(phi1, phi2)
+    spacing = config.q_spacing/trace_k_eff
+    sampled_paths = []
+    sampled_tangents = []
+    for path in _fast_segment_paths(segment_polydata):
+        try:
+            sampled = resample_polyline_by_arclength(path, spacing)
+        except ValueError:
+            continue
+        derivative = np.gradient(sampled, spacing, axis=0, edge_order=2)
+        norms = np.linalg.norm(derivative, axis=1)
+        if np.any(norms <= 1e-12):
+            continue
+        sampled_paths.append(sampled)
+        sampled_tangents.append(derivative/norms[:, None])
+    if not sampled_paths:
+        raise RuntimeError("no traced contour is long enough to retain")
+    length_scale = trace_k_eff/spectrum.k_eff
+    return TangentTrace(
+        tuple(path*length_scale for path in sampled_paths),
+        tuple(sampled_tangents), spectrum.k_eff, config.q_spacing,
+        {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+         "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+         "random_seed": config.random_seed,
+         "concentration_mM": spectrum.concentration_mM,
+         "r_sigma_k": spectrum.r_sigma_k,
+         "raw_trace_k_eff": float(trace_k_eff),
+         "physical_length_scale": float(length_scale),
+         "trace_method": "fast_grid_polyline"},
+    )
+
+
+# EXPERIMENTAL / NOT USED BY TESTS OR DEMOS: retained for a later decision.
+# Long-contour convergence must be checked in mode count and independent
+# random-wave realizations before interpreting an asymptotic slope.
+def build_continued_isotropic_tangent_trace(project_root: Path,
+        spectrum: FitSpectrum, config: TraceConfig, *, contour_count: int = 8,
+        contour_length_k_eff: float = 3000.0,
+        projection_iterations: int = 7,
+        projection_tolerance: float = 1e-8,
+        integration_method: str = "midpoint",
+        max_step_subdivisions: int = 3) -> TangentTrace:
+    """Trace fixed-length zero-set contours beyond the seed-grid boundary.
+
+    The finite grid is used only to locate starting points on intersections of
+    the two random-wave fields.  From each selected seed, the same analytically
+    defined fields are followed by integrating the unit
+    tangent ``cross(grad(phi1), grad(phi2))``.  Newton corrections after every
+    step keep the coordinates on ``phi1 = phi2 = 0``.  The analytic random-wave
+    sum is defined outside the seed grid, so an open contour's length is
+    prescribed by ``contour_length_k_eff`` rather than by a box boundary.
+    Closed contours are detected on return to their seed and truncated to half
+    a circuit so large-lag pairs cannot wrap around the loop.
+
+    ``integration_method='midpoint'`` is the efficient production default;
+    ``'rk4'`` is retained as a higher-order convergence check.  Newton
+    projection stops early once ``projection_tolerance`` is reached and a
+    contour is rejected if any retained step fails that tolerance.
+
+    ``q_spacing`` remains the dimensionless arclength increment
+    ``k_eff * ds``.  This function is intended for long-range tangent
+    correlations; unlike :func:`build_isotropic_trace`, it does not calculate
+    second or third contour derivatives.
+    """
+    if isinstance(contour_count, bool) or int(contour_count) != contour_count:
+        raise ValueError("contour_count must be a positive integer")
+    contour_count = int(contour_count)
+    if contour_count < 1:
+        raise ValueError("contour_count must be a positive integer")
+    contour_length_k_eff = float(contour_length_k_eff)
+    if (not np.isfinite(contour_length_k_eff)
+            or contour_length_k_eff < 2.0*config.q_spacing):
+        raise ValueError(
+            "contour_length_k_eff must span at least two q_spacing intervals"
+        )
+    if (isinstance(projection_iterations, bool)
+            or int(projection_iterations) != projection_iterations
+            or int(projection_iterations) < 1):
+        raise ValueError("projection_iterations must be a positive integer")
+    projection_iterations = int(projection_iterations)
+    projection_tolerance = float(projection_tolerance)
+    if not np.isfinite(projection_tolerance) or projection_tolerance <= 0:
+        raise ValueError("projection_tolerance must be finite and positive")
+    if integration_method not in {"midpoint", "rk4"}:
+        raise ValueError("integration_method must be 'midpoint' or 'rk4'")
+    if (isinstance(max_step_subdivisions, bool)
+            or int(max_step_subdivisions) != max_step_subdivisions
+            or not 0 <= int(max_step_subdivisions) <= 8):
+        raise ValueError("max_step_subdivisions must be an integer in [0, 8]")
+    max_step_subdivisions = int(max_step_subdivisions)
+
+    rwn = _import_project_module(project_root, "rw_line_network")
+    rwn.GRID_SIZE = config.grid_size
+    rwn.NUM_BLOCK = config.num_blocks
+    rwn.BLOCK_OVERLAP = config.block_overlap
+    rwn.RANDOM_SEED = config.random_seed
+    rwn.NUM_MODES = (config.num_modes,)*3
+    rwn.K_DISTRIBUTION = "gamma_radial"
+    rwn.K0 = (config.trace_k0,)*3
+    rwn.r_SIGMA_K = (spectrum.r_sigma_k,)*3
+    rwn.SHARED_K_VECTORS = False
+    rwn.COUPLE_PHI2_PHI3 = False
+    rwn.USE_VORTEX_TRACING = True
+    rwn.VORTEX_FACE_PREFILTER = True
+    rwn.SMOOTH_VORTEX_LINES = False
+
+    rng = np.random.default_rng(config.random_seed)
+    ksets = rwn.make_field_k_sets(
+        rwn.NUM_MODES, rwn.K_DISTRIBUTION, rng, shared_k_vectors=False
+    )
+    mean_k2 = 0.5*(
+        np.mean(np.einsum("ni,ni->n", ksets.phi1, ksets.phi1))
+        + np.mean(np.einsum("ni,ni->n", ksets.phi2, ksets.phi2))
+    )
+    trace_k_eff = (2*np.pi/config.grid_size)*np.sqrt(mean_k2)
+    coefficients1 = rwn.make_wave_coefficients(ksets.phi1, rng)
+    coefficients2 = rwn.make_wave_coefficients(ksets.phi2, rng)
+    q1 = (2*np.pi/config.grid_size)*coefficients1.k_vectors
+    q2 = (2*np.pi/config.grid_size)*coefficients2.k_vectors
+
+    def value_gradient(points, coefficients, q_vectors):
+        phase = points@q_vectors.T + coefficients.phases
+        cosine = np.cos(phase)*coefficients.amplitudes
+        sine = np.sin(phase)*coefficients.amplitudes
+        return np.sum(cosine, axis=1), (-sine)@q_vectors
+
+    projection_calls = 0
+    projection_iteration_total = 0
+
+    def project(points):
+        nonlocal projection_calls, projection_iteration_total
+        projection_calls += 1
+        output = np.asarray(points, dtype=float).copy()
+        valid = np.ones(len(output), dtype=bool)
+        iterations_used = 0
+        for _ in range(projection_iterations):
+            f1, g1 = value_gradient(output, coefficients1, q1)
+            f2, g2 = value_gradient(output, coefficients2, q2)
+            converged = np.maximum(np.abs(f1), np.abs(f2)) <= projection_tolerance
+            active = valid & ~converged
+            if not np.any(active):
+                break
+            a11 = np.einsum("ij,ij->i", g1, g1)
+            a12 = np.einsum("ij,ij->i", g1, g2)
+            a22 = np.einsum("ij,ij->i", g2, g2)
+            determinant = a11*a22-a12*a12
+            safe = (
+                active
+                & np.isfinite(determinant)
+                & (np.abs(determinant) > 1e-14*np.maximum(a11*a22, 1.0))
+            )
+            valid[active & ~safe] = False
+            c1 = np.zeros_like(f1)
+            c2 = np.zeros_like(f2)
+            c1[safe] = (
+                -f1[safe]*a22[safe] + f2[safe]*a12[safe]
+            )/determinant[safe]
+            c2[safe] = (
+                -f2[safe]*a11[safe] + f1[safe]*a12[safe]
+            )/determinant[safe]
+            output[safe] += c1[safe, None]*g1[safe] + c2[safe, None]*g2[safe]
+            iterations_used += 1
+        projection_iteration_total += iterations_used
+        f1, _ = value_gradient(output, coefficients1, q1)
+        f2, _ = value_gradient(output, coefficients2, q2)
+        residual = np.maximum(np.abs(f1), np.abs(f2))
+        valid &= np.isfinite(residual) & (residual <= projection_tolerance)
+        return output, valid
+
+    def oriented_tangent(points, reference=None):
+        _, g1 = value_gradient(points, coefficients1, q1)
+        _, g2 = value_gradient(points, coefficients2, q2)
+        tangent = np.cross(g1, g2)
+        norm = np.linalg.norm(tangent, axis=1)
+        valid = np.isfinite(norm) & (norm > 1e-12)
+        tangent[valid] /= norm[valid, None]
+        tangent[~valid] = 0.0
+        if reference is not None:
+            reverse = np.einsum("ij,ij->i", tangent, reference) < 0.0
+            tangent[reverse] *= -1.0
+        return tangent, valid
+
+    subdivision_recovery_count = 0
+
+    def advance(points, tangents, step, direction):
+        if integration_method == "midpoint":
+            midpoint, midpoint_projected = project(
+                points + 0.5*step*direction*tangents
+            )
+            midpoint_tangent, midpoint_good = oriented_tangent(
+                midpoint, tangents
+            )
+            updated_points, projected = project(
+                points + step*direction*midpoint_tangent
+            )
+            updated_tangent, good = oriented_tangent(
+                updated_points, midpoint_tangent
+            )
+            valid = midpoint_projected & midpoint_good & projected & good
+        else:
+            k1 = direction*tangents
+            point2, projected2 = project(points + 0.5*step*k1)
+            tangent2, good2 = oriented_tangent(point2, tangents)
+            k2 = direction*tangent2
+            point3, projected3 = project(points + 0.5*step*k2)
+            tangent3, good3 = oriented_tangent(point3, tangent2)
+            k3 = direction*tangent3
+            point4, projected4 = project(points + step*k3)
+            tangent4, good4 = oriented_tangent(point4, tangent3)
+            k4 = direction*tangent4
+            trial = points + (step/6.0)*(k1 + 2.0*k2 + 2.0*k3 + k4)
+            updated_points, projected = project(trial)
+            updated_tangent, good = oriented_tangent(
+                updated_points, tangents
+            )
+            valid = (
+                projected2 & good2 & projected3 & good3
+                & projected4 & good4 & projected & good
+            )
+        return updated_points, updated_tangent, valid
+
+    def advance_subdivided(point, tangent, step, direction, levels):
+        nonlocal subdivision_recovery_count
+        updated_point, updated_tangent, valid = advance(
+            point[None, :], tangent[None, :], step, direction
+        )
+        if valid[0]:
+            return updated_point[0], updated_tangent[0], True
+        if levels == 0:
+            return point, tangent, False
+        midpoint, midpoint_tangent, first_valid = advance_subdivided(
+            point, tangent, 0.5*step, direction, levels-1
+        )
+        if not first_valid:
+            return point, tangent, False
+        endpoint, endpoint_tangent, second_valid = advance_subdivided(
+            midpoint, midpoint_tangent, 0.5*step, direction, levels-1
+        )
+        if second_valid:
+            subdivision_recovery_count += 1
+        return endpoint, endpoint_tangent, second_valid
+
+    def integrate(seeds, initial_tangent, step_count, direction):
+        point_history = np.empty((step_count+1, len(seeds), 3), dtype=float)
+        tangent_history = np.empty_like(point_history)
+        point_history[0] = seeds
+        tangent_history[0] = initial_tangent
+        points = seeds.copy()
+        tangent = initial_tangent.copy()
+        failure_step = np.full(len(seeds), -1, dtype=np.int64)
+        closure_step = np.full(len(seeds), -1, dtype=np.int64)
+        step = config.q_spacing/trace_k_eff
+        minimum_return_step = max(8, int(np.ceil(4.0/config.q_spacing)))
+        for index in range(1, step_count+1):
+            active = (failure_step < 0) & (closure_step < 0)
+            active_index = np.flatnonzero(active)
+            if not len(active_index):
+                point_history[index:] = points
+                tangent_history[index:] = tangent
+                break
+            local_points = points[active_index]
+            local_tangent = tangent[active_index]
+            updated_points, updated_tangent, local_valid = advance(
+                local_points, local_tangent, step, direction
+            )
+            for local_index in np.flatnonzero(~local_valid):
+                recovered_point, recovered_tangent, recovered = advance_subdivided(
+                    local_points[local_index], local_tangent[local_index],
+                    step, direction, max_step_subdivisions,
+                )
+                if recovered:
+                    updated_points[local_index] = recovered_point
+                    updated_tangent[local_index] = recovered_tangent
+                    local_valid[local_index] = True
+            points[active_index] = updated_points
+            tangent[active_index] = updated_tangent
+            failure_step[active_index[~local_valid]] = index
+            point_history[index] = points
+            tangent_history[index] = tangent
+            if index >= minimum_return_step:
+                returned = (
+                    active
+                    & (closure_step < 0)
+                    & (np.linalg.norm(points-seeds, axis=1) < 0.5*step)
+                    & (np.einsum("ij,ij->i", tangent, initial_tangent) > 0.8)
+                )
+                closure_step[returned] = index
+        return point_history, tangent_history, failure_step, closure_step
+
+    if config.num_blocks == 1:
+        phi1 = rwn.build_random_wave_field_from_coefficients(
+            config.grid_size, coefficients1
+        )
+        phi2 = rwn.build_random_wave_field_from_coefficients(
+            config.grid_size, coefficients2
+        )
+    else:
+        phi1 = rwn.build_random_wave_field_blockwise(
+            config.grid_size, config.num_blocks, config.block_overlap,
+            coefficients1,
+        )
+        phi2 = rwn.build_random_wave_field_blockwise(
+            config.grid_size, config.num_blocks, config.block_overlap,
+            coefficients2,
+        )
+    segment_polydata = rwn.trace_vortex_segments(phi1, phi2)
+    paths = _fast_segment_paths(segment_polydata)
+    if not paths:
+        raise RuntimeError("the seed grid contains no traced zero-set contour")
+
+    candidate_seeds = np.asarray([path[len(path)//2] for path in paths])
+    candidate_seeds, projected = project(candidate_seeds)
+    candidate_tangents, nonsingular = oriented_tangent(candidate_seeds)
+    usable = projected & nonsingular & np.all(np.isfinite(candidate_seeds), axis=1)
+    candidate_seeds = candidate_seeds[usable]
+    candidate_tangents = candidate_tangents[usable]
+    if len(candidate_seeds) < contour_count:
+        raise RuntimeError(
+            f"only {len(candidate_seeds)} usable seeds are available; "
+            f"requested {contour_count} contours"
+        )
+
+    # Deterministic farthest-point sampling reduces the chance that two grid
+    # fragments seed the same analytically continued contour.
+    centre = 0.5*(np.min(candidate_seeds, axis=0)+np.max(candidate_seeds, axis=0))
+    selected = [int(np.argmax(np.linalg.norm(candidate_seeds-centre, axis=1)))]
+    nearest_squared = np.sum(
+        (candidate_seeds-candidate_seeds[selected[0]])**2, axis=1
+    )
+    while len(selected) < contour_count:
+        nearest_squared[selected] = -1.0
+        following = int(np.argmax(nearest_squared))
+        selected.append(following)
+        separation_squared = np.sum(
+            (candidate_seeds-candidate_seeds[following])**2, axis=1
+        )
+        nearest_squared = np.minimum(nearest_squared, separation_squared)
+    seeds = candidate_seeds[selected]
+    seed_tangents = candidate_tangents[selected]
+
+    total_intervals = int(np.ceil(
+        contour_length_k_eff/config.q_spacing - 1e-12
+    ))
+    point_history, tangent_history, failure_step, closure_step = integrate(
+        seeds, seed_tangents, total_intervals, 1.0
+    )
+
+    points_by_contour_grid = []
+    tangents_by_contour = []
+    closed_contour_count = 0
+    truncated_contour_count = 0
+    for index in range(len(seeds)):
+        stop = total_intervals+1
+        if failure_step[index] >= 0:
+            stop = min(stop, int(failure_step[index]))
+            truncated_contour_count += 1
+        if closure_step[index] >= 0:
+            # A closed curve is periodic.  Retaining at most half a circuit
+            # prevents large lags from wrapping back to small separations.
+            stop = min(stop, max(3, int(closure_step[index]//2+1)))
+            closed_contour_count += 1
+        if stop >= 3:
+            points_by_contour_grid.append(point_history[:stop, index])
+            tangents_by_contour.append(tangent_history[:stop, index])
+    if not points_by_contour_grid:
+        raise RuntimeError("all continued contours failed before three samples")
+    packed_points = np.concatenate(points_by_contour_grid, axis=0)
+    f1, _ = value_gradient(packed_points, coefficients1, q1)
+    f2, _ = value_gradient(packed_points, coefficients2, q2)
+    maximum_residual = float(np.max(np.maximum(np.abs(f1), np.abs(f2))))
+    length_scale = trace_k_eff/spectrum.k_eff
+    points_by_contour = tuple(
+        points*length_scale for points in points_by_contour_grid
+    )
+    tangents_by_contour = tuple(tangents_by_contour)
+    actual_lengths_k_eff = tuple(
+        (len(points)-1)*config.q_spacing for points in points_by_contour
+    )
+    return TangentTrace(
+        points_by_contour, tangents_by_contour,
+        spectrum.k_eff, config.q_spacing,
+        {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+         "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+         "random_seed": config.random_seed,
+         "concentration_mM": spectrum.concentration_mM,
+         "r_sigma_k": spectrum.r_sigma_k,
+         "raw_trace_k_eff": float(trace_k_eff),
+         "physical_length_scale": float(length_scale),
+         "trace_method": "analytic_zero_set_continuation",
+         "requested_contour_count": contour_count,
+         "retained_contour_count": len(points_by_contour),
+         "target_contour_length_k_eff": total_intervals*config.q_spacing,
+         "actual_contour_lengths_k_eff": actual_lengths_k_eff,
+         "closed_contour_count": closed_contour_count,
+         "truncated_contour_count": truncated_contour_count,
+         "subdivision_recovery_count": subdivision_recovery_count,
+         "projection_iterations": projection_iterations,
+         "projection_tolerance": projection_tolerance,
+         "mean_projection_iterations": (
+             projection_iteration_total/max(projection_calls, 1)
+         ),
+         "integration_method": integration_method,
+         "max_step_subdivisions": max_step_subdivisions,
+         "maximum_zero_set_residual": maximum_residual},
+    )
+
+
+def build_isotropic_tangent_trace(project_root: Path, spectrum: FitSpectrum,
+        config: TraceConfig) -> TangentTrace:
+    """Trace only coordinates and tangents for fast ``C_t(s)`` evaluation."""
+    rwn = _import_project_module(project_root, "rw_line_network")
+    scattering = _load_module_from_path(
+        "rw_line_scattering_ca_tangent",
+        Path(project_root)/"rw_line_scattering.py",
+    )
+    rwn.GRID_SIZE = config.grid_size
+    rwn.NUM_BLOCK = config.num_blocks
+    rwn.BLOCK_OVERLAP = config.block_overlap
+    rwn.RANDOM_SEED = config.random_seed
+    rwn.NUM_MODES = (config.num_modes,)*3
+    rwn.K_DISTRIBUTION = "gamma_radial"
+    rwn.K0 = (config.trace_k0,)*3
+    rwn.r_SIGMA_K = (spectrum.r_sigma_k,)*3
+    rwn.SHARED_K_VECTORS = False
+    rwn.COUPLE_PHI2_PHI3 = False
+    rwn.USE_VORTEX_TRACING = True
+    rwn.VORTEX_FACE_PREFILTER = True
+    rwn.SMOOTH_VORTEX_LINES = False
+
+    rng = np.random.default_rng(config.random_seed)
+    ksets = rwn.make_field_k_sets(
+        rwn.NUM_MODES, rwn.K_DISTRIBUTION, rng, shared_k_vectors=False
+    )
+    mean_k2 = 0.5*(
+        np.mean(np.einsum("ni,ni->n", ksets.phi1, ksets.phi1))
+        + np.mean(np.einsum("ni,ni->n", ksets.phi2, ksets.phi2))
+    )
+    trace_k_eff = (2*np.pi/config.grid_size)*np.sqrt(mean_k2)
+    coefficients1 = rwn.make_wave_coefficients(ksets.phi1, rng)
+    coefficients2 = rwn.make_wave_coefficients(ksets.phi2, rng)
+
+    def value_gradient(points, coefficients):
+        q = (2*np.pi/config.grid_size)*coefficients.k_vectors
+        phase = points@q.T + coefficients.phases
+        cosine = np.cos(phase)*coefficients.amplitudes
+        sine = np.sin(phase)*coefficients.amplitudes
+        return np.sum(cosine, axis=1), (-sine)@q
+
+    def project(points, iterations):
+        output = points.copy()
+        for _ in range(iterations):
+            f1, g1 = value_gradient(output, coefficients1)
+            f2, g2 = value_gradient(output, coefficients2)
+            a11 = np.einsum("ij,ij->i", g1, g1)
+            a12 = np.einsum("ij,ij->i", g1, g2)
+            a22 = np.einsum("ij,ij->i", g2, g2)
+            determinant = a11*a22-a12*a12
+            safe = np.abs(determinant) > 1e-14*np.maximum(a11*a22, 1.0)
+            c1 = np.zeros_like(f1)
+            c2 = np.zeros_like(f2)
+            c1[safe] = (-f1[safe]*a22[safe]+f2[safe]*a12[safe])/determinant[safe]
+            c2[safe] = (-f2[safe]*a11[safe]+f1[safe]*a12[safe])/determinant[safe]
+            output[safe] += c1[safe, None]*g1[safe]+c2[safe, None]*g2[safe]
+        return output
+
+    phi1, phi2, _ = scattering._build_fields()
+    connected = rwn.smooth_vortex_polydata(rwn.trace_vortex_segments(phi1, phi2))
+    cells = [np.asarray(cell, dtype=float) for cell in scattering._line_cells(connected)
+             if len(cell) >= 2]
+    coarse = []
+    for cell in cells:
+        sampled = scattering._sample_line_cell_by_arclength(cell, config.seed_spacing)
+        if len(sampled) > 3:
+            coarse.append(sampled[:-1])
+    coarse_points, coarse_offsets = packed_cells(coarse)
+    projected = unpacked_cells(project(coarse_points, 3), coarse_offsets)
+    fine = []
+    for points in projected:
+        try:
+            sampled = resample_contour_by_arclength(
+                points, config.q_spacing/trace_k_eff
+            )
+        except ValueError:
+            continue
+        if len(sampled) >= 8:
+            fine.append(sampled)
+    fine_points, fine_offsets = packed_cells(fine)
+    fine_points = project(fine_points, 2)
+    _, g1 = value_gradient(fine_points, coefficients1)
+    _, g2 = value_gradient(fine_points, coefficients2)
+    tangents = np.cross(g1, g2)
+    tangents /= np.linalg.norm(tangents, axis=1)[:, None]
+    length_scale = trace_k_eff/spectrum.k_eff
+    return TangentTrace(
+        unpacked_cells(fine_points*length_scale, fine_offsets),
+        unpacked_cells(tangents, fine_offsets), spectrum.k_eff, config.q_spacing,
+        {"grid_size": config.grid_size, "num_blocks": config.num_blocks,
+         "block_overlap": config.block_overlap, "num_modes": config.num_modes,
+         "random_seed": config.random_seed,
+         "concentration_mM": spectrum.concentration_mM,
+         "r_sigma_k": spectrum.r_sigma_k,
+         "raw_trace_k_eff": float(trace_k_eff),
+         "physical_length_scale": float(length_scale)},
+    )
+
+
 def build_isotropic_trace(project_root: Path, spectrum: FitSpectrum,
                           config: TraceConfig) -> ContourTrace:
     """Run the expensive production trace; never called at import or in fast tests."""
     rwn=_import_project_module(project_root,"rw_line_network")
     scattering=_load_module_from_path("rw_line_scattering_ca_interaction",
                                       Path(project_root)/"rw_line_scattering.py")
-    rwn.GRID_SIZE=config.grid_size; rwn.NUM_BLOCK=config.num_blocks; rwn.BLOCK_OVERLAP=0
+    rwn.GRID_SIZE=config.grid_size; rwn.NUM_BLOCK=config.num_blocks
+    rwn.BLOCK_OVERLAP=config.block_overlap
     rwn.RANDOM_SEED=config.random_seed; rwn.NUM_MODES=(config.num_modes,)*3
     rwn.K_DISTRIBUTION="gamma_radial"; rwn.K0=(config.trace_k0,)*3
     rwn.r_SIGMA_K=(spectrum.r_sigma_k,)*3; rwn.SHARED_K_VECTORS=False
@@ -1270,7 +3148,9 @@ def build_isotropic_trace(project_root: Path, spectrum: FitSpectrum,
     physical_r3=r3/length_scale**2
     return ContourTrace(unpacked_cells(physical_points,fine_offsets),unpacked_cells(tangent,fine_offsets),
         unpacked_cells(physical_r2,fine_offsets),unpacked_cells(physical_r3,fine_offsets),spectrum.k_eff,config.q_spacing,
-        {"grid_size":config.grid_size,"num_modes":config.num_modes,"random_seed":config.random_seed,
+        {"grid_size":config.grid_size,"num_blocks":config.num_blocks,
+         "block_overlap":config.block_overlap,"num_modes":config.num_modes,
+         "random_seed":config.random_seed,
          "concentration_mM":spectrum.concentration_mM,"r_sigma_k":spectrum.r_sigma_k,
          "raw_trace_k_eff":float(trace_k_eff),"physical_length_scale":float(length_scale)})
 
@@ -1351,6 +3231,90 @@ def nonlocal_change_cell_hamiltonian(trace: ContourTrace,
     else:
         zero=YukawaChangeKernel(0.0,change.screening_length)
     return nonlocal_energy_table(trace,change,zero,config)
+
+
+def make_model_free_radial_basis(config: NonlocalConfig,
+        model_free_config: ModelFreeNonlocalConfig|None=None) -> RadialHatBasis:
+    """Create the common physical radial basis used by both trajectory states."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    r_min=config.chord_floor if controls.r_min is None else controls.r_min
+    r_max=config.max_contour_separation if controls.r_max is None else controls.r_max
+    return RadialHatBasis.from_range(float(r_min),float(r_max),controls.basis_count)
+
+
+def build_model_free_nonlocal_table(trace: ContourTrace, k_ref: float,
+        radial_basis: RadialHatBasis, config: NonlocalConfig,
+        cell_length: float|None=None) -> ModelFreeNonlocalTable:
+    """Build geometry-only ``[K2,K4,Y]`` features at traced contour positions.
+
+    Points are sampled uniformly along the stored arclength-resampled
+    trajectories.  These weights are deliberately separate from the Kac--Rice
+    weights used by ``LocalGeometrySample``.  The radial coordinate is physical
+    and the caller must pass the same ``radial_basis`` to both states.
+    """
+    if not np.isfinite(k_ref) or k_ref<=0:
+        raise ValueError("k_ref must be finite and positive")
+    local_length=1/k_ref if cell_length is None else float(cell_length)
+    if not np.isclose(config.local_cutoff,local_length,rtol=1e-10,atol=1e-12):
+        raise ValueError("nonlocal cutoff and local expansion range must agree")
+    spacing=trace.physical_spacing
+    minimum=max(1,int(np.ceil(config.local_cutoff/spacing)))
+    maximum=int(np.floor(config.max_contour_separation/spacing))
+    if maximum<minimum:
+        raise ValueError("trace spacing does not resolve the requested nonlocal range")
+    states_physical=trace_local_state(trace,normalize=False)
+    candidates=sum(max(0,len(cell)-2*minimum) for cell in trace.points)
+    probability=min(1.0,config.max_points/max(candidates,1))
+    rng=np.random.default_rng(config.random_seed)
+    states=[]; local_features=[]; nonlocal_features=[]; groups=[]
+    for group,(points,state) in enumerate(zip(trace.points,states_physical)):
+        if len(points)<=2*minimum:
+            continue
+        centers=np.arange(minimum,len(points)-minimum)
+        centers=centers[rng.random(len(centers))<probability]
+        if len(centers)==0:
+            continue
+        y_values=np.zeros((len(centers),len(radial_basis.centers)),dtype=float)
+        for row,center in enumerate(centers):
+            local_max=min(maximum,center,len(points)-1-center)
+            if local_max<minimum:
+                continue
+            lags=np.arange(minimum,local_max+1)
+            neighbors=np.concatenate((center-lags,center+lags))
+            chord=np.maximum(
+                np.linalg.norm(points[neighbors]-points[center],axis=1),
+                config.chord_floor)
+            separation=np.tile(lags*spacing,2)
+            basis_difference=(radial_basis.evaluate(chord)-
+                              radial_basis.evaluate(separation))
+            y_values[row]=local_length*0.5*spacing*np.sum(basis_difference,axis=0)
+        local_state=state[centers]
+        normalized=local_state/np.array([k_ref,k_ref**2,k_ref**2])
+        fourth=local_fourth_order_density(
+            local_state[:,0],local_state[:,1],local_state[:,2])
+        factor=local_length*k_ref
+        local=np.column_stack((factor*local_state[:,0]**2/k_ref**2,
+                               factor*fourth/k_ref**4))
+        states.append(normalized); local_features.append(local)
+        nonlocal_features.append(y_values)
+        groups.append(np.full(len(centers),group,dtype=int))
+    if not states:
+        raise RuntimeError("no traced points satisfy the model-free nonlocal lag window")
+    state_values=np.vstack(states)
+    weights=np.full(len(state_values),1/len(state_values),dtype=float)
+    metadata={
+        "sampling_measure":"uniform arclength contour-position sampling",
+        "reporting_k_ref":float(k_ref),
+        "local_cutoff":float(config.local_cutoff),
+        "maximum_contour_separation":float(config.max_contour_separation),
+        "trace_spacing":float(spacing),
+        "radial_basis":"piecewise_linear_hat",
+        "radial_basis_centers":radial_basis.centers.tolist(),
+        "radial_basis_width":float(radial_basis.width),
+    }
+    return ModelFreeNonlocalTable(
+        state_values,np.vstack(local_features),np.vstack(nonlocal_features),
+        weights,np.concatenate(groups),metadata)
 
 
 def invariant_coordinates(state: ArrayLike, center: ArrayLike|None=None,
@@ -1620,7 +3584,8 @@ def _maximum_entropy_fit(reference_features: FloatArray,
         reference_mask: NDArray[np.bool_]|None=None,
         target_mask: NDArray[np.bool_]|None=None,
         initial: ArrayLike|None=None,
-        reference_beta_delta_f_nl: ArrayLike|None=None) -> MaximumEntropyResult:
+        reference_beta_delta_f_nl: ArrayLike|None=None,
+        physical_penalty_matrix: ArrayLike|None=None) -> MaximumEntropyResult:
     """Fit P/P0 proportional to exp(-theta.features) by moment matching."""
     xref=np.asarray(reference_features,dtype=float)
     xtarget=np.asarray(target_features,dtype=float)
@@ -1652,6 +3617,18 @@ def _maximum_entropy_fit(reference_features: FloatArray,
         wref[:,None]*centered_for_scale**2,axis=0))
     feature_scale=np.maximum(feature_scale,
         np.sqrt(np.finfo(float).eps)*np.maximum(np.abs(feature_center),1.0))
+    if physical_penalty_matrix is None:
+        penalty_z=np.zeros((xref.shape[1],xref.shape[1]),dtype=float)
+    else:
+        penalty=np.asarray(physical_penalty_matrix,dtype=float)
+        if (penalty.shape!=(xref.shape[1],xref.shape[1]) or
+                np.any(~np.isfinite(penalty)) or
+                not np.allclose(penalty,penalty.T,rtol=1e-10,atol=1e-12)):
+            raise ValueError("physical_penalty_matrix must be a finite symmetric feature matrix")
+        if np.min(np.linalg.eigvalsh(penalty))<-1e-10:
+            raise ValueError("physical_penalty_matrix must be positive semidefinite")
+        inverse_scale=np.diag(1/feature_scale)
+        penalty_z=inverse_scale@penalty@inverse_scale
     zref=(xref_kept-feature_center)/feature_scale
     ztarget=(xtarget_kept-feature_center)/feature_scale
     target_mean_z=np.sum(wtarget[:,None]*ztarget,axis=0)
@@ -1669,9 +3646,10 @@ def _maximum_entropy_fit(reference_features: FloatArray,
 
     def objective(parameters_z: FloatArray) -> tuple[float,FloatArray]:
         log_weight=log_reference-zref@parameters_z
-        value=float(logsumexp(log_weight)+target_mean_z@parameters_z)
+        value=float(logsumexp(log_weight)+target_mean_z@parameters_z+
+                    0.5*parameters_z@penalty_z@parameters_z)
         _,mean=distribution(parameters_z)
-        return value,target_mean_z-mean
+        return value,target_mean_z-mean+penalty_z@parameters_z
 
     start=np.zeros(xref.shape[1]) if initial is None else np.asarray(initial,dtype=float)
     if start.shape!=(xref.shape[1],):
@@ -1696,7 +3674,8 @@ def _maximum_entropy_fit(reference_features: FloatArray,
             "maximum-entropy covariance is nonfinite; reduce feature outliers "
             "or compare better-overlapped ensembles")
     n_reference=1/np.sum(tilted**2); n_target=1/np.sum(wtarget**2)
-    inverse=np.linalg.pinv(hessian)
+    penalized_hessian=hessian+penalty_z
+    inverse=np.linalg.pinv(penalized_hessian)
     covariance_z=inverse@(hessian/n_reference+target_covariance/n_target)@inverse
     inverse_scale=np.diag(1/feature_scale)
     covariance=inverse_scale@covariance_z@inverse_scale
@@ -1709,9 +3688,14 @@ def _maximum_entropy_fit(reference_features: FloatArray,
     target_mass=float(np.sum(wtarget_all[support_target])/np.sum(wtarget_all))
     target_mean=feature_center+feature_scale*target_mean_z
     fitted_mean=feature_center+feature_scale*fitted_mean_z
-    return MaximumEntropyResult(coefficients,covariance,float(objective(coefficients_z)[0]),
+    unpenalized=float(logsumexp(log_reference-zref@coefficients_z)+
+                      target_mean_z@coefficients_z)
+    regularization=float(0.5*coefficients_z@penalty_z@coefficients_z)
+    total=unpenalized+regularization
+    return MaximumEntropyResult(coefficients,covariance,total,
         success,message,target_mass,
-        effective_fraction,bounds,keep_ref,keep_target,target_mean,fitted_mean)
+        effective_fraction,bounds,keep_ref,keep_target,target_mean,fitted_mean,
+        unpenalized,regularization,total)
 
 
 def fit_linked_maximum_entropy(reference: LocalGeometrySample,
@@ -1728,6 +3712,225 @@ def fit_linked_maximum_entropy(reference: LocalGeometrySample,
         local_cell_features(target,k_ref,cell_length),
         reference.weights,target.weights,support_quantiles,
         reference_mask,target_mask,initial,reference_beta_delta_f_nl)
+
+
+def _model_free_penalty_matrix(feature_count: int,
+        ridge: float, smoothness: float) -> FloatArray:
+    if feature_count<4:
+        raise ValueError("joint model-free fit requires at least two radial features")
+    count=feature_count-2
+    penalty=np.zeros((feature_count,feature_count),dtype=float)
+    radial=2*ridge*np.eye(count)
+    if count>=3 and smoothness>0:
+        difference=np.zeros((count-2,count),dtype=float)
+        rows=np.arange(count-2)
+        difference[rows,rows]=1
+        difference[rows,rows+1]=-2
+        difference[rows,rows+2]=1
+        radial+=2*smoothness*(difference.T@difference)
+    penalty[2:,2:]=radial
+    return penalty
+
+
+def fit_joint_local_nonlocal_maximum_entropy(
+        reference: ModelFreeNonlocalTable,
+        target: ModelFreeNonlocalTable,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        initial: ArrayLike|None=None) -> MaximumEntropyResult:
+    """Fit ``Delta c2, Delta c4`` and all radial coefficients together."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    if reference.nonlocal_features.shape[1]!=target.nonlocal_features.shape[1]:
+        raise ValueError("reference and target tables must use the same radial basis")
+    reference_features=np.column_stack(
+        (reference.local_features,reference.nonlocal_features))
+    target_features=np.column_stack((target.local_features,target.nonlocal_features))
+    penalty=_model_free_penalty_matrix(
+        reference_features.shape[1],controls.nonlocal_ridge,
+        controls.nonlocal_smoothness)
+    return _maximum_entropy_fit(
+        reference_features,target_features,reference.weights,target.weights,
+        controls.support_quantiles,initial=initial,
+        physical_penalty_matrix=penalty)
+
+
+def model_free_joint_reweighted_weights(table: ModelFreeNonlocalTable,
+        result: MaximumEntropyResult,
+        mask: NDArray[np.bool_]|None=None) -> FloatArray:
+    """Return joint ``P_target/P_reference`` weights on a model-free table."""
+    features=np.column_stack((table.local_features,table.nonlocal_features))
+    if features.shape[1]!=len(result.coefficients):
+        raise ValueError("joint fit and feature table are incompatible")
+    keep=np.all((features>=result.feature_bounds[:,0])&
+                (features<=result.feature_bounds[:,1]),axis=1)
+    if mask is not None:
+        keep&=np.asarray(mask,dtype=bool)
+    if not np.any(keep):
+        raise ValueError("no model-free samples remain inside joint support")
+    output=np.zeros(len(features),dtype=float)
+    log_weight=(np.log(np.maximum(table.weights[keep],np.finfo(float).tiny))-
+                features[keep]@result.coefficients)
+    output[keep]=np.exp(log_weight-logsumexp(log_weight))
+    return output
+
+
+def _conditional_nonlocal_average(reference_state: FloatArray,
+        reference_weights: FloatArray, reference_log_weight: FloatArray,
+        query_state: FloatArray, neighbors: int,
+        bandwidth: float|None) -> tuple[FloatArray,FloatArray,FloatArray,FloatArray]:
+    """Weighted kNN estimate of ``-log E[exp(log_weight)|X]``."""
+    xref=np.asarray(reference_state,dtype=float)
+    xquery=np.asarray(query_state,dtype=float)
+    q=np.asarray(reference_weights,dtype=float)
+    log_values=np.asarray(reference_log_weight,dtype=float)
+    if (xref.ndim!=2 or xref.shape[1]!=3 or xquery.ndim!=2 or
+            xquery.shape[1]!=3 or q.shape!=(len(xref),) or
+            log_values.shape!=(len(xref),)):
+        raise ValueError("conditional-average arrays are not aligned")
+    q=q/np.sum(q)
+    center=np.sum(q[:,None]*xref,axis=0)
+    scale=np.sqrt(np.sum(q[:,None]*(xref-center)**2,axis=0))
+    scale=np.maximum(scale,1e-8)
+    zref=(xref-center)/scale; zquery=(xquery-center)/scale
+    count=min(max(2,int(neighbors)),len(zref))
+    distances,indices=cKDTree(zref).query(zquery,k=count)
+    if count==1:
+        distances=distances[:,None]; indices=indices[:,None]
+    if bandwidth is None:
+        local_bandwidth=np.maximum(distances[:,-1],1e-6)
+    else:
+        local_bandwidth=np.full(len(zquery),float(bandwidth))
+    kernel_log=-0.5*(distances/local_bandwidth[:,None])**2
+    neighbor_log_q=np.log(np.maximum(q[indices],np.finfo(float).tiny))
+    denominator=logsumexp(neighbor_log_q+kernel_log,axis=1)
+    log_mean=logsumexp(
+        neighbor_log_q+kernel_log+log_values[indices],axis=1)-denominator
+    local_probability=np.exp(
+        neighbor_log_q+kernel_log-denominator[:,None])
+    effective=1/np.sum(local_probability**2,axis=1)
+    log_second=logsumexp(
+        neighbor_log_q+kernel_log+2*log_values[indices],axis=1)-denominator
+    mean=np.exp(np.clip(log_mean,-350,350))
+    second=np.exp(np.clip(log_second,-350,700))
+    variance=np.maximum(second-mean**2,0.0)
+    return -log_mean,effective,distances[:,-1],variance
+
+
+def conditional_model_free_energy(reference: ModelFreeNonlocalTable,
+        nonlocal_coefficients: ArrayLike, query_state: ArrayLike,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        support_radius: float|None=None
+        ) -> tuple[FloatArray,ConditionalAverageDiagnostics]:
+    """Derive ``beta Delta F_nl(X)`` by marginalizing the fitted Y weight."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    coefficients=np.asarray(nonlocal_coefficients,dtype=float)
+    if coefficients.shape!=(reference.nonlocal_features.shape[1],):
+        raise ValueError("one nonlocal coefficient is required per radial feature")
+    raw,effective,distance,variance=_conditional_nonlocal_average(
+        reference.state,reference.weights,
+        -(reference.nonlocal_features@coefficients),
+        np.asarray(query_state,dtype=float),controls.conditional_neighbors,
+        controls.conditional_bandwidth)
+    if support_radius is None:
+        support_radius=float(weighted_quantile(
+            distance,(0.0,0.995),np.full(len(distance),1/len(distance)))[1])
+    supported=(distance<=support_radius)&(
+        effective>=controls.conditional_min_effective_count)
+    diagnostics=ConditionalAverageDiagnostics(
+        effective,distance,variance,supported,float(1-np.mean(supported)))
+    return raw,diagnostics
+
+
+def _model_free_identifiability(table: ModelFreeNonlocalTable
+        ) -> tuple[int,FloatArray,float,FloatArray,float]:
+    features=np.column_stack((table.local_features,table.nonlocal_features))
+    weights=table.weights/np.sum(table.weights)
+    mean=np.sum(weights[:,None]*features,axis=0)
+    scale=np.sqrt(np.sum(weights[:,None]*(features-mean)**2,axis=0))
+    scale=np.maximum(scale,1e-12)
+    standardized=(features-mean)/scale
+    weighted=standardized*np.sqrt(weights[:,None])
+    singular=np.linalg.svd(weighted,compute_uv=False)
+    tolerance=max(weighted.shape)*np.finfo(float).eps*singular[0]
+    rank=int(np.count_nonzero(singular>tolerance))
+    condition=float(np.inf if singular[-1]<=tolerance else singular[0]/singular[-1])
+    correlation=weighted_correlation_matrix(features,weights)[0:2,2:]
+    local=np.column_stack((np.ones(len(features)),table.local_features))
+    root=np.sqrt(weights)[:,None]
+    coefficients=np.linalg.lstsq(root*local,root*table.nonlocal_features,rcond=None)[0]
+    residual=table.nonlocal_features-local@coefficients
+    centered_y=table.nonlocal_features-np.sum(
+        weights[:,None]*table.nonlocal_features,axis=0)
+    total=float(np.sum(weights[:,None]*centered_y**2))
+    orthogonal=float(np.sum(weights[:,None]*residual**2)/total) if total>0 else 0.0
+    return rank,singular,condition,correlation,orthogonal
+
+
+def fit_model_free_nonlocal_correction(reference_trace: ContourTrace,
+        target_trace: ContourTrace, k_ref: float, config: NonlocalConfig,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        cell_length: float|None=None) -> ModelFreeNonlocalResult:
+    """Fit the interaction-form-independent joint local/nonlocal model."""
+    controls=ModelFreeNonlocalConfig() if model_free_config is None else model_free_config
+    radial_basis=make_model_free_radial_basis(config,controls)
+    reference=build_model_free_nonlocal_table(
+        reference_trace,k_ref,radial_basis,config,cell_length)
+    target=build_model_free_nonlocal_table(
+        target_trace,k_ref,radial_basis,config,cell_length)
+    joint=fit_joint_local_nonlocal_maximum_entropy(reference,target,controls)
+    coefficients=np.asarray(joint.coefficients,dtype=float)
+    radial_coefficients=coefficients[2:]
+    raw_reference,reference_diagnostics=conditional_model_free_energy(
+        reference,radial_coefficients,reference.state,controls)
+    support_radius=float(weighted_quantile(
+        reference_diagnostics.support_distance,(0.0,0.995),reference.weights)[1])
+    raw_reference,reference_diagnostics=conditional_model_free_energy(
+        reference,radial_coefficients,reference.state,controls,support_radius)
+    raw_target,target_diagnostics=conditional_model_free_energy(
+        reference,radial_coefficients,target.state,controls,support_radius)
+    reference_supported=reference_diagnostics.supported
+    if not np.any(reference_supported):
+        raise RuntimeError("conditional model-free estimate has no supported reference samples")
+    log_normalizer=logsumexp(
+        np.log(np.maximum(reference.weights[reference_supported],np.finfo(float).tiny))-
+        raw_reference[reference_supported])-logsumexp(
+        np.log(np.maximum(reference.weights[reference_supported],np.finfo(float).tiny)))
+    beta_reference=raw_reference+log_normalizer
+    beta_target=raw_target+log_normalizer
+    corrected=np.zeros(len(reference.weights),dtype=float)
+    joint_supported=(reference_supported&joint.reference_keep)
+    if not np.any(joint_supported):
+        raise RuntimeError("no reference samples remain in both joint and conditional support")
+    log_weight=(np.log(np.maximum(reference.weights[joint_supported],np.finfo(float).tiny))-
+                reference.local_features[joint_supported]@coefficients[:2]-
+                beta_reference[joint_supported])
+    corrected[joint_supported]=np.exp(log_weight-logsumexp(log_weight))
+    rank,singular,condition,correlation,orthogonal=_model_free_identifiability(reference)
+    message=joint.message
+    if orthogonal<0.05:
+        message+=("; local/nonlocal decomposition is poorly identifiable: "
+                  "less than 5% of Y variance is orthogonal to K2,K4")
+    success=bool(joint.success and target_diagnostics.poor_support_fraction<0.5 and
+                 rank==len(coefficients) and orthogonal>=0.05)
+    return ModelFreeNonlocalResult(
+        float(coefficients[0]),float(coefficients[1]),radial_coefficients,
+        radial_basis,reference,target,joint,beta_reference,beta_target,corrected,
+        float(log_normalizer),reference_diagnostics,target_diagnostics,rank,singular,condition,
+        correlation,orthogonal,effective_sample_fraction(corrected),
+        controls.nonlocal_ridge,controls.nonlocal_smoothness,success,message)
+
+
+def evaluate_model_free_marginal_free_energy(result: ModelFreeNonlocalResult,
+        state: ArrayLike,
+        model_free_config: ModelFreeNonlocalConfig|None=None
+        ) -> tuple[FloatArray,ConditionalAverageDiagnostics]:
+    """Evaluate the centered derived marginal correction at normalized X."""
+    support_radius=float(weighted_quantile(
+        result.reference_conditional_diagnostics.support_distance,
+        (0.0,0.995),result.reference_table.weights)[1])
+    raw,diagnostics=conditional_model_free_energy(
+        result.reference_table,result.nonlocal_coefficients,state,
+        model_free_config,support_radius)
+    return raw+result.conditional_log_normalizer,diagnostics
 
 
 def fit_independent_maximum_entropy(reference: LocalGeometrySample,
@@ -2131,6 +4334,9 @@ def combine_local_geometry_samples(samples: Sequence[LocalGeometrySample]) -> Lo
     k_eff=samples[0].k_eff
     if any(not np.isclose(sample.k_eff,k_eff) for sample in samples):
         raise ValueError("all pooled samples must share k_eff")
+    have_tangent_p2=[sample.tangent_p2 is not None for sample in samples]
+    if any(have_tangent_p2) and not all(have_tangent_p2):
+        raise ValueError("pooled samples must consistently include tangent_p2")
     count=len(samples)
     return LocalGeometrySample(
         np.concatenate([sample.kappa for sample in samples]),
@@ -2140,6 +4346,8 @@ def combine_local_geometry_samples(samples: Sequence[LocalGeometrySample]) -> Lo
         k_eff,
         float(np.mean([sample.stable_fraction for sample in samples])),
         float(np.mean([sample.mean_jacobian_dimensionless for sample in samples])),
+        (np.concatenate([sample.tangent_p2 for sample in samples])
+         if all(have_tangent_p2) else None),
     )
 
 
@@ -2201,6 +4409,36 @@ def yukawa_cutoff_factors(u: ArrayLike) -> tuple[FloatArray,FloatArray]:
     f2=gammainc(2,values)-exponential*values**2/3
     f4=gammainc(4,values)-exponential*values**4/30
     return np.maximum(f2,0.0),np.maximum(f4,0.0)
+
+
+def yukawa_parameter_curve(c2_kref: ArrayLike, c4_kref3: ArrayLike,
+        ell_kref: ArrayLike, d_kref: ArrayLike) -> YukawaParameterCurve:
+    """Trace the Sec. 4 line of possible ``(g,D,ell_p0)`` combinations.
+
+    ``c2_kref`` is the *total* quadratic coefficient ``c2*k_ref`` and therefore
+    includes the intrinsic bending term. ``c4_kref3`` is ``c4*k_ref**3``.
+    Inputs broadcast, which permits simultaneous uncertainty samples and a
+    screening-length grid. No absolute coefficient zero is inferred here; the
+    caller must supply absolute coefficients rather than coefficient changes.
+    """
+    c2,c4,cutoff,distance=np.broadcast_arrays(
+        np.asarray(c2_kref,dtype=float),
+        np.asarray(c4_kref3,dtype=float),
+        np.asarray(ell_kref,dtype=float),
+        np.asarray(d_kref,dtype=float),
+    )
+    if (np.any(~np.isfinite(c2)) or np.any(~np.isfinite(c4)) or
+            np.any(~np.isfinite(cutoff)) or np.any(~np.isfinite(distance))):
+        raise ValueError("coefficients, cutoff, and screening lengths must be finite")
+    if np.any(cutoff<=0) or np.any(distance<=0):
+        raise ValueError("cutoff and screening lengths must be positive")
+    f2,f4=yukawa_cutoff_factors(cutoff/distance)
+    with np.errstate(divide="ignore",invalid="ignore",over="ignore"):
+        strength=c4/(distance**4*f4)
+        persistence=2*c2-c4*f2/(4*distance**2*f4)
+    valid=(np.isfinite(strength)&np.isfinite(persistence)&
+           (strength>0)&(distance>0)&(persistence>0))
+    return YukawaParameterCurve(strength,distance,persistence,valid)
 
 
 def yukawa_dimensionless_coefficients(g_over_kref: ArrayLike,
@@ -2548,6 +4786,167 @@ def relative_yukawa_parameters(delta_c2_kref: ArrayLike,
     g0,d0=solve_yukawa_parameters(a0_kref,c4_0_kref3,reference_ell_kref)
     g,d=solve_yukawa_parameters(a,c4,ell_kref)
     return np.asarray(g/float(g0)),np.asarray(d/float(d0))
+
+
+def _positive_yukawa_roots(target_a_kref: float, target_b_kref3: float,
+        ell_kref: float, d_kref_bounds: tuple[float,float],
+        root_scan_points: int, root_tolerance: float) -> FloatArray:
+    """Find every resolved positive range root on one explicit log interval."""
+    lower,upper=(float(value) for value in d_kref_bounds)
+    if (not np.isfinite(lower) or not np.isfinite(upper) or
+            lower<=0 or upper<=lower):
+        raise ValueError("d_kref_bounds must be finite, positive, and ordered")
+    if root_scan_points<33 or root_tolerance<=0:
+        raise ValueError("root_scan_points must be at least 33 and tolerance positive")
+    if target_a_kref<=0 or target_b_kref3<=0 or ell_kref<=0:
+        return np.empty(0,dtype=float)
+
+    def residual(log_d: float) -> float:
+        distance=float(np.exp(log_d))
+        f2,f4=yukawa_cutoff_factors(ell_kref/distance)
+        fourth=float(f4)
+        if not np.isfinite(fourth) or fourth<=np.finfo(float).tiny:
+            return np.nan
+        return (target_b_kref3*float(f2)/(8*distance**2*fourth)
+                -target_a_kref)
+
+    log_grid=np.linspace(np.log(lower),np.log(upper),root_scan_points)
+    values=np.asarray([residual(value) for value in log_grid])
+    scale=max(abs(target_a_kref),abs(target_b_kref3),1.0)
+    candidates=[]
+    close=np.flatnonzero(np.isfinite(values)&(np.abs(values)<=root_tolerance*scale))
+    candidates.extend(log_grid[index] for index in close)
+    for index in range(len(log_grid)-1):
+        left,right=values[index:index+2]
+        if not np.isfinite(left) or not np.isfinite(right) or left*right>=0:
+            continue
+        candidates.append(brentq(
+            residual,log_grid[index],log_grid[index+1],
+            xtol=root_tolerance,rtol=max(root_tolerance,4*np.finfo(float).eps),
+            maxiter=200))
+    if not candidates:
+        return np.empty(0,dtype=float)
+    roots=[]
+    for value in sorted(float(np.exp(candidate)) for candidate in candidates):
+        if not roots or not np.isclose(value,roots[-1],rtol=1e-7,atol=0.0):
+            roots.append(value)
+    return np.asarray(roots,dtype=float)
+
+
+def interaction_path_from_reference(g0_over_kref: float, d0_kref: float,
+        concentration_mM: ArrayLike, delta_c2_kref: ArrayLike,
+        delta_c4_kref3: ArrayLike, k_eff: ArrayLike,
+        reference_concentration_mM: float=0.0,
+        local_expansion_range_multiplier: float=1.0,
+        cutoff_mode: str="finite_cutoff",
+        d_kref_bounds: tuple[float,float]=(1e-3,100.0),
+        root_scan_points: int=4097, root_tolerance: float=1e-10,
+        reconstruction_tolerance: float=1e-8) -> InteractionPathResult:
+    """Construct a finite-cutoff ``(g,D)`` salt path from relative coefficients.
+
+    The fitted coefficient changes remain independent of the assumed reference.
+    Only this downstream mapping uses ``g0/k_ref`` and ``D0*k_ref``, where
+    ``k_ref`` is the fitted effective wavevector at the reference condition.
+    Every resolved positive finite-cutoff root inside ``d_kref_bounds`` is
+    retained. ``cutoff_mode='short_range'`` instead sets ``f2=f4=1`` and
+    solves analytically; it is a separately labelled diagnostic valid when
+    the interaction range is small compared with the local cutoff.
+    """
+    salts,delta2,delta4,wavevectors=(np.asarray(value,dtype=float) for value in (
+        concentration_mM,delta_c2_kref,delta_c4_kref3,k_eff))
+    if (salts.ndim!=1 or len(salts)==0 or any(
+            value.shape!=salts.shape for value in (delta2,delta4,wavevectors))):
+        raise ValueError("salt, coefficient, and k_eff arrays must be aligned 1D arrays")
+    if (np.any(~np.isfinite(salts)) or np.any(~np.isfinite(delta2)) or
+            np.any(~np.isfinite(delta4)) or np.any(~np.isfinite(wavevectors)) or
+            np.any(wavevectors<=0)):
+        raise ValueError("path inputs must be finite with positive k_eff")
+    if (not np.isfinite(g0_over_kref) or not np.isfinite(d0_kref) or
+            g0_over_kref<=0 or d0_kref<=0 or
+            not np.isfinite(local_expansion_range_multiplier) or
+            local_expansion_range_multiplier<=0 or reconstruction_tolerance<=0):
+        raise ValueError("reference interaction and numerical scales must be positive")
+    if cutoff_mode not in {"finite_cutoff","short_range"}:
+        raise ValueError("cutoff_mode must be 'finite_cutoff' or 'short_range'")
+    reference_indices=np.flatnonzero(np.isclose(
+        salts,reference_concentration_mM,rtol=0.0,atol=1e-12))
+    if len(reference_indices)!=1:
+        raise ValueError("exactly one reference concentration must be present")
+    reference_index=int(reference_indices[0])
+    if (abs(delta2[reference_index])>reconstruction_tolerance or
+            abs(delta4[reference_index])>reconstruction_tolerance):
+        raise ValueError("reference-condition coefficient changes must be zero")
+    order=np.argsort(salts)
+    salts,delta2,delta4,wavevectors=(value[order] for value in
+        (salts,delta2,delta4,wavevectors))
+    reference_index=int(np.flatnonzero(np.isclose(
+        salts,reference_concentration_mM,rtol=0.0,atol=1e-12))[0])
+    reference_k_eff=float(wavevectors[reference_index])
+    ell0_kref=float(local_expansion_range_multiplier)
+    if cutoff_mode=="finite_cutoff":
+        a0,b0=yukawa_dimensionless_coefficients(
+            g0_over_kref,d0_kref,ell0_kref)
+    else:
+        a0=g0_over_kref*d0_kref**2/8
+        b0=g0_over_kref*d0_kref**4
+    a0=float(a0); b0=float(b0)
+    points=[]
+    for salt,change2,change4,condition_k_eff in zip(
+            salts,delta2,delta4,wavevectors):
+        ell_kref=float(
+            local_expansion_range_multiplier*reference_k_eff/condition_k_eff)
+        if np.isclose(salt,reference_concentration_mM,rtol=0.0,atol=1e-12):
+            strengths=np.asarray([g0_over_kref],dtype=float)
+            ranges=np.asarray([d0_kref],dtype=float)
+            status="reference"
+            maximum_residual=0.0
+        else:
+            target_a=a0+float(change2); target_b=b0+float(change4)
+            if cutoff_mode=="finite_cutoff":
+                ranges=_positive_yukawa_roots(
+                    target_a,target_b,ell_kref,d_kref_bounds,
+                    root_scan_points,root_tolerance)
+            elif target_a>0 and target_b>0:
+                ranges=np.asarray([np.sqrt(target_b/(8*target_a))])
+            else:
+                ranges=np.empty(0,dtype=float)
+            strengths=[]; accepted_ranges=[]; residuals=[]
+            for distance in ranges:
+                if cutoff_mode=="finite_cutoff":
+                    _,f4=yukawa_cutoff_factors(ell_kref/distance)
+                    fourth=float(f4)
+                    if fourth<=0:
+                        continue
+                    strength=target_b/(distance**4*fourth)
+                    reconstructed_a,reconstructed_b=yukawa_dimensionless_coefficients(
+                        strength,distance,ell_kref)
+                else:
+                    strength=target_b/distance**4
+                    reconstructed_a=strength*distance**2/8
+                    reconstructed_b=strength*distance**4
+                if not np.isfinite(strength) or strength<=0:
+                    continue
+                errors=np.abs(np.asarray([
+                    float(reconstructed_a)-a0-float(change2),
+                    float(reconstructed_b)-b0-float(change4)]))
+                scale=np.maximum(np.abs(np.asarray([change2,change4])),1.0)
+                if np.max(errors/scale)>reconstruction_tolerance:
+                    continue
+                strengths.append(strength); accepted_ranges.append(distance)
+                residuals.append(float(np.max(errors)))
+            strengths=np.asarray(strengths,dtype=float)
+            ranges=np.asarray(accepted_ranges,dtype=float)
+            status={0:"no_physical_solution",1:"unique_solution"}.get(
+                len(ranges),"multiple_solutions")
+            maximum_residual=max(residuals) if residuals else np.nan
+        points.append(InteractionPathPoint(
+            float(salt),float(change2),float(change4),
+            float(condition_k_eff/reference_k_eff),ell_kref,
+            strengths,ranges,status,float(maximum_residual)))
+    return InteractionPathResult(
+        float(reference_concentration_mM),reference_k_eff,
+        float(g0_over_kref),float(d0_kref),a0,b0,
+        cutoff_mode,tuple(float(value) for value in d_kref_bounds),tuple(points))
 
 
 def short_range_relative_yukawa_parameters(delta_c2_kref: ArrayLike,
@@ -2911,6 +5310,62 @@ def fit_nonlocal_corrected_maximum_entropy(trace: ContourTrace,
         physical,selected,np.asarray(ranges),np.asarray(strengths),condition,table,
         dependence,required,model,corrected_fit,beta_delta_f,corrected_base,
         np.asarray(history),converged)
+
+
+def fit_nonlocal_correction(reference_trace: ContourTrace,
+        reference_sample: LocalGeometrySample, target_sample: LocalGeometrySample,
+        k_ref: float, initial_delta_c2_kref: float,
+        initial_delta_c4_kref3: float, config: NonlocalConfig,
+        cell_length: float|None=None, nonlocal_method: str="yukawa",
+        target_trace: ContourTrace|None=None,
+        model_free_config: ModelFreeNonlocalConfig|None=None,
+        **yukawa_options: object
+        ) -> NonlocalMaximumEntropyResult|ModelFreeNonlocalResult:
+    """Dispatch without changing the established Yukawa implementation.
+
+    The default path forwards the original arguments directly to
+    ``fit_nonlocal_corrected_maximum_entropy``.  ``model_free`` requires the
+    independently traced target state and performs one joint ``[K2,K4,Y]``
+    fit; the local sample arguments and initial coefficients remain in the
+    signature only so callers can switch methods without restructuring code.
+    """
+    method=str(nonlocal_method).lower()
+    if method=="yukawa":
+        return fit_nonlocal_corrected_maximum_entropy(
+            reference_trace,reference_sample,target_sample,k_ref,
+            initial_delta_c2_kref,initial_delta_c4_kref3,config,
+            cell_length=cell_length,**yukawa_options)
+    if method=="model_free":
+        if target_trace is None:
+            raise ValueError(
+                "target_trace is required when nonlocal_method='model_free'")
+        if yukawa_options:
+            unexpected=", ".join(sorted(yukawa_options))
+            raise ValueError(
+                f"Yukawa-only options are not accepted by model_free: {unexpected}")
+        return fit_model_free_nonlocal_correction(
+            reference_trace,target_trace,k_ref,config,model_free_config,
+            cell_length)
+    raise ValueError("nonlocal_method must be 'yukawa' or 'model_free'")
+
+
+def compare_nonlocal_corrections(
+        yukawa: NonlocalMaximumEntropyResult,
+        model_free: ModelFreeNonlocalResult) -> dict[str,object]:
+    """Compact same-pair comparison without conflating the result types."""
+    return {
+        "yukawa_delta_c2_kref":float(yukawa.corrected_fit.coefficients[0]),
+        "yukawa_delta_c4_kref3":float(yukawa.corrected_fit.coefficients[1]),
+        "yukawa_effective_fraction":float(
+            yukawa.corrected_fit.reference_effective_fraction),
+        "model_free_delta_c2_kref":model_free.delta_c2_kref,
+        "model_free_delta_c4_kref3":model_free.delta_c4_kref3,
+        "model_free_effective_fraction":model_free.effective_sample_fraction,
+        "model_free_condition_number":model_free.joint_feature_condition_number,
+        "model_free_orthogonal_y_fraction":model_free.nonlocal_orthogonal_variance_fraction,
+        "model_free_target_poor_support_fraction":(
+            model_free.target_conditional_diagnostics.poor_support_fraction),
+    }
 
 
 def fit_relative_nonlocal_correction(trace: ContourTrace,

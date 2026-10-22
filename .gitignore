@@ -1,0 +1,5 @@
+randomcxl/AGENTS.md
+randomcxl/PAPER_FIGURE_NOTES.md
+randomcxl/**/__pycache__/
+randomcxl/smpl/curvefit/data/Ca/*.dat
+randomcxl/smpl/curvefit/output/**/trace_cache/
